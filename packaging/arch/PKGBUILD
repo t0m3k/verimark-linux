@@ -1,0 +1,74 @@
+# Maintainer: Tomasz Tracz <t@t90.dev>
+
+pkgname=libfprint-verimark
+pkgver=1.94.10.r1.g66591aa
+pkgrel=1
+pkgdesc="Library for fingerprint readers with experimental Kensington VeriMark support"
+url="https://fprint.freedesktop.org/"
+arch=(x86_64)
+license=(LGPL-2.1-or-later)
+options=(!debug)
+depends=(
+  libgcc
+  glib2
+  glibc
+  libgudev
+  libgusb
+  openssl
+  pixman
+  gnutls
+  nettle
+  gmp
+)
+makedepends=(
+  git
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python-cairo
+  python-gobject
+  systemd
+)
+checkdepends=(
+  cairo
+  umockdev
+)
+provides=(libfprint libfprint-2.so)
+conflicts=(libfprint)
+groups=(fprint)
+_commit=66591aae03856bcefa7d7b4c0f08ea630f64b623
+source=("libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=$_commit")
+b2sums=(SKIP)
+
+prepare() {
+  cd libfprint
+  if [[ $(git rev-parse HEAD) != "$_commit" ]]; then
+    error "resolved source does not match pinned commit $_commit"
+    return 1
+  fi
+}
+
+build() {
+  local meson_options=(
+    -D drivers=all
+    -D installed-tests=false
+  )
+
+  arch-meson libfprint build "${meson_options[@]}"
+  meson compile -C build
+
+  arch-meson libfprint/libfprint/drivers/verimark build-verimark-tests --werror
+  meson compile -C build-verimark-tests
+}
+
+check() {
+  meson test -C build --print-errorlogs
+  meson test -C build-verimark-tests --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:

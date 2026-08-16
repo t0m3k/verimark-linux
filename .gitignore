@@ -14,10 +14,12 @@ windows-driver/
 windows-extracted/
 
 # Local build and package output
+__pycache__/
 build/
 pkg/
 src/
 *.pkg.tar.*
+/packaging/arch/libfprint/
 
 # Isolated implementation worktrees
 .worktrees/

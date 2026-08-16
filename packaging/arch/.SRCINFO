@@ -1,0 +1,36 @@
+pkgbase = libfprint-verimark
+	pkgdesc = Library for fingerprint readers with experimental Kensington VeriMark support
+	pkgver = 1.94.10.r1.g66591aa
+	pkgrel = 1
+	url = https://fprint.freedesktop.org/
+	arch = x86_64
+	groups = fprint
+	license = LGPL-2.1-or-later
+	checkdepends = cairo
+	checkdepends = umockdev
+	makedepends = git
+	makedepends = glib2-devel
+	makedepends = gobject-introspection
+	makedepends = gtk-doc
+	makedepends = meson
+	makedepends = python-cairo
+	makedepends = python-gobject
+	makedepends = systemd
+	depends = libgcc
+	depends = glib2
+	depends = glibc
+	depends = libgudev
+	depends = libgusb
+	depends = openssl
+	depends = pixman
+	depends = gnutls
+	depends = nettle
+	depends = gmp
+	provides = libfprint
+	provides = libfprint-2.so
+	conflicts = libfprint
+	options = !debug
+	source = libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=66591aae03856bcefa7d7b4c0f08ea630f64b623
+	b2sums = SKIP
+
+pkgname = libfprint-verimark
