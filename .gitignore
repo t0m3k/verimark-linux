@@ -1,0 +1,20 @@
+# Device pairing credentials and Windows exports
+sub1*.bin
+*.reg
+
+# USB/biometric captures and crash artifacts
+*.pcap
+*.pcapng
+*.dmp
+core
+core.*
+
+# Extracted proprietary Windows components
+windows-driver/
+windows-extracted/
+
+# Local build and package output
+build/
+pkg/
+src/
+*.pkg.tar.*
