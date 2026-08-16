@@ -319,6 +319,13 @@ class GeneratedMetadataTests(unittest.TestCase):
 
         self.assertEqual(repeated["pkgver"], self.info["pkgver"])
 
+    def test_generated_metadata_pins_local_check_fix(self):
+        patch_source = "fix-generated-data-checks.patch"
+
+        self.assertIn(patch_source, self.info["source"])
+        patch_index = self.info["source"].index(patch_source)
+        self.assertRegex(self.info["b2sums"][patch_index], r"^[0-9a-f]{128}$")
+
     def test_package_plan_produces_one_replacement_archive(self):
         package_paths = run_checked(self, "makepkg", "--packagelist").splitlines()
 

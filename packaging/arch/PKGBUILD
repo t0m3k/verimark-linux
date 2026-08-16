@@ -38,8 +38,14 @@ provides=(libfprint libfprint-2.so)
 conflicts=(libfprint)
 groups=(fprint)
 _commit=66591aae03856bcefa7d7b4c0f08ea630f64b623
-source=("libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=$_commit")
-b2sums=(SKIP)
+source=(
+  "libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=$_commit"
+  fix-generated-data-checks.patch
+)
+b2sums=(
+  SKIP
+  a00743a99d8f1d1a9b7b61d6a84d002e1aa56fa9ed74224c277f23161005088a5206c8691e337c6044414e31df04f2e4ec6ae78bb1111e0e0543c921b9b714ad
+)
 
 prepare() {
   cd libfprint
@@ -47,6 +53,7 @@ prepare() {
     error "resolved source does not match pinned commit $_commit"
     return 1
   fi
+  patch -Np1 -i "$srcdir/fix-generated-data-checks.patch"
 }
 
 build() {
