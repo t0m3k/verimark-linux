@@ -1,0 +1,1194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 17:50:10 +0200
+Subject: [PATCH 26/62] verimark: sanitize source comments for upstream
+ submission
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Comment-only cleanup ahead of the upstream MR : remove internal
+development markers (Phase 5-10.3.x), references to private docs
+paths and tooling (python PoC, tools/, docs/), low-level RE notes
+(Ghidra symbols, WindDbg, etc.), and the "Realtek/ipw2200 pattern"
+analogy.
+
+Kept :
+- Tudor protocol naming (Synaptics family name, neutral)
+- Synaptics quirk documentation (useful for maintainers — just no
+  longer says HOW we observed it)
+- RFC references (RFC 5246 §7.4.9 etc.)
+- Wire-format and opcode specifications
+- Module-level architecture explanations
+
+No code or behavior changes. 11 standalone TDD suites stay green ;
+libfprint builds clean against libgusb 0.4.9 on NixOS.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/bootstrap.h |  4 +-
+ libfprint/drivers/verimark/capture.c   | 13 ++---
+ libfprint/drivers/verimark/capture.h   | 39 ++++++---------
+ libfprint/drivers/verimark/crypto.h    | 12 ++---
+ libfprint/drivers/verimark/enroll.c    |  3 +-
+ libfprint/drivers/verimark/enroll.h    | 15 ++----
+ libfprint/drivers/verimark/handshake.c | 12 ++---
+ libfprint/drivers/verimark/handshake.h |  4 +-
+ libfprint/drivers/verimark/match.c     | 15 +++---
+ libfprint/drivers/verimark/match.h     | 28 ++++-------
+ libfprint/drivers/verimark/pairing.h   |  9 ++--
+ libfprint/drivers/verimark/proto.c     |  9 ++--
+ libfprint/drivers/verimark/proto.h     | 25 +++-------
+ libfprint/drivers/verimark/session.c   |  2 +-
+ libfprint/drivers/verimark/session.h   | 15 +++---
+ libfprint/drivers/verimark/storage.c   | 22 ++++-----
+ libfprint/drivers/verimark/storage.h   | 39 +++++----------
+ libfprint/drivers/verimark/tls.c       |  3 +-
+ libfprint/drivers/verimark/transport.c | 12 ++---
+ libfprint/drivers/verimark/transport.h | 16 +++----
+ libfprint/drivers/verimark/verimark.c  | 66 ++++++++++----------------
+ libfprint/drivers/verimark/verimark.h  |  7 ---
+ 22 files changed, 134 insertions(+), 236 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/bootstrap.h b/libfprint/drivers/verimark/bootstrap.h
+index a9fa034..3d13c9d 100644
+--- a/libfprint/drivers/verimark/bootstrap.h
++++ b/libfprint/drivers/verimark/bootstrap.h
+@@ -3,7 +3,7 @@
+  *
+  * Builds the host-side data structures needed to perform the initial
+  * `0x93 DoPairBasic` exchange and persist the resulting Synaptics sub1
+- * pairing blob. Mirrors `python/verimark/bootstrap.py` byte-for-byte.
++ * pairing blob.
+  *
+  * This header exposes only the PURE host-side functions (cert
+  * layout, sub1 TLV serialization, P-256 params blob, response
+@@ -14,8 +14,6 @@
+  * TOFU model — sensor accepts any client_pubkey the first time
+  * 0x93 is sent. Subsequent 0x93 attempts against an already-paired
+  * sensor fail.
+- *
+- * Cf. docs/phase8b-bootstrap-pairing.md, docs/opcodes/0x93.yaml.
+  */
+ 
+ #ifndef VERIMARK_BOOTSTRAP_H
+diff --git a/libfprint/drivers/verimark/capture.c b/libfprint/drivers/verimark/capture.c
+index 438d3f7..d425413 100644
+--- a/libfprint/drivers/verimark/capture.c
++++ b/libfprint/drivers/verimark/capture.c
+@@ -2,8 +2,7 @@
+  * capture.c — Tudor capture-pipeline opcode wrappers implementation.
+  *
+  * Each wrapper builds the request payload, calls
+- * `verimark_session_call_opcode()`, and parses the response per
+- * docs/opcodes/0x{39,80,81,82}.yaml.
++ * `verimark_session_call_opcode()`, and parses the response.
+  */
+ 
+ #include "capture.h"
+@@ -103,19 +102,15 @@ bool verimark_capture_config(VerimarkSession *s,
+  * 0x82 [02 07] — get dimensions
+  * ------------------------------------------------------------------------- */
+ 
+-/* Payload for `0x82 sub=[02 07]` : 8 bytes : 00*6 02 07.
+- * Ghidra FUN_180060960 lines 48201-48202 : buffer[7]=2, buffer[8]=7
+- * → payload[6]=2, payload[7]=7.
+- */
++/* Payload for `0x82 sub=[02 07]` : 8 bytes : 00*6 02 07. */
+ static const uint8_t DIMS_REQ_PAYLOAD[8] = {
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x07,
+ };
+ 
+ /* Response layout : 9 × u16 LE starting at offset 12 of the payload
+  * (= offset 14 of the response-complete buffer that includes the
+- * status u16 BE in front, per Ghidra FUN_180060960 line 48207-48224).
+- * Runtime payload is 32 bytes ; we need at least 12 + 9*2 = 30 to
+- * read the dimensions. */
++ * status u16 BE in front). Runtime payload is 32 bytes ; we need at
++ * least 12 + 9*2 = 30 to read the dimensions. */
+ #define DIMS_RESP_FIELDS_OFFSET 12u
+ #define DIMS_RESP_MIN_LEN       (DIMS_RESP_FIELDS_OFFSET + 9u * 2u)  /* 30 */
+ 
+diff --git a/libfprint/drivers/verimark/capture.h b/libfprint/drivers/verimark/capture.h
+index f76403d..4a41d1c 100644
+--- a/libfprint/drivers/verimark/capture.h
++++ b/libfprint/drivers/verimark/capture.h
+@@ -11,16 +11,9 @@
+  *
+  * This module exposes one wrapper per opcode. A higher-level
+  * orchestrator that drives the full state machine (with retry on
+- * 0xdd and timeout on "waiting for finger") will live in the
+- * libfprint integration layer (`verimark.c` fpi_ssm) — out of
+- * scope for this module.
+- *
+- * See:
+- *   - docs/opcodes/0x39.yaml (capture_config — 124-byte payload)
+- *   - docs/opcodes/0x80.yaml (get_frame    — 16/24-byte payload)
+- *   - docs/opcodes/0x81.yaml (status_poll  — empty payload)
+- *   - docs/opcodes/0x82.yaml (dims/data    — 8-byte payload, 2 sub-cmds)
+- *   - docs/phase9-capture-pipeline.md      (runtime canonical sequence)
++ * 0xdd and timeout on "waiting for finger") lives in the libfprint
++ * integration layer (`verimark.c` fpi_ssm) — out of scope for this
++ * module.
+  */
+ 
+ #ifndef VERIMARK_CAPTURE_H
+@@ -48,8 +41,7 @@ struct VerimarkTransportIO;
+  * Send opcode `0x19` (no payload, 1 byte total on the wire) to ask
+  * the sensor to (re)initialize its capture-side internal state.
+  *
+- * Observed runtime as the very first call of the canonical Linux
+- * verify pipeline (cf. `python/verimark/match.py:main()` preamble).
++ * Observed as the first call of the canonical verify pipeline.
+  * The response is a single 2-byte status with no payload.
+  */
+ bool verimark_capture_init_session(VerimarkSession *s,
+@@ -68,8 +60,8 @@ bool verimark_capture_init_session(VerimarkSession *s,
+  *
+  * Runtime confirms a payload of 124 zero bytes is accepted by the
+  * sensor (status 0x0000). The exact semantics of the 124 bytes
+- * (6 records of 20 bytes + 4-byte header per Ghidra FUN_1800624c0)
+- * is not yet fully decoded ; for normal operation, pass zeros.
++ * (6 records of 20 bytes + 4-byte header) is not yet fully decoded ;
++ * for normal operation, pass zeros.
+  */
+ bool verimark_capture_config(VerimarkSession *s,
+                              struct VerimarkTransportIO *io,
+@@ -87,7 +79,6 @@ bool verimark_capture_config(VerimarkSession *s,
+  *
+  * Runtime values for the reference VeriMark DT sensor :
+  *   width = 104, height = 104, pixel_depth = 16-bit suspected.
+- * Other fields' semantics remain TBD.
+  */
+ typedef struct {
+     uint16_t width;
+@@ -140,7 +131,7 @@ bool verimark_capture_get_frame(VerimarkSession *s,
+  * parse the 2-byte response status (u16 LE).
+  *
+  * `*poll_status_out` carries the raw u16 returned by the sensor.
+- * Known values (Phase 9 step 4.4) :
++ * Known values :
+  *   - 0x0000  → frame ready (capture completed)
+  *   - 0xcc05  → idle / no frame ready (waiting for finger)
+  *   - 0xdd    → frame not ready yet (retry)
+@@ -161,8 +152,8 @@ bool verimark_capture_status_poll(VerimarkSession *s,
+ /**
+  * Send `0x82` with sub-cmd `[02 02]` (8-byte payload `00*6 02 02`)
+  * and copy the response payload into `out_buf`. The response can be
+- * up to ~16 KB (`0x3f0e` per Ghidra) when a capture is active ;
+- * shorter (8 bytes of zeros observed) when idle.
++ * up to ~16 KB (`0x3f0e`) when a capture is active ; shorter (8 bytes
++ * of zeros observed) when idle.
+  *
+  * `*out_image_size` is set to the number of bytes actually written
+  * to `out_buf`. If the response is larger than `out_size`, returns
+@@ -186,10 +177,9 @@ bool verimark_capture_get_frame_data(VerimarkSession *s,
+  * Send opcode `0x80` with a caller-supplied 16-byte payload.
+  *
+  * The canonical "verify-style" payload is
+- *   `14 00 00 00 01 00 00 00 01 00 00 08 01 01 01 00`
+- * (cf. `python/verimark/match.py:build_capture_start_payload()`).
++ *   `14 00 00 00 01 00 00 00 01 00 00 08 01 01 01 00`.
+  * Distinct from `verimark_capture_get_frame()`, which sends 16 zeros
+- * and was the early Phase 9 "naive" entrypoint.
++ * (the "naive" entrypoint).
+  */
+ bool verimark_capture_start(VerimarkSession *s,
+                             struct VerimarkTransportIO *io,
+@@ -207,8 +197,7 @@ bool verimark_capture_start(VerimarkSession *s,
+  * Send opcode `0x86` with a 36-byte payload :
+  *   `[mask_a:16][mask_b:16][field_21:u32 LE]`
+  *
+- * Wire is LITTLE-ENDIAN despite what the YAML claims — that's the v3
+- * "Linux runtime" finding documented in `python/verimark/match.py`.
++ * Wire is LITTLE-ENDIAN.
+  *
+  * Subscribe a set of event IDs (0..127) by setting bit `(id & 0x1f)`
+  * in `mask[id // 32 * 4 ...]` (little-endian u32 inside the 16-byte
+@@ -235,7 +224,7 @@ bool verimark_capture_event_config(VerimarkSession *s,
+ 
+ /**
+  * One sensor event record (12 bytes on the wire). Wire format
+- * little-endian (cf. v3 finding).
++ * little-endian.
+  */
+ typedef struct {
+     uint8_t  type;
+@@ -263,7 +252,7 @@ typedef struct {
+  *   `[cursor:u16 LE][max_events:u16 LE][field_05:u32 LE = 1]`
+  *
+  * Returns the parsed event page. Cursor=0 + max_events=32 is the
+- * typical polling pattern (cf. Python `_poll_for_frame_ready`).
++ * typical polling pattern.
+  */
+ bool verimark_capture_event_read(VerimarkSession *s,
+                                  struct VerimarkTransportIO *io,
+diff --git a/libfprint/drivers/verimark/crypto.h b/libfprint/drivers/verimark/crypto.h
+index 2395702..591abf9 100644
+--- a/libfprint/drivers/verimark/crypto.h
++++ b/libfprint/drivers/verimark/crypto.h
+@@ -1,8 +1,8 @@
+ /*
+  * crypto.h — TLS 1.2 primitives for the VeriMark/Synaptics driver.
+  *
+- * Implements (via GnuTLS) the exact cryptographic primitives reverse-
+- * engineered from synaWudfBioUsb132.dll during Phase 5 :
++ * Implements (via GnuTLS) the cryptographic primitives required by the
++ * Synaptics Tudor variant of TLS 1.2 :
+  *
+  *   - TLS 1.2 PRF with HMAC-SHA-384 (used for master_secret, key_block,
+  *     verify_data).
+@@ -12,15 +12,11 @@
+  *
+  * Synaptics quirks already encoded by the caller :
+  *   - master_secret seed = client_random || server_random (= RFC)
+- *   - key_block     seed = client_random || server_random (≠ RFC, see
+- *     docs/phase5-tls-psk-linux.md § "KDF Synaptics identifiée")
++ *   - key_block     seed = client_random || server_random
++ *     (deviates from RFC 5246 §6.3, which uses server_random || client_random)
+  *   - verify_data transcript hash = SHA-256, NOT SHA-384 of the cipher.
+  *   - CertVerify signature       = SHA-256 ECDSA.
+  *
+- * These are validated against the reference Python implementation
+- * (`tools/tls_psk.py` + `tools/verimark_synaptics_handshake.py`) via
+- * cross-language test vectors in `tests/test_vectors.h`.
+- *
+  * Style : opaque returns, no GError dependency (kept layer-clean so the
+  * lib can be unit-tested standalone). Errors return a non-zero result.
+  */
+diff --git a/libfprint/drivers/verimark/enroll.c b/libfprint/drivers/verimark/enroll.c
+index 15de03b..297ccaa 100644
+--- a/libfprint/drivers/verimark/enroll.c
++++ b/libfprint/drivers/verimark/enroll.c
+@@ -2,8 +2,7 @@
+  * enroll.c — Tudor enroll FSM implementation.
+  *
+  * Each wrapper builds the right `0x96 NN` sub-command payload, sends
+- * it through the active TLS session, and parses the response per
+- * `docs/opcodes/0x96.yaml`.
++ * it through the active TLS session, and parses the response.
+  */
+ 
+ #include "enroll.h"
+diff --git a/libfprint/drivers/verimark/enroll.h b/libfprint/drivers/verimark/enroll.h
+index 2195ebd..1fcfbcb 100644
+--- a/libfprint/drivers/verimark/enroll.h
++++ b/libfprint/drivers/verimark/enroll.h
+@@ -9,10 +9,6 @@
+  *   0x96 03  commit          — finalize the template (123-B payload : tuid + SID)
+  *   0x96 04  finish          — cleanup the FSM
+  *
+- * Wire format & semantics : `docs/opcodes/0x96.yaml` +
+- * `docs/phase9-enroll-flow-windows.md`. The Linux reference impl that
+- * decoded all of this is `python/verimark/enroll.py`.
+- *
+  * Capture pipeline opcodes (0x39, 0x80, 0x86, 0x87, 0x81) used during
+  * the per-swipe capture cycles live in `capture.h`.
+  */
+@@ -55,13 +51,13 @@ bool verimark_enroll_begin(VerimarkSession *s,
+  * 0x96 02 — add image (called after each successful swipe)
+  * ------------------------------------------------------------------------- */
+ 
+-#define VERIMARK_ENROLL_VERDICT_ACCEPTED 0x64   /* 'd' = accepted (per Ghidra) */
++#define VERIMARK_ENROLL_VERDICT_ACCEPTED 0x64   /* 'd' = accepted */
+ #define VERIMARK_ENROLL_TARGET_BITMASK   0x7f   /* 7 unique slots = template complete */
+ 
+ /**
+  * Parsed 80-byte response payload from `0x96 02`.
+  *
+- * Field semantics (cf. `python/verimark/enroll.py:parse_add_image_response`):
++ * Field semantics :
+  *   - `progress_bitmask`  : grows from 0x01 → 0x03 → 0x07 … 0x7f as
+  *                            each UNIQUE swipe is accepted. Stays
+  *                            unchanged when the engine rejects a
+@@ -71,7 +67,7 @@ bool verimark_enroll_begin(VerimarkSession *s,
+  *                            geometry).
+  *   - `swipe_index`       : 1-based counter of UNIQUE swipes so far.
+  *   - `cumulative`        : grows ~4540 per accepted swipe (quality
+- *                            accumulator — exact semantic TBD).
++ *                            accumulator).
+  */
+ typedef struct {
+     uint16_t progress_bitmask;
+@@ -101,10 +97,9 @@ bool verimark_enroll_add_image(VerimarkSession *s,
+ /**
+  * Send `0x96 03` (123-byte payload) committing the just-captured
+  * template under the host-supplied 16-byte `tuid`. The Windows SID
+- * (28 bytes) is optional ; pass NULL or all-zeros for a Linux PoC.
++ * (28 bytes) is optional ; pass NULL or all-zeros if unused.
+  *
+- * Wire payload layout (LE throughout, cf. python/verimark/enroll.py
+- * `build_enroll_commit_payload`) :
++ * Wire payload layout (LE throughout) :
+  *   [ 0]   u8   subcmd = 0x03
+  *   [ 4..7]   u32  field_1   = 0
+  *   [ 8..11]  u32  field_2   = 0x6f
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+index fa426d9..e99f43f 100644
+--- a/libfprint/drivers/verimark/handshake.c
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -185,7 +185,7 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+      * which we can get via a hack — call ECDH with the secp256r1 generator.
+      *
+      * Actually the cleanest is to add a small helper in crypto.
+-     * For Phase 7.3.a, we add the call directly via nettle below.
++     * For now, we add the call directly via nettle below.
+      */
+     {
+         uint8_t pub_x[32], pub_y[32];
+@@ -267,7 +267,7 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+     memcpy(b->transcript + b->transcript_len, b->cv_hs, cv_hs_n);
+     b->transcript_len += cv_hs_n;
+     /* SYNAPTICS QUIRK : verify_data transcript hash = SHA-256 (not SHA-384
+-     * of the cipher), PRF = SHA-384. Cf. docs/phase5-tls-psk-linux.md. */
++     * of the cipher), PRF = SHA-384 (deviates from RFC 5246 §7.4.9). */
+     {
+         uint8_t h[32];
+         if (gnutls_hash_fast(GNUTLS_DIG_SHA256,
+@@ -407,9 +407,9 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+         }
+         /* Note : we do NOT validate the server verify_data against our PRF
+          * compute, because the Synaptics server-side transcript or label may
+-         * differ from RFC standard (see docs/phase5-tls-psk-linux.md). The
+-         * successful GCM decrypt is itself strong evidence the session is
+-         * established (the server used the right MS + key_block). */
++         * differ from RFC standard. The successful GCM decrypt is itself
++         * strong evidence the session is established (the server used the
++         * right MS + key_block). */
+ 
+         /* Server's GCM seq starts at 0 ; advance to 1 for the next decrypt. */
+         session_out->server_seq = 1;
+@@ -440,7 +440,7 @@ out:
+ }
+ 
+ 
+-/* === Phase 10.3.c — async handshake (libgusb-only) ====================
++/* === Async handshake (libgusb-only) ===================================
+  *
+  * Mirrors the sync `verimark_handshake_perform()` but drives the two USB
+  * round-trips via `verimark_transceive_async()`. The crypto stages
+diff --git a/libfprint/drivers/verimark/handshake.h b/libfprint/drivers/verimark/handshake.h
+index 97d6378..01f2cb5 100644
+--- a/libfprint/drivers/verimark/handshake.h
++++ b/libfprint/drivers/verimark/handshake.h
+@@ -6,7 +6,7 @@
+  * `verimark_handshake_perform()` returns OK, the caller owns a ready-
+  * to-use `VerimarkSession` for AppData encrypt/decrypt.
+  *
+- * Sequence (validated runtime, see docs/phase5-tls-psk-linux.md) :
++ * Sequence :
+  *   1. Send ClientHello (with handshake transport prefix `44 00 00 00`).
+  *   2. Receive ServerHello, parse server_random + cipher.
+  *   3. Build Certificate + ClientKeyExchange + CertificateVerify, sign.
+@@ -108,7 +108,7 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+                             VerimarkSession *session_out);
+ 
+ 
+-/* --- Async handshake (Phase 10.3.c, libgusb-only) ----------------------
++/* --- Async handshake (libgusb-only) ------------------------------------
+  *
+  * Non-blocking equivalent of verimark_handshake_perform. Drives the two
+  * USB round-trips (ClientHello → ServerHello ; Flight2 → ServerResponse)
+diff --git a/libfprint/drivers/verimark/match.c b/libfprint/drivers/verimark/match.c
+index 5cc1451..9aebdec 100644
+--- a/libfprint/drivers/verimark/match.c
++++ b/libfprint/drivers/verimark/match.c
+@@ -58,10 +58,9 @@ bool verimark_match_generate_nonce(uint8_t out_nonce[VERIMARK_MATCH_NONCE_LEN])
+  * Allow generous overhead. */
+ #define MATCH_MAX_PAYLOAD (16u * 1024u + 8u * VERIMARK_MATCH_TUID_LEN + 32u)
+ 
+-/* Response qm struct layout (per Ghidra FUN_18007d0a0 line 58781 :
+- * "if (iVar4 == 0x24) { copy 36 bytes }" — so the qm struct is the
+- * FIRST 36 bytes of the response payload after the status u16 BE
+- * already stripped by session_call_opcode). */
++/* Response qm struct layout : the qm struct is the FIRST 36 bytes of the
++ * response payload after the status u16 BE has been stripped by
++ * session_call_opcode. */
+ #define QM_STRUCT_LEN 36u
+ 
+ bool verimark_match_request(VerimarkSession *s,
+@@ -97,8 +96,7 @@ bool verimark_match_request(VerimarkSession *s,
+     static uint8_t payload[MATCH_MAX_PAYLOAD];
+     size_t off = 0;
+ 
+-    /* tag(1) u32 LE = 01 00 00 00 (per Ghidra : FUN_1800a3ee0 is
+-     * identity, so the wire format is the raw u32). */
++    /* tag(1) u32 LE = 01 00 00 00 (raw u32 on the wire). */
+     write_le32(payload + off, 1);
+     off += 4;
+ 
+@@ -164,9 +162,8 @@ bool verimark_match_request(VerimarkSession *s,
+  * 0x99 — simplified flag-only variant
+  * ------------------------------------------------------------------------- */
+ 
+-/* Canonical Linux 0x99 payload : single flag byte + 11 zeros. The
+- * sensor sources image + tuids from session state. Cf.
+- * python/verimark/match.py:build_match_request_payload(). */
++/* Canonical 0x99 payload : single flag byte + 11 zeros. The sensor
++ * sources image + tuids from session state. */
+ static const uint8_t MATCH_SIMPLE_PAYLOAD[12] = {
+     0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+diff --git a/libfprint/drivers/verimark/match.h b/libfprint/drivers/verimark/match.h
+index 2d9c4ae..530b27d 100644
+--- a/libfprint/drivers/verimark/match.h
++++ b/libfprint/drivers/verimark/match.h
+@@ -6,8 +6,7 @@
+  * the host. This module exposes the `0x99` opcode that drives that
+  * MoC pipeline.
+  *
+- * Layout per Ghidra (FUN_18007d0a0:58655-58858) and runtime
+- * validation (Phase 9 step 4.3+, docs/opcodes/0x99.yaml) :
++ * Wire layout :
+  *
+  *   request payload =
+  *     [tag(1)         : u32 LE = 01 00 00 00]
+@@ -22,12 +21,11 @@
+  *     [matchIndex : u32 LE]
+  *     [matchStrength : u32 LE]
+  *     [templateUpdate : u8]
+- *     [reserved : 23 bytes]   (semantics TBD)
++ *     [reserved : 23 bytes]
+  *
+- * Key insight from the Ghidra deep-dive : the secureBio nonce is
+- * generated LOCALLY by the host (vtable [+0x50] sub-cmd 8 is a
+- * local function inside the DLL, not a wire opcode). So the Linux
+- * driver can produce its own nonce via `getentropy(16)`.
++ * The secureBio nonce is generated LOCALLY by the host (no wire opcode
++ * is required to obtain it), so this driver simply produces its own via
++ * `getentropy(16)`.
+  */
+ 
+ #ifndef VERIMARK_MATCH_H
+@@ -57,10 +55,8 @@ struct VerimarkTransportIO;
+  * Generate a 16-byte cryptographically-random secureBio nonce.
+  *
+  * The sensor uses this nonce as part of the match command's payload.
+- * Per Ghidra (FUN_18007adb0:57891 → vtable [+0x50] sub-cmd 8), this
+- * nonce is generated *locally* by the Windows driver — no wire
+- * opcode is exchanged with the sensor to obtain it. So the Linux
+- * driver simply produces its own.
++ * The nonce is generated locally by the host; no wire opcode is
++ * exchanged with the sensor to obtain it.
+  *
+  * Uses `getentropy(3)` (POSIX 2013) which is available on Linux 3.17+
+  * (glibc 2.25+) and never blocks on the kernel RNG once seeded.
+@@ -79,10 +75,6 @@ bool verimark_match_generate_nonce(uint8_t out_nonce[VERIMARK_MATCH_NONCE_LEN]);
+ 
+ /**
+  * Match verdict returned by the sensor in a 36-byte qm struct.
+- *
+- * Field naming matches the Windows DLL's internal log format
+- * (`"matchScore = %d, matchIndex = %d, matchStrength = %d,
+- * templateUpdate = %d"`).
+  */
+ typedef struct {
+     uint32_t match_score;
+@@ -126,8 +118,8 @@ bool verimark_match_request(VerimarkSession *s,
+ 
+ 
+ /* ---------------------------------------------------------------------------
+- * 0x99 — simplified match call (the variant actually used by the canonical
+- * Linux verify pipeline, cf. python/verimark/match.py)
++ * 0x99 — simplified match call (the variant used by the canonical verify
++ * pipeline)
+  * ------------------------------------------------------------------------- */
+ 
+ #define VERIMARK_MATCH_VERDICT_MAX 256
+@@ -151,7 +143,7 @@ typedef struct {
+  * 11 zeros). The sensor sources the captured image + candidate
+  * enrollments from its internal session state, so this call is
+  * meaningful only after the `0x39 / 0x86 / 0x80 / 0x87 / 0x81`
+- * capture preamble (cf. `python/verimark/match.py`).
++ * capture preamble.
+  *
+  * Outcomes :
+  *   - `status == 0x0000` + non-empty response → match accepted ;
+diff --git a/libfprint/drivers/verimark/pairing.h b/libfprint/drivers/verimark/pairing.h
+index 26a9132..fb2b0c2 100644
+--- a/libfprint/drivers/verimark/pairing.h
++++ b/libfprint/drivers/verimark/pairing.h
+@@ -11,10 +11,11 @@
+  *
+  * TLV record header layout : `[tag:u16 LE][length:u16 LE][2 reserved][value]`.
+  *
+- * Until we reverse the Synaptics pairing process (separate phase), the
+- * Linux driver imports a sub1 blob extracted from the user.s existing device
+- * install (ipw2200 / Realtek pattern). The loader parses the blob and
+- * normalizes the keys to big-endian for the GnuTLS-based crypto layer.
++ * Until the Synaptics pairing process is implemented natively, the
++ * Linux driver imports a sub1 blob extracted from the user's existing
++ * vendor install (firmware-style import pattern). The loader parses the
++ * blob and normalizes the keys to big-endian for the GnuTLS-based
++ * crypto layer.
+  *
+  * **Security** : `VerimarkPairingData::client_priv_be` is a SECRET. Never
+  * log it or any derivative (master_secret, key_block, etc.) in plaintext.
+diff --git a/libfprint/drivers/verimark/proto.c b/libfprint/drivers/verimark/proto.c
+index a72abad..afba628 100644
+--- a/libfprint/drivers/verimark/proto.c
++++ b/libfprint/drivers/verimark/proto.c
+@@ -11,8 +11,7 @@
+ #include <string.h>
+ 
+ 
+-/* Magic constant for wValue computation (see palWinUsbBulkWriteEp0InEp0Out,
+- * FUN_1800478e0 in the synaWudfBioUsb132.dll pseudo-C). */
++/* Magic constant for wValue computation (Synaptics-specific). */
+ #define VERIMARK_MAGIC_WRITE  0x80004007u
+ 
+ 
+@@ -129,11 +128,9 @@ void verimark_format_serial(const VerimarkDeviceInfo *info, char buf[13])
+ 
+ /* ---- Storage info (opcode 0x3E) -------------------------------------------
+  *
+- * The on-wire layout was reverse-engineered from FUN_180062a80 in
+- * synaWudfBioUsb132.dll (see docs/opcodes/0x3e.yaml for the original notes,
+- * corrected here against captured runtime data):
++ * On-wire layout:
+  *
+- *   payload+0x00 .. +0x0b : 6 × u16 LE      (header — semantics TBD)
++ *   payload+0x00 .. +0x0b : 6 × u16 LE      (header)
+  *   payload+0x0c          : u16 LE          (entry_count)
+  *   payload+0x0e          : entry_count × 12 B (entries)
+  *
+diff --git a/libfprint/drivers/verimark/proto.h b/libfprint/drivers/verimark/proto.h
+index 934f329..e2e6e14 100644
+--- a/libfprint/drivers/verimark/proto.h
++++ b/libfprint/drivers/verimark/proto.h
+@@ -5,11 +5,6 @@
+  *   request  = [opcode:u8][payload...]
+  *   response = [status:u16 BE][payload...]
+  *
+- * See ../../docs/opcodes/README.md and ../../docs/protocol.md for the
+- * full reverse-engineered transport stack (in French — this driver targets
+- * upstream libfprint integration, hence English code; project docs remain
+- * in French).
+- *
+  * This layer is **pure C with no external dependency** (other than stdlib)
+  * so it can be tested standalone and is portable to any USB backend.
+  */
+@@ -31,7 +26,7 @@ extern "C" {
+ #define VERIMARK_PID       0x00F2
+ #define VERIMARK_MI_BIO    1     /* Interface MI_01 (biometric, vendor 0xff) */
+ 
+-/* ---- Vendor control transfer codes (see docs/protocol.md) ---- */
++/* ---- Vendor control transfer codes ---- */
+ 
+ #define VERIMARK_REQ_TLS_STATUS  0x14  /* IN, 1-2 bytes, TLS session status */
+ #define VERIMARK_REQ_CTRL_15     0x15  /* OUT, 0 bytes, control (IOCTL 0x68) */
+@@ -45,7 +40,6 @@ extern "C" {
+ #define VERIMARK_ALIGNMENT   8     /* bMaxPacketSize0 (Full-Speed) */
+ 
+ /* ---- Known Tudor opcodes (subset usable in cleartext) ---- */
+-/* Full opcode dictionary in docs/opcodes/. */
+ 
+ #define VERIMARK_OP_GET_DEVICE_INFO     0x01
+ #define VERIMARK_OP_GET_START_INFO      0x19
+@@ -62,21 +56,15 @@ extern "C" {
+ #define VERIMARK_OP_DO_PAIR             0x93
+ #define VERIMARK_OP_SECURE_BIO_CONNECT  0xA6
+ 
+-/* ---- Application status codes (response u16 BE) ----
+- *
+- * Decoded from the translation table FUN_180065270 in
+- * synaWudfBioUsb132.dll pseudo-C (see docs/phase5-tls-psk-linux.md).
+- */
++/* ---- Application status codes (response u16 BE) ---- */
+ #define VERIMARK_STATUS_OK           0x0000
+ #define VERIMARK_STATUS_UNKNOWN_OP   0x0104  /* opcode not recognized */
+ #define VERIMARK_STATUS_BAD_STATE    0x0404  /* e.g. capture not started */
+-/* Other codes documented in docs/phase5-tls-psk-linux.md. */
+ 
+ /* ---- Helpers ---- */
+ 
+ /**
+- * Compute wValue for a write 0x16 according to the Synaptics formula in
+- * `palWinUsbBulkWriteEp0InEp0Out` (FUN_1800478e0 of the pseudo-C):
++ * Compute wValue for a write 0x16 according to the Synaptics formula:
+  *   wValue = original_length & magic_write & 7   where magic_write = 0x80004007
+  *          = length & 7
+  *
+@@ -129,7 +117,7 @@ size_t verimark_encode_get_device_info(uint8_t *out_buf, size_t out_buf_size);
+ /**
+  * Parsed device-info payload (>= 36 bytes expected).
+  *
+- * See docs/opcodes/0x01.yaml. Multi-byte BE fields are byte-swapped.
++ * Multi-byte BE fields are byte-swapped.
+  */
+ typedef struct VerimarkDeviceInfo {
+     uint32_t version_word;      /* offset 0x00, byte-swapped */
+@@ -166,9 +154,8 @@ void verimark_format_serial(const VerimarkDeviceInfo *info, char buf[13]);
+ 
+ /* ---- Storage info (opcode 0x3E) ---- */
+ 
+-/* A storage partition entry. 12 bytes on the wire, parsed from
+- * `FUN_180062a80` of synaWudfBioUsb132.dll. Type 0x02 designates the
+- * **host partition** where biometric templates are stored. */
++/* A storage partition entry. 12 bytes on the wire. Type 0x02 designates
++ * the **host partition** where biometric templates are stored. */
+ typedef struct VerimarkStorageEntry {
+     uint8_t  type;      /* entry type — 0x02 == host partition */
+     uint8_t  b_1;       /* second byte — meaning TBD */
+diff --git a/libfprint/drivers/verimark/session.c b/libfprint/drivers/verimark/session.c
+index 6d237a7..d83eda0 100644
+--- a/libfprint/drivers/verimark/session.c
++++ b/libfprint/drivers/verimark/session.c
+@@ -293,7 +293,7 @@ size_t verimark_session_decrypt_appdata(VerimarkSession *s,
+ }
+ 
+ 
+-/* === Phase 10.3.b — async call_opcode (libgusb-only) ================== */
++/* === Async call_opcode (libgusb-only) ================================= */
+ 
+ #ifdef VERIMARK_HAVE_LIBGUSB
+ 
+diff --git a/libfprint/drivers/verimark/session.h b/libfprint/drivers/verimark/session.h
+index 5bf634b..653eaaa 100644
+--- a/libfprint/drivers/verimark/session.h
++++ b/libfprint/drivers/verimark/session.h
+@@ -1,17 +1,16 @@
+ /*
+  * session.h — Active TLS 1.2 session state + AppData wrappers.
+  *
+- * After the handshake completes (Phase 7.3.a, TBD), a `VerimarkSession`
+- * carries the derived AES-256-GCM keys and the per-direction sequence
+- * counters. This module provides the simplest possible API for the
+- * upper driver layer :
++ * After the handshake completes, a `VerimarkSession` carries the
++ * derived AES-256-GCM keys and the per-direction sequence counters.
++ * This module provides the simplest possible API for the upper driver
++ * layer :
+  *
+  *   - `verimark_session_init_from_key_block()` populates the session
+  *     from a 72-byte TLS 1.2 key_block (AEAD-only layout).
+  *   - `verimark_session_encrypt_appdata()` produces a full TLS record
+  *     ready to send on the wire (no `44 00 00 00` transport prefix —
+- *     that one is handshake-only, removed for AppData ; cf.
+- *     `docs/phase5-tls-psk-linux.md` § "Phase 6 — premiere AppData").
++ *     that one is handshake-only, removed for AppData).
+  *   - `verimark_session_decrypt_appdata()` consumes a full TLS record
+  *     and returns the plaintext (`[status:u16 BE][payload]` for Tudor
+  *     responses).
+@@ -96,7 +95,7 @@ size_t verimark_session_encrypt_appdata(VerimarkSession *s,
+  * decrypt_appdata, with proper sequence-counter management on both sides.
+  *
+  * `transport_io` must have `is_handshake=false` semantics (no `44 00 00 00`
+- * prefix on AppData records — see Phase 6 finding).
++ * prefix on AppData records).
+  *
+  * Inputs :
+  *   - `opcode`            : Tudor opcode (e.g. 0x01 = get_device_info)
+@@ -163,7 +162,7 @@ size_t verimark_session_decrypt_appdata(VerimarkSession *s,
+                                          uint8_t *out, size_t out_size);
+ 
+ 
+-/* --- Async call_opcode (Phase 10.3.b, libgusb-only) --------------------
++/* --- Async call_opcode (libgusb-only) ---------------------------------
+  *
+  * Non-blocking equivalent of verimark_session_call_opcode. Chains
+  * (encrypt → verimark_transceive_async → decrypt → parse status) inside
+diff --git a/libfprint/drivers/verimark/storage.c b/libfprint/drivers/verimark/storage.c
+index 5dafdea..874919c 100644
+--- a/libfprint/drivers/verimark/storage.c
++++ b/libfprint/drivers/verimark/storage.c
+@@ -2,8 +2,7 @@
+  * storage.c — Tudor storage layer 2 opcodes implementation.
+  *
+  * Each wrapper just builds the request payload, calls
+- * `verimark_session_call_opcode()`, and parses the response payload
+- * according to docs/opcodes/0x{9e,9f,a0}.yaml.
++ * `verimark_session_call_opcode()`, and parses the response payload.
+  */
+ 
+ #include "storage.h"
+@@ -27,11 +26,11 @@ static inline uint16_t read_le16(const uint8_t *p)
+  * 0x9e — GetDbInfo
+  * ------------------------------------------------------------------------- */
+ 
+-/* Response layout (Phase 9 step 4.2 runtime + Ghidra FUN_180085320:61901-3):
+- *   The Ghidra code reads u16 LE at offsets 0x16, 0x1c, 0x22 of the
+- *   FULL response (including the leading status u16 BE). Since
+- *   `verimark_session_call_opcode()` strips the status before handing
+- *   us the payload, our payload-relative offsets are minus 2 :
++/* Response layout : the sensor returns u16 LE counts at offsets
++ * 0x16, 0x1c, 0x22 of the FULL response (including the leading
++ * status u16 BE). Since `verimark_session_call_opcode()` strips the
++ * status before handing us the payload, our payload-relative offsets
++ * are minus 2 :
+  *     +0x14 = count_class_1
+  *     +0x1a = count_class_2
+  *     +0x20 = count_class_3
+@@ -82,7 +81,7 @@ bool verimark_storage_get_db_info(VerimarkSession *s,
+  * 0x9f — GetObjectList
+  * ------------------------------------------------------------------------- */
+ 
+-/* Response layout (Phase 9 step 4.2 runtime):
++/* Response layout :
+  *     +0x00 = count : u8
+  *     +0x01 = reserved : u8
+  *     +0x02 = tuids[count * 16] : opaque
+@@ -124,9 +123,8 @@ bool verimark_storage_get_object_list(VerimarkSession *s,
+     if (payload_len < 2 + reported * VERIMARK_STORAGE_TUID_LEN)
+         return false;
+ 
+-    /* Truncate at our compile-time cap. The Windows Hello / libfprint
+-     * convention is 10 fingers max (we cap at 8 which matches the
+-     * sensor's observed enrollment count). */
++    /* Truncate at our compile-time cap (8 matches the sensor's
++     * observed enrollment count). */
+     size_t to_copy = reported;
+     if (to_copy > VERIMARK_STORAGE_MAX_OBJECTS)
+         to_copy = VERIMARK_STORAGE_MAX_OBJECTS;
+@@ -145,7 +143,7 @@ bool verimark_storage_get_object_list(VerimarkSession *s,
+  * 0xa0 — GetObjectInfo
+  * ------------------------------------------------------------------------- */
+ 
+-/* Request payload (per Ghidra FUN_180086060:62178-82) :
++/* Request payload :
+  *   [opcode]
+  *   [class:1] [pad:3 = 00 00 00] [tuid:16]
+  *   = 21 bytes total, 20 bytes payload after the opcode.
+diff --git a/libfprint/drivers/verimark/storage.h b/libfprint/drivers/verimark/storage.h
+index 9644734..d50c1b5 100644
+--- a/libfprint/drivers/verimark/storage.h
++++ b/libfprint/drivers/verimark/storage.h
+@@ -6,14 +6,8 @@
+  * its internal flash partitioned by "class" (class 1 = enrollments
+  * proper, class 2/3 = template payloads with restricted access).
+  *
+- * See:
+- *   - docs/opcodes/0x9e.yaml — get_db_info
+- *   - docs/opcodes/0x9f.yaml — get_object_list
+- *   - docs/opcodes/0xa0.yaml — get_object_info
+- *   - docs/phase8-ghidra-findings.md § Layer 2 storage
+- *
+  * Class 1 is the only class we observe enrollments on with the
+- * 8-finger Windows Hello configuration. The cap of 8 below mirrors
++ * reference 8-finger configuration. The cap of 8 below mirrors
+  * libfprint's typical max enrollments per user.
+  */
+ 
+@@ -42,9 +36,9 @@ struct VerimarkTransportIO;
+ /**
+  * Database object counts per class. Returned by `0x9e GetDbInfo`.
+  *
+- * Runtime semantic (Phase 9 step 4.2, 8-finger reference):
++ * Runtime semantic (8-finger reference):
+  *   count_class_1 = 8 (= number of fingerprints enrolled)
+- *   count_class_2 / count_class_3 = sensor-side metadata, exact meaning TBD.
++ *   count_class_2 / count_class_3 = sensor-side metadata.
+  */
+ typedef struct {
+     uint16_t count_class_1;
+@@ -96,7 +90,7 @@ typedef struct {
+  *
+  * Truncates silently if the sensor returns more than
+  * `VERIMARK_STORAGE_MAX_OBJECTS` entries (highly unlikely given the
+- * 8-finger Windows Hello cap).
++ * 8-finger cap).
+  */
+ bool verimark_storage_get_object_list(VerimarkSession *s,
+                                       struct VerimarkTransportIO *io,
+@@ -110,11 +104,9 @@ bool verimark_storage_get_object_list(VerimarkSession *s,
+  * ------------------------------------------------------------------------- */
+ 
+ /**
+- * Object metadata returned by `0xa0 GetObjectInfo`. Exact field
+- * semantics are unidentified ; runtime shows all zeros for class=1
+- * (probably "metadata not exposed for enrollment master IDs").
+- *
+- * Stored verbatim from the wire ; the caller can introspect.
++ * Object metadata returned by `0xa0 GetObjectInfo`. Runtime shows all
++ * zeros for class=1 (probably "metadata not exposed for enrollment
++ * master IDs"). Stored verbatim from the wire.
+  */
+ typedef struct {
+     uint8_t bytes[10];
+@@ -123,8 +115,7 @@ typedef struct {
+ /**
+  * Send opcode `0xa0` and parse the response.
+  *
+- * Request payload (20 octets, per Ghidra FUN_180086060 lines
+- * 62178-62182): `[class:1][pad:3=00 00 00][tuid:16]`.
++ * Request payload (20 octets): `[class:1][pad:3=00 00 00][tuid:16]`.
+  *
+  * Runtime confirms class=1 returns 10 zero bytes for any tuid from
+  * `get_object_list(class=1)` ; class 2/3 with class-1 tuids return
+@@ -132,7 +123,7 @@ typedef struct {
+  *
+  * NB: opcode `0xa1 GetObjectData` (template extraction) refuses
+  * systematically — likely the Match-on-Chip protection in action.
+- * See `docs/opcodes/0xa1.yaml` ; not exposed by this module.
++ * Not exposed by this module.
+  */
+ bool verimark_storage_get_object_info(VerimarkSession *s,
+                                       struct VerimarkTransportIO *io,
+@@ -149,8 +140,7 @@ bool verimark_storage_get_object_info(VerimarkSession *s,
+ /**
+  * Delete a single object from sensor storage by tuid.
+  *
+- * Request payload layout (per Ghidra FUN_180086c30 and
+- * `docs/opcodes/0xa3.yaml`) : `[class:1][pad:3=00 00 00][tuid:16]`
++ * Request payload layout : `[class:1][pad:3=00 00 00][tuid:16]`
+  * = 20 bytes after the opcode. Identical layout to `0xa0
+  * GetObjectInfo` ; only the opcode byte differs.
+  *
+@@ -161,8 +151,6 @@ bool verimark_storage_get_object_info(VerimarkSession *s,
+  * jointly back one fingerprint. The caller usually only cares that
+  * the count is non-zero ; pass NULL for `deleted_count_out` to skip.
+  *
+- * Runtime confirmed 2026-05-25 (cf. `tools/probe_delete.py`).
+- *
+  * Returns true on transport success ; sensor-level errors (e.g.
+  * `0x8306` = no such object) are reported via `*status_out` with
+  * `*deleted_count_out` left at 0.
+@@ -184,7 +172,7 @@ bool verimark_storage_delete_object(VerimarkSession *s,
+  * `0x99` verdict) to the corresponding `storage_handle` (= class-1
+  * tuid that `verimark list` / `verimark delete` operate on).
+  *
+- * Wire layout (per `docs/opcodes/0xa0.yaml` § Phase 9 v3) :
++ * Wire layout :
+  *   request  : opcode + [class=02][pad:3=00 00 00][matched_tuid:16] = 20 B
+  *   response : 50 B, storage_handle at offset 18..33.
+  *
+@@ -192,9 +180,8 @@ bool verimark_storage_delete_object(VerimarkSession *s,
+  * `0x8306` = "matched_tuid not in class-2") are reported via
+  * `*status_out` with `out_storage_handle` left zeroed.
+  *
+- * Discovered runtime 2026-05-25 — the matched_tuid carried by a
+- * positive 0x99 verdict is NOT directly comparable to the tuid
+- * libfprint stores ; this opcode is the bridge.
++ * The matched_tuid carried by a positive 0x99 verdict is NOT directly
++ * comparable to the tuid libfprint stores ; this opcode is the bridge.
+  */
+ bool verimark_storage_resolve_template_to_handle(
+     VerimarkSession *s,
+diff --git a/libfprint/drivers/verimark/tls.c b/libfprint/drivers/verimark/tls.c
+index 2634dad..f28dc9d 100644
+--- a/libfprint/drivers/verimark/tls.c
++++ b/libfprint/drivers/verimark/tls.c
+@@ -93,8 +93,7 @@ size_t verimark_tls_encode_handshake_msg(uint8_t hs_type,
+ size_t verimark_tls_build_client_hello(const uint8_t random_32[32],
+                                        uint8_t *out, size_t out_size)
+ {
+-    /* Reverse-engineered from synaWudfBioUsb132.dll FUN_180072530, validated
+-     * runtime (Phase 5). Layout :
++    /* Synaptics ClientHello layout :
+      *   [5]   TLS record hdr  : 16 03 03 00 4b   (len = 75)
+      *   [4]   HS hdr          : 01 00 00 47      (ClientHello, len 71)
+      *   [2]   version         : 03 03
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index f5d322e..06ea512 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -10,11 +10,7 @@
+  * only depend on the `verimark_ctrl_out` / `verimark_ctrl_in` primitives,
+  * so they are shared across backends.
+  *
+- * Status: Phase 6 skeleton. The high-level logic mirrors the
+- * synaWudfBioUsb132.dll pseudo-C (see ../../docs/protocol.md and
+- * ../../docs/phase5-tls-psk-linux.md) and the Python prototype
+- * ../../tools/verimark_transport.py. Building requires libgusb 0.4+
+- * (provided by shell.nix; see ../../README.md).
++ * Building requires libgusb 0.4+.
+  */
+ 
+ #include "proto.h"
+@@ -153,7 +149,7 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+ #endif /* VERIMARK_HAVE_LIBGUSB (closes the original sync impl / stubs split) */
+ 
+ 
+-/* === Phase 10.3.a — async transport (libgusb-backed) ================== */
++/* === Async transport (libgusb-backed) ================================= */
+ #ifdef VERIMARK_HAVE_LIBGUSB
+ 
+ /**
+@@ -623,8 +619,8 @@ VerimarkResult verimark_transceive(VerimarkUsbHandle *h,
+     memcpy(send_buf, data, data_len);
+ 
+     /* Write 0x16 — payloads > 4096 would need to loop with per-chunk
+-     * wValue (cf. pseudo-C FUN_1800478e0, "first chunk" flag and
+-     * magic_high bits). Single-chunk only for now. */
++     * wValue ("first chunk" flag and magic_high bits in the Synaptics
++     * formula). Single-chunk only for now. */
+     VerimarkResult r = VERIMARK_OK;
+     if (aligned <= VERIMARK_CHUNK_SIZE) {
+         r = verimark_ctrl_out(h, VERIMARK_REQ_WRITE, wvalue, 0,
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+index a501e47..b54f691 100644
+--- a/libfprint/drivers/verimark/transport.h
++++ b/libfprint/drivers/verimark/transport.h
+@@ -5,9 +5,8 @@
+  * a GUsbDevice (libfprint build) or a libusb_device_handle (standalone
+  * tests).
+  *
+- * For wire-level details see ../../docs/protocol.md § Couche transport.
+- * The wValue formula, fragmentation, and 8-byte alignment all come from
+- * `palWinUsbBulkWriteEp0InEp0Out` (see ../../docs/phase5-tls-psk-linux.md).
++ * The wValue formula, fragmentation, and 8-byte alignment are Synaptics-
++ * specific quirks of the vendor protocol.
+  *
+  * The API is transport-agnostic; implementations are:
+  *   - verimark-transport-gusb.c   (libgusb, for libfprint)
+@@ -87,7 +86,7 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+ /* --- High-level helpers --------------------------------------------------- */
+ 
+ /**
+- * Init sequence observed in `_tudorInitDevice` and the matik captures:
++ * Init sequence required by the device:
+  *   1. bRequest=0x19 OUT, wValue=0x0001 (no data)
+  *   2. bRequest=0x1A IN, wLength=1 (reads 1 byte — typically 0x01)
+  *
+@@ -186,11 +185,10 @@ void verimark_handle_free(VerimarkUsbHandle *h);
+ 
+ /* --- Async transport (libgusb only — gated by VERIMARK_HAVE_LIBGUSB) -----
+  *
+- * Phase 10.3.a foundation : non-blocking variants of ctrl_out / ctrl_in /
+- * transceive that integrate with the libfprint GMainLoop. The sync variants
+- * above are KEPT compilable in parallel — they are still used by the
+- * standalone test build and by the (legacy) bootstrap orchestrator until
+- * 10.3.c migrates it to async too.
++ * Non-blocking variants of ctrl_out / ctrl_in / transceive that integrate
++ * with the libfprint GMainLoop. The sync variants above are KEPT compilable
++ * in parallel — they are still used by the standalone test build and by the
++ * (legacy) bootstrap orchestrator.
+  *
+  * Standard GAsyncReadyCallback convention :
+  *   - `_async()` returns immediately and arranges for `callback` to be
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 8c98f93..e2e0a52 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1,9 +1,6 @@
+ /*
+  * verimark.c — libfprint driver for the Kensington VeriMark DT (047d:00f2).
+  *
+- * Target: upstream integration as `libfprint/drivers/verimark/`.
+- *
+- * Phase 7.4 status (2026-05-23):
+  *   - probe()  : reads opcode 0x01 (get_device_info) in cleartext for
+  *                serial extraction.
+  *   - open()   : claims MI_01, runs init sequence, loads sub1 pairing
+@@ -14,18 +11,13 @@
+  *   - list()   : reads the storage partition table (cleartext 0x3E),
+  *                then enumerates enrolled templates via TLS AppData
+  *                (0x40 read partition over `session`).
+- *   - verify() / enroll() / identify() / delete() : require additional
+- *                Tudor opcodes that are reachable via the now-active
+- *                TLS session ; see Phase 7.5.
+  *
+  * Reference driver pattern: `libfprint/drivers/goodixmoc/` (match-on-chip,
+  * USB vendor — the closest functional match).
+  *
+  * Synchronous handshake : `verimark_handshake_perform()` blocks ~100ms.
+  * Acceptable for open() ; for an upstream-grade driver we would wrap it
+- * in a `fpi_ssm` state machine. The current implementation is testable
+- * end-to-end via `verimark_handshake_runtime` (standalone binary built
+- * by the meson `verimark` target).
++ * in a `fpi_ssm` state machine.
+  */
+ 
+ #include "verimark.h"
+@@ -67,7 +59,7 @@ struct _FpiDeviceVerimark {
+     VerimarkSession session;
+     gboolean session_active;
+ 
+-    /* Phase 10.3.d / 10.3.e : async state machines.
++    /* Async state machines.
+      *
+      * `task_ssm` is non-NULL while a verify, identify, or enroll task
+      * is in flight. Exactly one of `verify_ctx` / `enroll_ctx` is
+@@ -225,14 +217,11 @@ static void verimark_probe(FpDevice *device)
+  *   2.  /var/lib/fprintd/verimark/sub1.bin                       (single-device
+  *       legacy fallback)
+  *   3.  $XDG_CONFIG_HOME/verimark/sub1-<usb_iserial>.bin         (developer
+- *       convenience, matches the Python PoC's naming convention)
++ *       convenience)
+  *   4.  $XDG_CONFIG_HOME/verimark/sub1.bin                       (developer
+  *       fallback)
+  *
+- * `$XDG_CONFIG_HOME` defaults to `$HOME/.config`. The dash separator
+- * + USB iSerial of path 3 mirrors the convention used by
+- * `python/verimark/handshake.py:_default_sub1_path()` and lets the C
+- * driver share a bootstrap with the Python reference PoC.
++ * `$XDG_CONFIG_HOME` defaults to `$HOME/.config`.
+  *
+  * Returns a heap-allocated path (caller frees with g_free), or NULL.
+  */
+@@ -357,11 +346,11 @@ verimark_try_bootstrap(FpiDeviceVerimark *self)
+ 
+ 
+ /* ========================================================================
+- * Phase 10.3.g — async open()
++ * Async open()
+  * ========================================================================
+  *
+- * Wires `verimark_handshake_perform_async()` (Phase 10.3.c) into the
+- * open() vfunc. The handshake's two USB round-trips (ClientHello→ServerHello,
++ * Wires `verimark_handshake_perform_async()` into the open() vfunc.
++ * The handshake's two USB round-trips (ClientHello→ServerHello,
+  * flight2→server_resp) no longer block the GMainLoop. Stale-state
+  * recovery (plaintext close_notify + drain + retry handshake) is also
+  * chained through the same callback, gated by a `attempted_recovery`
+@@ -467,8 +456,7 @@ static void verimark_open(FpDevice *device)
+     /* Plain pointer — open_complete steals the GError reference. */
+     GError *error = NULL;
+ 
+-    /* USB-level reset before claiming. Mirrors python/verimark/match.py
+-     * reset_dev() which does the same. Crucial for robustness across
++    /* USB-level reset before claiming. Crucial for robustness across
+      * interrupted previous sessions : if a prior fprintd was SIGKILLed
+      * mid-USB-transfer, the kernel USB driver and/or sensor firmware
+      * can be left in a state where new control transfers queue without
+@@ -476,7 +464,7 @@ static void verimark_open(FpDevice *device)
+      * reset fails (no permission, device gone), continue and let the
+      * downstream claim_interface report the real error. */
+     g_usb_device_reset(usb, NULL);
+-    g_usleep(300 * 1000);   /* 0.3s — same as python reset_dev() */
++    g_usleep(300 * 1000);   /* 0.3s post-reset settle */
+ 
+     if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
+         fpi_device_open_complete(device, error);
+@@ -581,7 +569,7 @@ static FpPrint *verimark_gallery_find_by_tuid(GPtrArray *gallery,
+ 
+ /* ---- verify pipeline ----------------------------------------------------
+  *
+- * Canonical Linux verify flow (cf. `python/verimark/match.py`) :
++ * Canonical verify flow :
+  *
+  *   preamble : 0x19 / 0x86 events_1_2 / 0x87 cursor=0 / 0x86 subscribe_all
+  *   capture  : 0x39 RICH / 0x86 frame_ready_arm / 0x80 / loop 0x87 / 0x39 SPARSE
+@@ -607,9 +595,8 @@ static FpPrint *verimark_gallery_find_by_tuid(GPtrArray *gallery,
+ #define VERIMARK_VERIFY_MAX_ATTEMPTS     3
+ 
+ 
+-/* Capture config templates — exact bytes from python/verimark/match.py
+- * CAPTURE_CONFIG_VERIFY_VARIANTS["…"] / Ghidra reverse of the WindDbg
+- * input structs. Each is 124 bytes (= the `0x39` payload). */
++/* Capture config templates — canonical verify-variant 124-byte payloads
++ * for the `0x39` capture_config opcode. */
+ 
+ static const uint8_t VERIMARK_CFG_RICH[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
+     0x00, 0x71, 0x02, 0x00,
+@@ -644,8 +631,7 @@ static const uint8_t VERIMARK_CFG_SPARSE[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
+ 
+ /* WARM template — firmware "retry mode" / brief red-LED feedback. Sent
+  * after a no-match verdict so the user gets a visual cue (and on retry
+- * attempts to loosen the pre-filter). Bytes from
+- * python/verimark/match.py:CAPTURE_CONFIG_VERIFY_VARIANTS["WARM"]. */
++ * attempts to loosen the pre-filter). */
+ static const uint8_t VERIMARK_CFG_WARM[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
+     0xe8, 0x03, 0x00, 0x00,
+     0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20,
+@@ -678,15 +664,13 @@ static const uint8_t VERIMARK_CFG_MIXED[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ };
+ 
+-/* 16-byte structured 0x80 payload — "verify-style" capture_start.
+- * Source: python/verimark/match.py:build_capture_start_payload(). */
++/* 16-byte structured 0x80 payload — "verify-style" capture_start. */
+ static const uint8_t VERIMARK_CAPSTART_VERIFY[VERIMARK_CAPTURE_START_PAYLOAD_LEN] = {
+     0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+     0x01, 0x00, 0x00, 0x08, 0x01, 0x01, 0x01, 0x00,
+ };
+ 
+-/* 0x80 capture_start ENROLL payload (param_2 = 0x0c). Cf.
+- * python/verimark/enroll.py:build_capture_start_enroll_payload(). */
++/* 0x80 capture_start ENROLL payload (param_2 = 0x0c). */
+ static const uint8_t VERIMARK_CAPSTART_ENROLL[VERIMARK_CAPTURE_START_PAYLOAD_LEN] = {
+     0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+     0x01, 0x00, 0x00, 0x08, 0x01, 0x01, 0x01, 0x00,
+@@ -743,7 +727,7 @@ static const uint8_t VERIMARK_MASK_EVENT_2[VERIMARK_EVENT_MASK_LEN] = {
+ 
+ 
+ /* ========================================================================
+- * Phase 10.3.d — async verify/identify SSM
++ * Async verify/identify SSM
+  * ========================================================================
+  *
+  * Replaces the previous synchronous `verimark_run_capture_match_pipeline`
+@@ -755,7 +739,7 @@ static const uint8_t VERIMARK_MASK_EVENT_2[VERIMARK_EVENT_MASK_LEN] = {
+  *
+  * Architecture :
+  *   - Each Tudor opcode is one async call via
+- *     `verimark_session_call_opcode_async()` (Phase 10.3.b).
++ *     `verimark_session_call_opcode_async()`.
+  *   - The poll loop becomes a state pair (`POLL_READ` / `POLL_WAIT`) that
+  *     re-fires `event_read` every 250 ms via `g_timeout_add` until
+  *     frame_ready, false-detect (RICH only), or the 30 s per-attempt
+@@ -1541,7 +1525,7 @@ verimark_run_verify_ssm(FpDevice *device)
+ static void verimark_verify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+-    /* Phase 10.3.d : delegate to the shared async SSM. The SSM checks
++    /* Delegate to the shared async SSM. The SSM checks
+      * `session_active`, builds its own ctx, runs through preamble /
+      * attempts / postamble / resolve via async opcodes, and calls
+      * `fpi_device_verify_complete` in its done callback. */
+@@ -1550,7 +1534,7 @@ static void verimark_verify(FpDevice *device)
+ 
+ 
+ /* ========================================================================
+- * Phase 10.3.e — async enroll SSM
++ * Async enroll SSM
+  * ========================================================================
+  *
+  * Replaces the previous synchronous `verimark_enroll` (with its inline
+@@ -2482,7 +2466,7 @@ verimark_run_enroll_ssm(FpDevice *device)
+ static void verimark_enroll(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+-    /* Phase 10.3.e : delegate to the shared async enroll SSM. */
++    /* Delegate to the shared async enroll SSM. */
+     verimark_run_enroll_ssm(device);
+ }
+ 
+@@ -2514,8 +2498,8 @@ verimark_gallery_find_by_tuid(GPtrArray *gallery,
+ static void verimark_identify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+-    /* Phase 10.3.d : same async SSM as verify ; the done callback
+-     * dispatches based on `fpi_device_get_current_action()`. */
++    /* Same async SSM as verify ; the done callback dispatches based
++     * on `fpi_device_get_current_action()`. */
+     verimark_run_verify_ssm(device);
+ }
+ 
+@@ -2573,9 +2557,7 @@ static void verimark_list(FpDevice *device)
+     /*
+      * Enumerate the class-1 storage handles via opcode 0x9f (= the
+      * sensor-side fingerprint slots). Each handle becomes one FpPrint
+-     * carrying the 16-byte tuid as opaque data. Mirrors what
+-     * `python/verimark/storage.py:list_class_1()` does in the
+-     * reference PoC.
++     * carrying the 16-byte tuid as opaque data.
+      *
+      * Requires an active TLS session ; sub1 must have been found by
+      * `find_sub1_path()` during open(). If not, surface a clear error
+@@ -2737,7 +2719,7 @@ static void fpi_device_verimark_init(FpiDeviceVerimark *self)
+ 
+ 
+ /* ========================================================================
+- * Phase 10.3.f — cancellation
++ * Cancellation
+  * ========================================================================
+  *
+  * libfprint's cancellation path :
+diff --git a/libfprint/drivers/verimark/verimark.h b/libfprint/drivers/verimark/verimark.h
+index c759bdf..f4ba846 100644
+--- a/libfprint/drivers/verimark/verimark.h
++++ b/libfprint/drivers/verimark/verimark.h
+@@ -1,12 +1,5 @@
+ /*
+  * verimark.h — libfprint driver for the Kensington VeriMark DT (047d:00f2).
+- *
+- * Target: upstream integration as `libfprint/drivers/verimark/`.
+- *
+- * Phase 6 status: skeleton. probe()/open()/close() use the cleartext Tudor
+- * channel (opcode 0x01 = get_device_info). verify/enroll/identify are stubs
+- * until the TLS-PSK handshake is solved (see
+- * ../../docs/phase5-tls-psk-linux.md § "Question résiduelle").
+  */
+ 
+ #ifndef VERIMARK_H

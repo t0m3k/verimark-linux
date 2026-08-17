@@ -2,9 +2,11 @@ import gzip
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 from tests.fixtures import valid_blob
@@ -408,7 +410,96 @@ class PackageSourceBoundaryTests(unittest.TestCase):
 
 
 class PackageSeriesValidationTests(unittest.TestCase):
-    def test_prepare_rejects_blank_duplicate_traversal_and_symlink_entries(self):
+    def test_private_staging_rejects_unchecked_symlink_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_directory = root / "makepkg-src"
+            staged_directory = source_directory / ".verimark-patches"
+            source_directory.mkdir()
+            patch_paths = [PATCH_SERIES, *sorted(PATCH_GENERATION.glob("*.patch"))]
+            for path in patch_paths:
+                (source_directory / path.name).symlink_to(path.resolve())
+            untrusted = root / "outside.patch"
+            untrusted.write_text("unchecked content outside the source stage\n")
+            first_patch = source_directory / patch_paths[1].name
+            first_patch.unlink()
+            first_patch.symlink_to(untrusted)
+            command = (
+                'error() { printf "error: %s\\n" "$*" >&2; }\n'
+                'source "$1"\n'
+                '_stage_patch_series "$2" "$3"\n'
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    command,
+                    "stage-test",
+                    str(PACKAGE_BUILD),
+                    str(source_directory),
+                    str(staged_directory),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("checksum mismatch", result.stderr)
+            if staged_directory.exists():
+                self.assertFalse(
+                    any(path.is_symlink() for path in staged_directory.iterdir())
+                )
+
+    @unittest.skipUnless(shutil.which("makepkg"), "makepkg is required")
+    def test_real_makepkg_staging_accepts_checked_local_source_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build_directory = Path(directory)
+            wrapper = build_directory / "PKGBUILD"
+            staged_sources = [PATCH_SERIES, *sorted(PATCH_GENERATION.glob("*.patch"))]
+            for path in staged_sources:
+                (build_directory / path.name).symlink_to(path)
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    source {PACKAGE_BUILD}
+                    source[0]="libfprint::git+file://{DRIVER_WORKTREE}#commit=$_commit"
+                    """
+                )
+            )
+
+            result = subprocess.run(
+                [
+                    "makepkg",
+                    "--nobuild",
+                    "--nodeps",
+                    "--cleanbuild",
+                    "--skippgpcheck",
+                    "--noconfirm",
+                ],
+                cwd=build_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(
+                (build_directory / "src" / "series").is_symlink(),
+                "test must exercise makepkg's real local-source symlink staging",
+            )
+            checkout = build_directory / "src" / "libfprint"
+            base = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD~62"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(base.returncode, 0, base.stderr)
+            self.assertEqual(base.stdout.strip(), PIN)
+
+    def test_private_validator_rejects_blank_duplicate_traversal_and_symlink_entries(self):
         cases = {
             "blank": (
                 "0001-valid.patch\n\n0002-valid.patch\n",
@@ -447,8 +538,7 @@ class PackageSeriesValidationTests(unittest.TestCase):
                 command = (
                     'error() { printf "error: %s\\n" "$*" >&2; }\n'
                     'source "$1"\n'
-                    'srcdir="$2"\n'
-                    "prepare\n"
+                    '_validate_patch_series "$2/series" "$2"\n'
                 )
 
                 result = subprocess.run(

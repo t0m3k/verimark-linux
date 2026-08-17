@@ -125,6 +125,8 @@ done
 rmdir "${temporary_directory}/raw"
 
 validate_generation "${temporary_directory}"
+chmod 0755 "${temporary_directory}"
+chmod 0644 "${temporary_directory}/series" "${temporary_directory}"/*.patch
 
 generation_name="${EXPECTED_BASE_COMMIT:0:12}-${resolved_ref:0:12}"
 generation="${GENERATIONS}/${generation_name}"

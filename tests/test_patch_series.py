@@ -5,13 +5,14 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
 
 
 BASE_COMMIT = "c4654fdc85c25afdd9115bec2f95a44145ae3b94"
-DRIVER_REF = "verimark-both-rebased"
+DRIVER_REF = "verimark-both-publishable"
 REPOSITORY = Path(__file__).resolve().parents[1]
 DRIVER_WORKTREE = REPOSITORY / ".driver-worktrees" / "libfprint"
 PATCH_ROOT = REPOSITORY / "patches" / "libfprint"
@@ -23,6 +24,21 @@ PATCH_NAME = re.compile(r"^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$")
 LICENSE_COMPATIBLE_PREFIXES = ("data/", "libfprint/", "tests/")
 LICENSE_COMPATIBLE_FILES = {"meson.build"}
 SCELLES_AUTHOR = "Sébastien Celles <s.celles@gmail.com>"
+CLEANUP_AUTHOR = "Tomasz Tracz <t@t90.dev>"
+PROHIBITED_RESIDUE = {
+    "unreviewed bio-serial": re.compile(r"D84CD3B6708B0000", re.IGNORECASE),
+    "credential extractor": re.compile(
+        r"powershell|pwsh|\.ps1|extract_pairingdata", re.IGNORECASE
+    ),
+    "named Windows capture": re.compile(
+        r"windows[^\n]{0,100}(?:pcap|sub1)|"
+        r"(?:pcap|sub1)[^\n]{0,100}windows|"
+        r"\b20\d{2}-\d{2}-\d{2}[^\n]{0,30}pcap|"
+        r"fresh-pairing-bootstrap\.pcapng",
+        re.IGNORECASE,
+    ),
+    "absolute temporary harness path": re.compile(r"/tmp/"),
+}
 
 
 def run(*arguments, cwd=REPOSITORY, env=None):
@@ -71,6 +87,24 @@ def clone_at(test_case, destination, revision):
     test_case.assertEqual(checked_out.returncode, 0, checked_out.stderr)
 
 
+def apply_series(test_case, checkout):
+    clone_at(test_case, checkout, BASE_COMMIT)
+    for name in read_series():
+        applied = run(
+            "git", "-C", str(checkout), "am", "--keep-cr",
+            str((CURRENT / name).resolve()),
+        )
+        test_case.assertEqual(applied.returncode, 0, f"{name}: {applied.stderr}")
+
+
+def read_text_tree(root):
+    return "\n".join(
+        path.read_text(errors="replace")
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    )
+
+
 class PatchSeriesTests(unittest.TestCase):
     def test_series_is_nonempty_ordered_and_unique(self):
         names = read_series()
@@ -94,6 +128,14 @@ class PatchSeriesTests(unittest.TestCase):
         exported = {path.name for path in CURRENT.glob("*.patch")}
 
         self.assertEqual(exported, listed)
+
+    def test_current_generation_has_project_source_permissions(self):
+        generation = CURRENT.resolve()
+
+        self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o755)
+        for path in (generation / "series", *generation.glob("*.patch")):
+            with self.subTest(path=path.name):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
 
     def test_patches_preserve_mail_authorship_and_license_compatible_targets(self):
         authors = []
@@ -119,7 +161,16 @@ class PatchSeriesTests(unittest.TestCase):
                         before,
                     )
 
-        self.assertIn(SCELLES_AUTHOR, authors)
+        self.assertEqual(authors, [SCELLES_AUTHOR] * 61 + [CLEANUP_AUTHOR])
+
+    def test_active_patches_exclude_prohibited_provenance_residue(self):
+        patch_text = "\n".join(
+            (CURRENT / name).read_text(errors="replace") for name in read_series()
+        )
+
+        for description, pattern in PROHIBITED_RESIDUE.items():
+            with self.subTest(description=description):
+                self.assertIsNone(pattern.search(patch_text))
 
     def test_active_patch_series_registers_both_verimark_ids(self):
         patch_text = "\n".join((CURRENT / name).read_text() for name in read_series())
@@ -137,13 +188,7 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertTrue(DRIVER_WORKTREE.is_dir(), "driver checkout is required")
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / "libfprint"
-            clone_at(self, checkout, BASE_COMMIT)
-            for name in read_series():
-                applied = run(
-                    "git", "-C", str(checkout), "am", "--keep-cr",
-                    str((CURRENT / name).resolve()),
-                )
-                self.assertEqual(applied.returncode, 0, f"{name}: {applied.stderr}")
+            apply_series(self, checkout)
 
             count = len(read_series())
             resolved_base = run_checked(
@@ -152,16 +197,72 @@ class PatchSeriesTests(unittest.TestCase):
             self.assertEqual(resolved_base, BASE_COMMIT)
             authors = run_checked(
                 self,
-                "git", "-C", str(checkout), "log", "--format=%an <%ae>",
+                "git", "-C", str(checkout), "log", "--reverse",
+                "--format=%an <%ae>",
                 f"{BASE_COMMIT}..HEAD",
             ).splitlines()
-            self.assertIn(SCELLES_AUTHOR, authors)
+            self.assertEqual(authors, [SCELLES_AUTHOR] * 61 + [CLEANUP_AUTHOR])
+
+    def test_materialized_driver_has_only_implemented_features_for_both_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            driver = checkout / "libfprint" / "drivers" / "verimark"
+            source = (driver / "verimark.c").read_text()
+            header = (driver / "proto.h").read_text()
+
+            id_table = re.search(
+                r"static const FpIdEntry id_table\[\] = \{(.*?)\n\};",
+                source,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(id_table)
+            self.assertEqual(
+                re.findall(r"\.pid = (VERIMARK_PID_[A-Z]+)", id_table.group(1)),
+                ["VERIMARK_PID_DT", "VERIMARK_PID_IT"],
+            )
+            self.assertRegex(header, r"(?m)^#define VERIMARK_PID_DT\s+0x00F2\b")
+            self.assertRegex(header, r"(?m)^#define VERIMARK_PID_IT\s+0x8054\b")
+
+            features = re.search(
+                r"dev_class->features\s*=\s*(.*?);", source, re.DOTALL
+            )
+            self.assertIsNotNone(features)
+            self.assertEqual(
+                set(re.findall(r"FP_DEVICE_FEATURE_[A-Z_]+", features.group(1))),
+                {
+                    "FP_DEVICE_FEATURE_IDENTIFY",
+                    "FP_DEVICE_FEATURE_VERIFY",
+                    "FP_DEVICE_FEATURE_STORAGE",
+                    "FP_DEVICE_FEATURE_STORAGE_LIST",
+                    "FP_DEVICE_FEATURE_STORAGE_DELETE",
+                },
+            )
+            for callback in ("enroll", "identify", "verify", "list", "delete"):
+                with self.subTest(callback=callback):
+                    self.assertRegex(
+                        source,
+                        rf"dev_class->{callback}\s*=\s*verimark_{callback};",
+                    )
+            self.assertNotRegex(source, r"dev_class->capture\s*=")
+
+    def test_materialized_source_excludes_prohibited_provenance_residue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            driver_text = read_text_tree(
+                checkout / "libfprint" / "drivers" / "verimark"
+            )
+
+            for description, pattern in PROHIBITED_RESIDUE.items():
+                with self.subTest(description=description):
+                    self.assertIsNone(pattern.search(driver_text))
 
     def test_pkgbuild_applies_the_checked_series_in_order(self):
         package_build = (REPOSITORY / "packaging" / "arch" / "PKGBUILD").read_text()
 
-        self.assertIn('done < "${srcdir}/series"', package_build)
-        self.assertIn('git am --keep-cr "${srcdir}/${patch_name}"', package_build)
+        self.assertIn('done < "${patch_directory}/series"', package_build)
+        self.assertIn('git am --keep-cr "${patch_directory}/${patch_name}"', package_build)
         for name in read_series():
             self.assertIn(name, package_build)
 
@@ -292,8 +393,15 @@ class PatchSeriesTests(unittest.TestCase):
             self.assertNotEqual(os.readlink(current), "generations/old")
             published = (current.parent / os.readlink(current)).resolve()
             self.assertTrue((published / "series").is_file())
+            self.assertEqual(stat.S_IMODE(published.stat().st_mode), 0o755)
             for patch_name in read_series(published):
                 self.assertTrue((published / patch_name).is_file())
+                self.assertEqual(
+                    stat.S_IMODE((published / patch_name).stat().st_mode), 0o644
+                )
+            self.assertEqual(
+                stat.S_IMODE((published / "series").stat().st_mode), 0o644
+            )
             previous = current.parent / "previous"
             self.assertTrue(previous.is_symlink())
             self.assertEqual(os.readlink(previous), "generations/old")

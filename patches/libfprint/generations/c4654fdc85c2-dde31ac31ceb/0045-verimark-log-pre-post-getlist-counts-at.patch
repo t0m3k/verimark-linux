@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:20:26 +0200
+Subject: [PATCH 45/62] verimark: log pre/post getlist counts at
+ ENR_S_RESOLVE_TUID for IT diagnose
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Verify on the IT consistently returns status 0x0905 from 0x99
+match even after a re-enroll that fprintd reports as completed.
+Hypothesis : our skip of 0x96 03 commit on the IT means the
+template is never actually written to the sensor's NVRAM —
+post_list.count would then equal pre_list.count, and the resolve
+loop would leave effective_tuid unchanged.
+
+Log pre_count, post_count, and the first 8 bytes of effective_tuid
+so we can confirm whether the enroll actually grew the on-sensor
+template set or not.
+
+TEMP.
+---
+ libfprint/drivers/verimark/verimark.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 1996067..c9dc34a 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2607,6 +2607,7 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+             cancel, enr_cb_getlist_post, ssm);
+         return;
+     case ENR_S_RESOLVE_TUID: {
++        gboolean found_new = FALSE;
+         for (uint8_t i = 0; i < ctx->post_list.count; i++) {
+             gboolean in_pre = FALSE;
+             for (uint8_t j = 0; j < ctx->pre_list.count; j++) {
+@@ -2627,9 +2628,21 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+                             "using device-reported storage_handle for "
+                             "FpPrint match later");
+                 }
++                found_new = TRUE;
+                 break;
+             }
+         }
++        /* TEMP diag : confirm the template was actually persisted on the
++         * sensor by checking that getlist post-enroll grew vs pre-enroll. */
++        fp_warn("enroll: RESOLVE_TUID — pre_count=%u post_count=%u found_new=%d, "
++                "effective_tuid[0..8] = %02x %02x %02x %02x %02x %02x %02x %02x",
++                (unsigned)ctx->pre_list.count,
++                (unsigned)ctx->post_list.count,
++                (int)found_new,
++                ctx->effective_tuid[0], ctx->effective_tuid[1],
++                ctx->effective_tuid[2], ctx->effective_tuid[3],
++                ctx->effective_tuid[4], ctx->effective_tuid[5],
++                ctx->effective_tuid[6], ctx->effective_tuid[7]);
+         fpi_ssm_mark_completed(ssm);
+         return;
+     }

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:40:03 +0200
+Subject: [PATCH 36/62] verimark: auto-route transceive_async to BULK on the IT
+ (047d:8054)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Routes ALL callers of verimark_transceive_async to the BULK
+variant when the underlying device is the IT, by checking the
+PID at function entry. The handshake.c sites already dispatch
+explicitly via the is_it_variant flag ; this auto-routing covers
+every other caller (session.c for the AppData round-trips used
+by verify/enroll/identify, plus any future opcode added to the
+DT path) without each having to learn about IT.
+
+Without this, the first runtime enroll on the IT failed with
+"endpoint stalled or request not supported" — fprintd was running
+identify-for-enroll, which calls the session layer, which calls
+verimark_transceive_async, which was issuing vendor control
+transfers on the IT (no such endpoint) and getting USB STALLs.
+
+The auto-route checks `g_usb_device_get_pid(h->native) ==
+VERIMARK_PID_IT` and forwards to verimark_transceive_async_bulk,
+releasing the local GTask cleanly (the BULK helper creates its
+own). The DT path is byte-for-byte unchanged when PID == 0x00F2.
+
+12 standalone tests still green ; full libfprint build clean.
+---
+ libfprint/drivers/verimark/transport.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index 8340341..b9f4041 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -489,6 +489,22 @@ verimark_transceive_async(VerimarkUsbHandle *h,
+         g_object_unref(task);
+         return;
+     }
++    /* Auto-route to BULK on the IT (047d:8054). All callers that talk
++     * Tudor opcodes go through this function (verify, enroll, identify,
++     * list, ...) ; routing here means they all just work without each
++     * having to learn about is_it_variant. The IT bypasses the wValue
++     * formula / 8-byte alignment quirks of the DT vendor control framing. */
++    {
++        GUsbDevice *dev = (GUsbDevice *)h->native;
++        if (dev != NULL && g_usb_device_get_pid(dev) == VERIMARK_PID_IT) {
++            g_object_unref(task);   /* release the local task, transceive_async_bulk creates its own */
++            verimark_transceive_async_bulk(h, data, data_len,
++                                            resp, resp_size,
++                                            timeout_ms, cancellable,
++                                            callback, user_data);
++            return;
++        }
++    }
+     /* Single-chunk only — multi-chunk fragmentation is the sync path's
+      * job, and no observed Tudor opcode exceeds the chunk size. */
+     if (data_len > VERIMARK_CHUNK_SIZE) {
