@@ -23,3 +23,12 @@ src/
 
 # Isolated implementation worktrees
 .worktrees/
+
+# Private factory artifacts
+.driver-worktrees/
+hardware-local/
+sub1*.bin
+*.pcap
+*.pcapng
+*.reg
+*.pkg.tar.*
