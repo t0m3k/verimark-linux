@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly EXPECTED_BASE_COMMIT="c4654fdc85c25afdd9115bec2f95a44145ae3b94"
+readonly UPSTREAM_URL="https://gitlab.freedesktop.org/libfprint/libfprint.git"
+readonly REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PATCH_ROOT="${REPOSITORY_ROOT}/patches/libfprint"
+readonly CURRENT="${PATCH_ROOT}/current"
+
+fail() {
+  printf '%s\n' "error: $*" >&2
+  exit 1
+}
+
+validate_generation() {
+  local current_target generation series patch_name patch_path count=0
+  declare -A seen=()
+  local -a patch_names=()
+
+  [[ -L "${CURRENT}" ]] || fail "missing patch-generation current symlink"
+  current_target=$(readlink "${CURRENT}")
+  [[ "${current_target}" == generations/* ]] || \
+    fail "current patch generation must be below generations/"
+  generation=$(realpath -e -- "${PATCH_ROOT}/${current_target}") || \
+    fail "current patch generation does not exist"
+  [[ "${generation}" == "${PATCH_ROOT}/generations/"* ]] || \
+    fail "current patch generation escapes generations/"
+
+  series="${generation}/series"
+  [[ -f "${series}" && ! -L "${series}" ]] || \
+    fail "patch series must be a regular non-symlink file"
+
+  while IFS= read -r patch_name || [[ -n "${patch_name}" ]]; do
+    [[ -n "${patch_name}" ]] || fail "blank patch-series entry"
+    [[ "${patch_name}" =~ ^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$ ]] || \
+      fail "invalid patch-series entry: ${patch_name}"
+    [[ -z "${seen[${patch_name}]+present}" ]] || \
+      fail "duplicate patch-series entry: ${patch_name}"
+    seen["${patch_name}"]=1
+    patch_path="${generation}/${patch_name}"
+    [[ -f "${patch_path}" && ! -L "${patch_path}" ]] || \
+      fail "patch entry must be a regular non-symlink file: ${patch_name}"
+    patch_names+=("${patch_name}")
+    count=$((count + 1))
+  done < "${series}"
+
+  [[ ${count} -gt 0 ]] || fail "patch series is empty"
+  for patch_name in "${patch_names[@]}"; do
+    patch_path="${generation}/${patch_name}"
+    grep -Eq '^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$' "${patch_path}" || \
+      fail "patch entry is missing a mail header: ${patch_name}"
+    grep -Eq '^From: .+ <[^>]+>$' "${patch_path}" || \
+      fail "patch entry is missing mail authorship: ${patch_name}"
+  done
+  printf '%s\n' "${generation}"
+}
+
+if [[ $# -ne 1 ]]; then
+  fail "usage: $0 OUTPUT_DIRECTORY"
+fi
+
+patch_generation=$(validate_generation)
+output_directory=$1
+
+if [[ -e "${output_directory}" || -L "${output_directory}" ]]; then
+  [[ -d "${output_directory}/.git" || -f "${output_directory}/.git" ]] || \
+    fail "output exists but is not a Git checkout: ${output_directory}"
+  if [[ -n $(git -C "${output_directory}" status --porcelain --untracked-files=all) ]]; then
+    fail "source checkout is dirty: ${output_directory}"
+  fi
+  resolved_head=$(git -C "${output_directory}" rev-parse --verify HEAD) || \
+    fail "could not resolve source HEAD"
+  [[ "${resolved_head}" == "${EXPECTED_BASE_COMMIT}" ]] || \
+    fail "source HEAD must be exactly ${EXPECTED_BASE_COMMIT}"
+else
+  mkdir -p "$(dirname "${output_directory}")"
+  git init "${output_directory}"
+  git -C "${output_directory}" remote add origin "${UPSTREAM_URL}"
+  git -C "${output_directory}" fetch --no-tags --depth=1 origin \
+    "${EXPECTED_BASE_COMMIT}"
+  git -C "${output_directory}" checkout --detach FETCH_HEAD
+  resolved_head=$(git -C "${output_directory}" rev-parse --verify HEAD)
+  [[ "${resolved_head}" == "${EXPECTED_BASE_COMMIT}" ]] || \
+    fail "fetched source does not match ${EXPECTED_BASE_COMMIT}"
+fi
+
+git -C "${output_directory}" config user.name "VeriMark Materializer"
+git -C "${output_directory}" config user.email "materializer@invalid"
+
+while IFS= read -r patch_name || [[ -n "${patch_name}" ]]; do
+  git -C "${output_directory}" am --keep-cr \
+    "${patch_generation}/${patch_name}"
+done < "${patch_generation}/series"
+
+if [[ -n $(git -C "${output_directory}" status --porcelain --untracked-files=all) ]]; then
+  fail "materialized source is dirty after patch application"
+fi
+
+meson setup "${output_directory}/build" "${output_directory}" \
+  -Ddrivers=all -Dinstalled-tests=false -Dwerror=true
+meson compile -C "${output_directory}/build"
+meson setup "${output_directory}/build-verimark-tests" \
+  "${output_directory}/libfprint/drivers/verimark" --werror
+meson compile -C "${output_directory}/build-verimark-tests"

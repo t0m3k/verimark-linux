@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 12:36:03 +0200
+Subject: [PATCH 10/62] chore(verimark): use fp_warn for verify diagnostic
+ exits
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fp_info gets filtered out by glib's default log level threshold —
+the new diagnostic lines (poll loop done / verdict / match status /
+report-error-on-retry) never reached the journal. Use fp_warn instead
+so they always appear under `journalctl -u fprintd`.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index cb3a218..e6002bf 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -615,7 +615,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+     /* Surface the "place finger" cue at INFO level too — the
+      * debug-only fp_dbg() wouldn't reach a user running fprintd or
+      * fp_device_verify_sync without G_MESSAGES_DEBUG. */
+-    fp_info("verify: PLACE YOUR FINGER ON THE SENSOR NOW (timeout %d s)",
++    fp_warn("verify: PLACE YOUR FINGER ON THE SENSOR NOW (timeout %d s)",
+             VERIMARK_VERIFY_TIMEOUT_S);
+     g_print(">>> PLACE YOUR FINGER ON THE SENSOR NOW <<< (timeout %d s)\n",
+             VERIMARK_VERIFY_TIMEOUT_S);
+@@ -664,7 +664,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         }
+         g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+     }
+-    fp_info("verify: poll loop done — frame_ready=%d, polls=%d",
++    fp_warn("verify: poll loop done — frame_ready=%d, polls=%d",
+             *out_frame_ready, poll_count);
+ 
+     /* Close the capture window regardless of frame_ready outcome. */
+@@ -690,7 +690,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         return FALSE;
+     }
+     if (st == 0x0000 && v.len >= 16) {
+-        fp_info("verify: positive verdict (%zu bytes)", v.len);
++        fp_warn("verify: positive verdict (%zu bytes)", v.len);
+         fp_dbg("verify: positive verdict (%zu bytes), matched_tuid=%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                v.len,
+@@ -702,7 +702,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         if (out_matched_tuid)
+             memcpy(out_matched_tuid, v.bytes, VERIMARK_STORAGE_TUID_LEN);
+     } else {
+-        fp_info("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
++        fp_warn("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
+         /* Fire 0x39 WARM to trigger the firmware's brief red-LED
+          * "no-match" feedback (cf. docs/phase9-led-red-finding.md).
+          * Even without a retry loop, this gives the user the visual
+@@ -795,13 +795,13 @@ static void verimark_verify(FpDevice *device)
+     }
+ 
+     if (matched) {
+-        fp_info("verify: reporting MATCH_SUCCESS");
++        fp_warn("verify: reporting MATCH_SUCCESS");
+         fpi_device_verify_report(device, FPI_MATCH_SUCCESS, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+     } else if (frame_ready) {
+         /* Finger was seen but no enrollment matched → libfprint
+          * "fail" verdict, not an error. */
+-        fp_info("verify: reporting MATCH_FAIL (finger seen, no enrollment matched)");
++        fp_warn("verify: reporting MATCH_FAIL (finger seen, no enrollment matched)");
+         if (pipeline_err) g_clear_error(&pipeline_err);
+         fpi_device_verify_report(device, FPI_MATCH_FAIL, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+@@ -809,7 +809,7 @@ static void verimark_verify(FpDevice *device)
+         /* Retry-class error (timeout / no finger) goes through report,
+          * not complete — libfprint rejects retry errors at the
+          * complete entrypoint (cf. goodixmoc fp_verify_ssm_done). */
+-        fp_info("verify: reporting MATCH_ERROR (retry: %s)",
++        fp_warn("verify: reporting MATCH_ERROR (retry: %s)",
+                 pipeline_err->message ? pipeline_err->message : "(no msg)");
+         fpi_device_verify_report(device, FPI_MATCH_ERROR, NULL,
+                                  g_steal_pointer(&pipeline_err));

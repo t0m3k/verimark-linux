@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 10:01:56 +0200
+Subject: [PATCH 40/62] verimark: log the 0x99 match no-match response shape at
+ info level
+
+Triple verify-no-match on the IT with the correctly-enrolled
+finger suggests the driver may be reading the verdict from a
+mismatched offset/structure rather than a real bad match. The
+current fp_dbg log only fires at debug verbosity, hiding the
+firmware status code and the response payload prefix.
+
+Promote the no-match path to fp_info and include the status word
+plus the first 8 payload bytes. If the IT firmware uses an IT-
+specific verdict code (analogous to enroll's 0x8006 = complete),
+it'll surface here on the next attempt.
+---
+ libfprint/drivers/verimark/verimark.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index cbf75d7..d2b8064 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1191,8 +1191,20 @@ vfy_cb_match(GObject *src, GAsyncResult *res, gpointer ud)
+         fp_info("verify: positive verdict on attempt %d (%zu bytes)",
+                 ctx->attempt, payload_len);
+     } else {
+-        fp_dbg("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
+-               ctx->attempt, status, payload_len);
++        /* Logged at info level so the firmware status/payload shape is
++         * visible without a debug rebuild — useful for finding IT-
++         * specific match-on-chip codes (similar to enroll's 0x8006). */
++        fp_info("verify: attempt %d no-match (status 0x%04x, %zu bytes, "
++                "first 8 = %02x %02x %02x %02x %02x %02x %02x %02x)",
++                ctx->attempt, status, payload_len,
++                payload && payload_len >= 1 ? payload[0] : 0,
++                payload && payload_len >= 2 ? payload[1] : 0,
++                payload && payload_len >= 3 ? payload[2] : 0,
++                payload && payload_len >= 4 ? payload[3] : 0,
++                payload && payload_len >= 5 ? payload[4] : 0,
++                payload && payload_len >= 6 ? payload[5] : 0,
++                payload && payload_len >= 7 ? payload[6] : 0,
++                payload && payload_len >= 8 ? payload[7] : 0);
+     }
+     g_free(payload);
+     fpi_ssm_next_state(ssm);

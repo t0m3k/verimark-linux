@@ -1,0 +1,682 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 15:43:22 +0200
+Subject: [PATCH 21/62] =?UTF-8?q?feat(verimark):=20Phase=2010.3.c=20?=
+ =?UTF-8?q?=E2=80=94=20async=20handshake?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add `verimark_handshake_perform_async()` / `_finish()` mirroring the sync
+`verimark_handshake_perform()` but driving the two USB round-trips through
+`verimark_transceive_async()` (Phase 10.3.a foundation).
+
+The crypto stages (ECDH P-256, TLS-PRF SHA-384, ECDSA-P256/SHA-256 sign,
+AES-256-GCM encrypt/decrypt) stay synchronous on the GMainLoop thread —
+they are microseconds-fast in practice and not worth offloading.
+
+Structure :
+
+    perform_async()
+      build ClientHello → kick off TX1 (verimark_transceive_async)
+        → tx1_done : parse SH, derive keys, build flight2, kick off TX2
+          → tx2_done : decrypt Server Finished, advance seq, complete
+
+`HandshakeAsyncCtx` heap-owned (freed by GTask), containing the
+`HandshakeBufs` working buffer, deep-copied `VerimarkPairingData`
+(secret — zeroed on free), and the two prefixed wire buffers
+`wire_ch` / `wire_flight` (44 00 00 00 prepended manually since
+`verimark_transceive_async` doesn't know about handshake mode).
+
+The sync `verimark_handshake_perform()` is preserved verbatim — its
+TDD test suite (11 suites, all green) remains the regression net for
+the crypto/transcript logic. The async path duplicates the orchestration
+to keep the sync code 100% untouched ; a future refactor can extract
+the shared helpers.
+
+Stale-state recovery is propagated via `VERIMARK_HANDSHAKE_ERR_SERVER_ALERT`
+in the GTask result ; the SSM caller (10.3.d/e) will handle the
+retry-after-close_notify dance.
+
+Gated behind `#ifdef VERIMARK_HAVE_LIBGUSB` (same convention as 10.3.a/b).
+Built clean against libfprint + libgusb 0.4.9 on NixOS.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/handshake.c | 561 +++++++++++++++++++++++++
+ libfprint/drivers/verimark/handshake.h |  53 +++
+ 2 files changed, 614 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+index b7bdaee..fa426d9 100644
+--- a/libfprint/drivers/verimark/handshake.c
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -438,3 +438,564 @@ out:
+     }
+     return result;
+ }
++
++
++/* === Phase 10.3.c — async handshake (libgusb-only) ====================
++ *
++ * Mirrors the sync `verimark_handshake_perform()` but drives the two USB
++ * round-trips via `verimark_transceive_async()`. The crypto stages
++ * (PRFs, ECDH, ECDSA, GCM encrypt/decrypt) run on the GMainLoop thread —
++ * they are microseconds-fast in practice and not worth offloading.
++ *
++ * Structure :
++ *   _async()                              # build CH, kick off TX1
++ *     → handshake_async_tx1_done()        # parse SH, build flight2, kick off TX2
++ *       → handshake_async_tx2_done()      # decrypt Server Finished, complete
++ *
++ * The sync path stays untouched — its TDD tests remain golden.
++ */
++#ifdef VERIMARK_HAVE_LIBGUSB
++
++#include <gio/gio.h>
++
++#include "transport.h"
++
++#define HS_PREFIX_LEN 4
++static const uint8_t HS_PREFIX[HS_PREFIX_LEN] = { 0x44, 0x00, 0x00, 0x00 };
++
++/* Wire buffers : 44-prefix + record. The sync layer's vtable prepends
++ * 44 00 00 00 only when is_handshake=true ; we have to do the same here
++ * before calling verimark_transceive_async, which doesn't know about
++ * handshake mode. */
++#define HS_WIRE_CH_CAP    (HS_PREFIX_LEN + 80)    /* ch_record fits in 80 */
++#define HS_WIRE_FLT_CAP   (HS_PREFIX_LEN + 1024)  /* flight fits in 1024 */
++#define HS_RESP1_CAP      256                      /* matches sh_record cap */
++#define HS_RESP2_CAP      256                      /* matches server_response cap */
++
++
++typedef struct {
++    /* --- Inputs (deep copies — caller buffers may go out of scope). --- */
++    VerimarkUsbHandle *transport;
++    unsigned           timeout_ms;
++    VerimarkPairingData pairing;             /* SECRET — wiped on free */
++    bool               has_repro;
++    VerimarkHandshakeReproducibleParams repro;
++    GCancellable      *cancellable;          /* not owned */
++
++    /* --- Working buffers : same layout as sync HandshakeBufs. --- */
++    HandshakeBufs     *bufs;                 /* heap, wiped on free */
++
++    /* --- Per-handshake crypto intermediates. --- */
++    uint8_t  client_random[32];
++    uint8_t  eph_priv_be[32];
++    uint8_t  server_random[32];
++    uint16_t cipher;
++    size_t   ch_n;                           /* ClientHello record length */
++
++    /* --- Wire send buffers (44-prefix + record). --- */
++    uint8_t  wire_ch[HS_WIRE_CH_CAP];
++    size_t   wire_ch_len;
++    uint8_t  wire_flight[HS_WIRE_FLT_CAP];
++    size_t   wire_flight_len;
++
++    /* --- Final result (filled before g_task_return_*). --- */
++    VerimarkSession         session;
++    VerimarkHandshakeResult result;
++} HandshakeAsyncCtx;
++
++
++static void
++handshake_async_ctx_free(gpointer data)
++{
++    HandshakeAsyncCtx *ctx = data;
++    if (ctx == NULL)
++        return;
++    if (ctx->bufs != NULL) {
++        volatile uint8_t *p = (volatile uint8_t *)ctx->bufs;
++        for (size_t i = 0; i < sizeof(*ctx->bufs); i++) p[i] = 0;
++        free(ctx->bufs);
++    }
++    /* Wipe secret copies. */
++    {
++        volatile uint8_t *p = (volatile uint8_t *)&ctx->pairing;
++        for (size_t i = 0; i < sizeof(ctx->pairing); i++) p[i] = 0;
++    }
++    {
++        volatile uint8_t *p1 = (volatile uint8_t *)ctx->client_random;
++        volatile uint8_t *p2 = (volatile uint8_t *)ctx->eph_priv_be;
++        volatile uint8_t *p3 = (volatile uint8_t *)ctx->server_random;
++        volatile uint8_t *p4 = (volatile uint8_t *)&ctx->repro;
++        for (size_t i = 0; i < 32; i++) { p1[i] = 0; p2[i] = 0; p3[i] = 0; }
++        for (size_t i = 0; i < sizeof(ctx->repro); i++) p4[i] = 0;
++    }
++    /* Wipe wire buffers (may contain plaintext handshake messages). */
++    {
++        volatile uint8_t *p1 = (volatile uint8_t *)ctx->wire_ch;
++        volatile uint8_t *p2 = (volatile uint8_t *)ctx->wire_flight;
++        for (size_t i = 0; i < HS_WIRE_CH_CAP; i++)  p1[i] = 0;
++        for (size_t i = 0; i < HS_WIRE_FLT_CAP; i++) p2[i] = 0;
++    }
++    g_free(ctx);
++}
++
++
++/* Build ClientHello into ctx->bufs->ch_record + ctx->wire_ch (with prefix).
++ * Returns OK on success. */
++static VerimarkHandshakeResult
++handshake_async_build_client_hello(HandshakeAsyncCtx *ctx)
++{
++    HandshakeBufs *b = ctx->bufs;
++
++    if (ctx->has_repro) {
++        memcpy(ctx->client_random, ctx->repro.client_random, 32);
++        memcpy(ctx->eph_priv_be,   ctx->repro.eph_priv_be,   32);
++    } else {
++        if (!get_random(ctx->client_random, 32) ||
++            !get_random(ctx->eph_priv_be,   32))
++            return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    }
++
++    size_t ch_n = verimark_tls_build_client_hello(ctx->client_random,
++                                                   b->ch_record,
++                                                   sizeof(b->ch_record));
++    if (ch_n == 0)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    ctx->ch_n = ch_n;
++
++    if (HS_PREFIX_LEN + ch_n > HS_WIRE_CH_CAP)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    memcpy(ctx->wire_ch,                  HS_PREFIX,  HS_PREFIX_LEN);
++    memcpy(ctx->wire_ch + HS_PREFIX_LEN,  b->ch_record, ch_n);
++    ctx->wire_ch_len = HS_PREFIX_LEN + ch_n;
++    return VERIMARK_HANDSHAKE_OK;
++}
++
++
++/* Process the ServerHello in ctx->bufs->sh_record / sh_record_len, build
++ * Cert+CKE+CV+CCS+Finished into ctx->wire_flight (prefixed) and init the
++ * session. */
++static VerimarkHandshakeResult
++handshake_async_process_sh_build_flight(HandshakeAsyncCtx *ctx)
++{
++    HandshakeBufs *b = ctx->bufs;
++    VerimarkSession *session_out = &ctx->session;
++
++    /* ---- Parse ServerHello ---- */
++    {
++        uint8_t ct = 0;
++        uint16_t ver = 0;
++        const uint8_t *body = NULL;
++        size_t body_len = 0;
++        if (!verimark_tls_parse_record(b->sh_record, b->sh_record_len,
++                                        &ct, &ver, &body, &body_len))
++            return VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++        if (ct == VERIMARK_CT_ALERT)
++            return VERIMARK_HANDSHAKE_ERR_SERVER_ALERT;
++        if (ct != VERIMARK_CT_HANDSHAKE || body_len < 4 + 38 ||
++            body[0] != VERIMARK_HS_SERVER_HELLO)
++            return VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++        const uint8_t *hs_body = body + 4;
++        size_t hs_body_len = body_len - 4;
++        if (!verimark_tls_parse_server_hello(hs_body, hs_body_len,
++                                              ctx->server_random, &ctx->cipher))
++            return VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++        if (ctx->cipher != 0xc02e)
++            return VERIMARK_HANDSHAKE_ERR_CIPHER;
++    }
++
++    /* ---- Build Cert + CKE + CV ---- */
++    if (verimark_tls_build_certificate_body(ctx->pairing.client_cert,
++                                             b->cert_body,
++                                             sizeof(b->cert_body)) != 408)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    size_t cert_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CERTIFICATE,
++                                                          b->cert_body, 408,
++                                                          b->cert_hs,
++                                                          sizeof(b->cert_hs));
++    if (cert_hs_n != 412)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    {
++        uint8_t pub_x[32], pub_y[32];
++        if (verimark_ecc_p256_derive_pubkey(ctx->eph_priv_be, pub_x, pub_y)
++              != VERIMARK_CRYPTO_OK)
++            return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++        uint8_t eph_pub_uncompressed[65];
++        eph_pub_uncompressed[0] = 0x04;
++        memcpy(eph_pub_uncompressed + 1,  pub_x, 32);
++        memcpy(eph_pub_uncompressed + 33, pub_y, 32);
++        if (verimark_tls_build_cke_body(eph_pub_uncompressed, b->cke_body,
++                                         sizeof(b->cke_body)) != 65)
++            return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    }
++    size_t cke_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CLIENT_KEY_EXCHANGE,
++                                                         b->cke_body, 65,
++                                                         b->cke_hs,
++                                                         sizeof(b->cke_hs));
++    if (cke_hs_n != 69)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    /* Transcript before CertVerify. */
++    b->transcript_len = 0;
++    memcpy(b->transcript + b->transcript_len, b->ch_record + 5, ctx->ch_n - 5);
++    b->transcript_len += ctx->ch_n - 5;
++    memcpy(b->transcript + b->transcript_len, b->sh_record + 5,
++            b->sh_record_len - 5);
++    b->transcript_len += b->sh_record_len - 5;
++    memcpy(b->transcript + b->transcript_len, b->cert_hs, cert_hs_n);
++    b->transcript_len += cert_hs_n;
++    memcpy(b->transcript + b->transcript_len, b->cke_hs, cke_hs_n);
++    b->transcript_len += cke_hs_n;
++
++    if (verimark_ecdsa_p256_sha256_sign(ctx->pairing.client_priv_be,
++                                         b->transcript, b->transcript_len,
++                                         b->sig_der, sizeof(b->sig_der),
++                                         &b->sig_der_len) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    if (verimark_tls_build_cv_body(b->sig_der, b->sig_der_len,
++                                    b->cv_body, sizeof(b->cv_body)) != b->sig_der_len)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    b->cv_body_len = b->sig_der_len;
++    size_t cv_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CERTIFICATE_VERIFY,
++                                                       b->cv_body, b->cv_body_len,
++                                                       b->cv_hs, sizeof(b->cv_hs));
++    if (cv_hs_n == 0)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    /* ---- Premaster + MS + KB ---- */
++    if (verimark_ecdh_p256(ctx->eph_priv_be,
++                            ctx->pairing.server_pub_uncompressed,
++                            b->premaster) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    uint8_t seed[64];
++    memcpy(seed,      ctx->client_random, 32);
++    memcpy(seed + 32, ctx->server_random, 32);
++    if (verimark_prf_sha384(b->premaster, 32,
++                             (const uint8_t *)"master secret", 13,
++                             seed, 64,
++                             b->master_secret, 48) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    if (verimark_prf_sha384(b->master_secret, 48,
++                             (const uint8_t *)"key expansion", 13,
++                             seed, 64,
++                             b->key_block, 72) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    if (!verimark_session_init_from_key_block(session_out, b->key_block))
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    /* ---- Build Finished + flight ---- */
++    memcpy(b->transcript + b->transcript_len, b->cv_hs, cv_hs_n);
++    b->transcript_len += cv_hs_n;
++    {
++        uint8_t h[32];
++        if (gnutls_hash_fast(GNUTLS_DIG_SHA256,
++                             b->transcript, b->transcript_len, h) < 0)
++            return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++        if (verimark_prf_sha384(b->master_secret, 48,
++                                 (const uint8_t *)"client finished", 15,
++                                 h, 32,
++                                 b->verify_data, 12) != VERIMARK_CRYPTO_OK)
++            return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    }
++    size_t fin_plain_n = verimark_tls_build_finished_body(b->verify_data, 12,
++                                                           b->fin_plain,
++                                                           sizeof(b->fin_plain));
++    if (fin_plain_n != 16)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    uint8_t fin_nonce_explicit[8];
++    if (!get_random(fin_nonce_explicit, 8))
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    uint8_t fin_full_nonce[12];
++    memcpy(fin_full_nonce,     session_out->client_write_iv, 4);
++    memcpy(fin_full_nonce + 4, fin_nonce_explicit,           8);
++    uint8_t fin_aad[13];
++    verimark_tls_build_aad_gcm(0, VERIMARK_CT_HANDSHAKE,
++                                VERIMARK_TLS_VERSION,
++                                (uint16_t)fin_plain_n,
++                                fin_aad, sizeof(fin_aad));
++    uint8_t fin_ct_tag[32];
++    if (verimark_aes256_gcm_encrypt(session_out->client_write_key, fin_full_nonce,
++                                     fin_aad, 13,
++                                     b->fin_plain, fin_plain_n,
++                                     fin_ct_tag, sizeof(fin_ct_tag)) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    uint8_t fin_body[8 + 32];
++    memcpy(fin_body,     fin_nonce_explicit, 8);
++    memcpy(fin_body + 8, fin_ct_tag,         fin_plain_n + 16);
++    size_t fin_record_n = verimark_tls_encode_record(VERIMARK_CT_HANDSHAKE,
++                                                      fin_body, 8 + fin_plain_n + 16,
++                                                      b->fin_record,
++                                                      sizeof(b->fin_record));
++    if (fin_record_n == 0)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    /* Cert+CKE+CV in one HS record. */
++    uint8_t hs_stream[1024];
++    size_t hs_stream_n = 0;
++    memcpy(hs_stream + hs_stream_n, b->cert_hs, cert_hs_n); hs_stream_n += cert_hs_n;
++    memcpy(hs_stream + hs_stream_n, b->cke_hs,  cke_hs_n);  hs_stream_n += cke_hs_n;
++    memcpy(hs_stream + hs_stream_n, b->cv_hs,   cv_hs_n);   hs_stream_n += cv_hs_n;
++    size_t flight_record_n = verimark_tls_encode_record(VERIMARK_CT_HANDSHAKE,
++                                                         hs_stream, hs_stream_n,
++                                                         b->flight_record,
++                                                         sizeof(b->flight_record));
++    if (flight_record_n == 0)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    size_t ccs_record_n = verimark_tls_encode_record(VERIMARK_CT_CCS,
++                                                     (const uint8_t *)"\x01", 1,
++                                                     b->ccs_record,
++                                                     sizeof(b->ccs_record));
++    if (ccs_record_n != 6)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    size_t flight_total = 0;
++    if (flight_record_n + ccs_record_n + fin_record_n > sizeof(b->flight))
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    memcpy(b->flight + flight_total, b->flight_record, flight_record_n);
++    flight_total += flight_record_n;
++    memcpy(b->flight + flight_total, b->ccs_record,    ccs_record_n);
++    flight_total += ccs_record_n;
++    memcpy(b->flight + flight_total, b->fin_record,    fin_record_n);
++    flight_total += fin_record_n;
++
++    /* Prefix the flight for the wire. */
++    if (HS_PREFIX_LEN + flight_total > HS_WIRE_FLT_CAP)
++        return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++    memcpy(ctx->wire_flight,                 HS_PREFIX,   HS_PREFIX_LEN);
++    memcpy(ctx->wire_flight + HS_PREFIX_LEN, b->flight,   flight_total);
++    ctx->wire_flight_len = HS_PREFIX_LEN + flight_total;
++
++    return VERIMARK_HANDSHAKE_OK;
++}
++
++
++/* Parse the Server CCS + decrypt Server Finished from
++ * ctx->bufs->server_response. Advance session counters on success. */
++static VerimarkHandshakeResult
++handshake_async_process_server_finished(HandshakeAsyncCtx *ctx)
++{
++    HandshakeBufs *b = ctx->bufs;
++    VerimarkSession *session_out = &ctx->session;
++
++    if (b->server_response_len < 6 || b->server_response[0] != VERIMARK_CT_CCS) {
++        if (b->server_response_len >= 5 &&
++            b->server_response[0] == VERIMARK_CT_ALERT)
++            return VERIMARK_HANDSHAKE_ERR_SERVER_ALERT;
++        return VERIMARK_HANDSHAKE_ERR_SERVER_CCS;
++    }
++    size_t off = 6;
++    if (b->server_response_len < off + 5)
++        return VERIMARK_HANDSHAKE_ERR_SERVER_FIN;
++
++    uint8_t ct = 0;
++    uint16_t ver = 0;
++    const uint8_t *body = NULL;
++    size_t body_len = 0;
++    if (!verimark_tls_parse_record(b->server_response + off,
++                                    b->server_response_len - off,
++                                    &ct, &ver, &body, &body_len))
++        return VERIMARK_HANDSHAKE_ERR_SERVER_FIN;
++    if (ct != VERIMARK_CT_HANDSHAKE || body_len < 8 + 16)
++        return VERIMARK_HANDSHAKE_ERR_SERVER_FIN;
++
++    const uint8_t *sf_nonce = body;
++    const uint8_t *sf_ct    = body + 8;
++    size_t         sf_ct_len = body_len - 8;
++    uint8_t sf_full_nonce[12];
++    memcpy(sf_full_nonce,     session_out->server_write_iv, 4);
++    memcpy(sf_full_nonce + 4, sf_nonce,                     8);
++    uint8_t sf_aad[13];
++    verimark_tls_build_aad_gcm(0, VERIMARK_CT_HANDSHAKE,
++                                VERIMARK_TLS_VERSION,
++                                (uint16_t)(sf_ct_len - 16),
++                                sf_aad, sizeof(sf_aad));
++    uint8_t sf_plain[32];
++    if (verimark_aes256_gcm_decrypt(session_out->server_write_key, sf_full_nonce,
++                                     sf_aad, 13,
++                                     sf_ct, sf_ct_len,
++                                     sf_plain, sizeof(sf_plain)) != VERIMARK_CRYPTO_OK)
++        return VERIMARK_HANDSHAKE_ERR_SERVER_FIN;
++    if (sf_ct_len - 16 < 4 || sf_plain[0] != VERIMARK_HS_FINISHED)
++        return VERIMARK_HANDSHAKE_ERR_SERVER_FIN;
++
++    session_out->server_seq = 1;
++    session_out->client_seq = 1;
++    return VERIMARK_HANDSHAKE_OK;
++}
++
++
++/* TX2 completion : transceive done, parse Server Finished, complete task. */
++static void
++handshake_async_tx2_done(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    (void)obj;
++    GTask *task = G_TASK(ud);
++    HandshakeAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    size_t resp_len = 0;
++
++    VerimarkResult tr = verimark_transceive_finish(res, &resp_len, &err);
++    if (tr != VERIMARK_OK) {
++        if (err == NULL)
++            err = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED,
++                              "handshake_async: TX2 transceive failed");
++        verimark_session_zero(&ctx->session);
++        ctx->result = VERIMARK_HANDSHAKE_ERR_READ;
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    ctx->bufs->server_response_len = resp_len;
++
++    VerimarkHandshakeResult r = handshake_async_process_server_finished(ctx);
++    if (r != VERIMARK_HANDSHAKE_OK) {
++        verimark_session_zero(&ctx->session);
++        ctx->result = r;
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "handshake_async: server finished failed (%d)",
++                                (int)r);
++        g_object_unref(task);
++        return;
++    }
++
++    ctx->result = VERIMARK_HANDSHAKE_OK;
++    g_task_return_boolean(task, TRUE);
++    g_object_unref(task);
++}
++
++
++/* TX1 completion : transceive done, parse SH + build flight, kick off TX2. */
++static void
++handshake_async_tx1_done(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    (void)obj;
++    GTask *task = G_TASK(ud);
++    HandshakeAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    size_t resp_len = 0;
++
++    VerimarkResult tr = verimark_transceive_finish(res, &resp_len, &err);
++    if (tr != VERIMARK_OK) {
++        if (err == NULL)
++            err = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED,
++                              "handshake_async: TX1 transceive failed");
++        verimark_session_zero(&ctx->session);
++        ctx->result = VERIMARK_HANDSHAKE_ERR_READ;
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    ctx->bufs->sh_record_len = resp_len;
++
++    VerimarkHandshakeResult r = handshake_async_process_sh_build_flight(ctx);
++    if (r != VERIMARK_HANDSHAKE_OK) {
++        verimark_session_zero(&ctx->session);
++        ctx->result = r;
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "handshake_async: SH/flight failed (%d)",
++                                (int)r);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Kick off TX2 : send flight2, read server response. */
++    verimark_transceive_async(ctx->transport,
++                              ctx->wire_flight, ctx->wire_flight_len,
++                              ctx->bufs->server_response,
++                              sizeof(ctx->bufs->server_response),
++                              ctx->timeout_ms,
++                              ctx->cancellable,
++                              handshake_async_tx2_done, task);
++}
++
++
++void
++verimark_handshake_perform_async(
++    VerimarkUsbHandle *transport,
++    unsigned timeout_ms,
++    const VerimarkPairingData *pairing,
++    const VerimarkHandshakeReproducibleParams *repro_or_null,
++    GCancellable *cancellable,
++    GAsyncReadyCallback callback,
++    gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_handshake_perform_async);
++
++    if (transport == NULL || pairing == NULL) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "handshake_async: NULL transport or pairing");
++        g_object_unref(task);
++        return;
++    }
++
++    HandshakeAsyncCtx *ctx = g_new0(HandshakeAsyncCtx, 1);
++    ctx->transport   = transport;
++    ctx->timeout_ms  = timeout_ms;
++    ctx->pairing     = *pairing;            /* deep copy */
++    ctx->has_repro   = (repro_or_null != NULL);
++    if (ctx->has_repro)
++        ctx->repro = *repro_or_null;
++    ctx->cancellable = cancellable;
++    ctx->bufs = (HandshakeBufs *)calloc(1, sizeof(HandshakeBufs));
++    if (ctx->bufs == NULL) {
++        handshake_async_ctx_free(ctx);
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "handshake_async: out of memory");
++        g_object_unref(task);
++        return;
++    }
++    g_task_set_task_data(task, ctx, handshake_async_ctx_free);
++
++    /* Build ClientHello synchronously (fast). */
++    VerimarkHandshakeResult r = handshake_async_build_client_hello(ctx);
++    if (r != VERIMARK_HANDSHAKE_OK) {
++        ctx->result = r;
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "handshake_async: build_client_hello failed (%d)",
++                                (int)r);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Kick off TX1 : send ClientHello, read ServerHello. */
++    verimark_transceive_async(transport,
++                              ctx->wire_ch, ctx->wire_ch_len,
++                              ctx->bufs->sh_record,
++                              sizeof(ctx->bufs->sh_record),
++                              timeout_ms,
++                              cancellable,
++                              handshake_async_tx1_done, task);
++}
++
++
++VerimarkHandshakeResult
++verimark_handshake_perform_finish(GAsyncResult *res,
++                                   VerimarkSession *session_out,
++                                   GError **error)
++{
++    g_return_val_if_fail(G_IS_TASK(res), VERIMARK_HANDSHAKE_ERR_PARAM);
++    GTask *task = G_TASK(res);
++    if (session_out)
++        verimark_session_zero(session_out);
++
++    if (!g_task_propagate_boolean(task, error)) {
++        HandshakeAsyncCtx *ctx = g_task_get_task_data(task);
++        return (ctx && ctx->result != VERIMARK_HANDSHAKE_OK)
++                 ? ctx->result
++                 : VERIMARK_HANDSHAKE_ERR_READ;
++    }
++
++    HandshakeAsyncCtx *ctx = g_task_get_task_data(task);
++    if (ctx == NULL)
++        return VERIMARK_HANDSHAKE_ERR_PARAM;
++
++    if (session_out)
++        *session_out = ctx->session;
++    /* Wipe our copy — caller owns the keys now. */
++    verimark_session_zero(&ctx->session);
++    return VERIMARK_HANDSHAKE_OK;
++}
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
+diff --git a/libfprint/drivers/verimark/handshake.h b/libfprint/drivers/verimark/handshake.h
+index 7c0edfa..97d6378 100644
+--- a/libfprint/drivers/verimark/handshake.h
++++ b/libfprint/drivers/verimark/handshake.h
+@@ -108,6 +108,59 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+                             VerimarkSession *session_out);
+ 
+ 
++/* --- Async handshake (Phase 10.3.c, libgusb-only) ----------------------
++ *
++ * Non-blocking equivalent of verimark_handshake_perform. Drives the two
++ * USB round-trips (ClientHello → ServerHello ; Flight2 → ServerResponse)
++ * via verimark_transceive_async, performs the crypto on the GMainLoop
++ * thread (microseconds, not worth offloading), and fires `callback` once
++ * the whole handshake completes (success OR failure OR cancellation).
++ *
++ * The caller does NOT need to keep `pairing` alive after the function
++ * returns — the orchestrator deep-copies it into a heap-owned context.
++ * The copy is wiped before free.
++ *
++ * `timeout_ms` applies to BOTH the OUT and the IN transfer of EACH round-
++ * trip (= 4 individual timeouts max).
++ *
++ * `cancellable` may be NULL.
++ *
++ * No vtable abstraction here : the async path drives the USB handle
++ * directly via verimark_transceive_async (which knows the wValue formula
++ * and 8-byte alignment). The `44 00 00 00` handshake-mode prefix is
++ * prepended manually before each send.
++ */
++#ifdef VERIMARK_HAVE_LIBGUSB
++#include <gio/gio.h>
++
++typedef struct VerimarkUsbHandle VerimarkUsbHandle;
++
++void verimark_handshake_perform_async(
++    VerimarkUsbHandle *transport,
++    unsigned timeout_ms,
++    const VerimarkPairingData *pairing,
++    const VerimarkHandshakeReproducibleParams *repro_or_null,
++    GCancellable *cancellable,
++    GAsyncReadyCallback callback,
++    gpointer user_data);
++
++/**
++ * On success copies the derived AES-GCM session into `*session_out`
++ * (with sequence counters advanced to 1 on both sides, matching the
++ * sync path). Returns VERIMARK_HANDSHAKE_OK.
++ *
++ * On failure returns the matching VerimarkHandshakeResult code and
++ * populates `*error` (if non-NULL) with a descriptive GError. The
++ * caller's `*session_out` is left zeroed.
++ */
++VerimarkHandshakeResult verimark_handshake_perform_finish(
++    GAsyncResult *res,
++    VerimarkSession *session_out,
++    GError **error);
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
++
++
+ #ifdef __cplusplus
+ }
+ #endif

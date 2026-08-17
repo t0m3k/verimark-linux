@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 23:12:41 +0200
+Subject: [PATCH 61/62] verimark: trigger 0xA4 01 cleanup GC after DT 0xA3
+ delete (symmetry with IT)
+
+---
+ libfprint/drivers/verimark/verimark.c | 39 +++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index ccc5b43..87de5e3 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3285,6 +3285,45 @@ static void verimark_delete(FpDevice *device)
+ 
+     fp_dbg("delete: %u sensor objects removed (cascading across classes)",
+            (unsigned) deleted);
++
++    /* Trigger partition cleanup GC `0xA4 01` to actually wipe the just-
++     * deleted slots from the firmware's biometric store. Symmetric with
++     * the IT branch above ; observed runtime 2026-06-07 on the DT :
++     * without this, ghost templates from previous sessions (Windows or
++     * old Linux test runs) accumulate in NVRAM and the firmware's
++     * identify path keeps matching them, returning a TUID that doesn't
++     * match the requested storage_handle → verify-no-match for the
++     * correct finger on a freshly enrolled print
++     * (`enroll: RESOLVE_TUID — pre_count=N>0 post_count=N+1`). Adding
++     * the GC step here mirrors what Windows `_stiTudorDeleteEnrollment`
++     * does (`0xA3` by TUID then `0xA4` cleanup). Failures are non-fatal
++     * — the per-TUID delete already succeeded. */
++    {
++        uint8_t gc_payload[1] = { 0x01 };
++        uint8_t gc_resp_buf[64];
++        uint16_t gc_status = 0;
++        const uint8_t *gc_payload_out = NULL;
++        size_t gc_payload_len = 0;
++        if (!verimark_session_call_opcode(&self->session, &io,
++                                          /*opcode*/ 0xA4,
++                                          gc_payload, sizeof(gc_payload),
++                                          gc_resp_buf, sizeof(gc_resp_buf),
++                                          &gc_status, &gc_payload_out,
++                                          &gc_payload_len)) {
++            fp_warn("delete: 0xa4 01 cleanup GC transport failure (non-fatal)");
++        } else {
++            unsigned erased = 0;
++            unsigned partver = 0;
++            if (gc_payload_out && gc_payload_len >= 2)
++                erased = (unsigned)(gc_payload_out[0] | (gc_payload_out[1] << 8));
++            if (gc_payload_out && gc_payload_len >= 4)
++                partver = (unsigned)(gc_payload_out[2] | (gc_payload_out[3] << 8));
++            fp_dbg("delete: 0xa4 01 cleanup GC OK (status 0x%04x, "
++                   "erased=%u slots, partition_version=%u)",
++                   gc_status, erased, partver);
++        }
++    }
++
+     fpi_device_delete_complete(device, NULL);
+ }
+ 

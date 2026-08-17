@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 08:52:01 +0200
+Subject: [PATCH 31/62] verimark: high-level IT session reset helper
+ (close_notify recovery)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds verimark_it_reset_session() in transport.{h,c} — the C
+equivalent of reset_firmware_session() in
+tools/verimark-it/handshake_attempt.py (runtime-validated 2026-06-07).
+
+The helper handles the three firmware states observed when the
+IT is plugged from cold or after a previous session:
+
+  a) Fresh / power-cycled : '01' immediately returns 38 B device-
+     info starting with 00 00.
+  b) Stale Windows-side session : '01' triggers a plaintext TLS
+     Alert. We ACK with a host close_notify, drain, and retry.
+  c) Our own previous handshake left a live session : '01' is
+     silent. Same recovery as (b).
+
+The function tries at most 3 attempts (so at most 2 close_notify
+frames) before returning VERIMARK_ERR_TIMEOUT, at which point the
+caller must physically unplug + replug the sensor.
+
+The helper only uses the BULK primitives added in the previous
+commit (and the constants in proto.h), so it compiles cleanly
+both with libgusb and as a standalone stub.
+
+Building block for the upcoming wiring inside open() for the IT
+path (TLS handshake + session_active = TRUE).
+---
+ libfprint/drivers/verimark/transport.c | 79 ++++++++++++++++++++++++++
+ libfprint/drivers/verimark/transport.h | 39 +++++++++++++
+ 2 files changed, 118 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index cb20369..0991a9f 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -576,6 +576,85 @@ VerimarkResult verimark_init_sequence(VerimarkUsbHandle *h,
+ }
+ 
+ 
++VerimarkResult verimark_it_reset_session(VerimarkUsbHandle *h,
++                                          uint8_t *device_info,
++                                          size_t device_info_size,
++                                          size_t *device_info_len,
++                                          unsigned timeout_ms)
++{
++    if (h == NULL)
++        return VERIMARK_ERR_INVALID_ARG;
++
++    /* Up-front drain : discard any bytes the firmware queued from a
++     * previous session (a stale TLS Alert, etc.). Best-effort — a
++     * timeout here is the expected outcome on a clean device. */
++    {
++        uint8_t scratch[128];
++        size_t  drained = 0;
++        (void)verimark_bulk_in(h, VERIMARK_IT_EP_BULK_IN,
++                               scratch, sizeof(scratch),
++                               &drained, 200);
++    }
++
++    /* Internal scratch for the device-info reply when the caller passes
++     * a NULL buffer — we still need to inspect the first 2 bytes to
++     * decide whether the firmware is in raw mode (00 00) or in a stale
++     * session (15 03 Alert) or silent. */
++    uint8_t  internal_buf[64];
++    uint8_t *buf = device_info ? device_info : internal_buf;
++    size_t   buf_size = device_info ? device_info_size : sizeof(internal_buf);
++    if (buf_size < 2)
++        return VERIMARK_ERR_INVALID_ARG;
++
++    for (int attempt = 0; attempt < 3; attempt++) {
++        VerimarkResult r = verimark_bulk_out(
++            h, VERIMARK_IT_EP_BULK_OUT,
++            VERIMARK_IT_INIT_01, sizeof(VERIMARK_IT_INIT_01),
++            timeout_ms);
++        if (r != VERIMARK_OK)
++            return r;
++
++        size_t received = 0;
++        r = verimark_bulk_in(h, VERIMARK_IT_EP_BULK_IN,
++                             buf, buf_size,
++                             &received, timeout_ms);
++        /* Three possible outcomes :
++         *   - received == 38, buf[0..1] == "00 00" : success (a).
++         *   - received >= 2, buf[0..1] == "15 03"  : stale session (b).
++         *   - r == TIMEOUT or received == 0        : our own session (c).
++         * In (b) and (c) we send a host close_notify and retry. */
++        const bool got_device_info =
++            (r == VERIMARK_OK) && (received == 38) &&
++            (buf[0] == 0x00) && (buf[1] == 0x00);
++        if (got_device_info) {
++            if (device_info_len)
++                *device_info_len = received;
++            return VERIMARK_OK;
++        }
++
++        /* Either an Alert or silence — both are recovered the same way.
++         * We do not differentiate beyond this point because they both
++         * collapse into "ask the firmware to drop its session". */
++        VerimarkResult close_r = verimark_bulk_out(
++            h, VERIMARK_IT_EP_BULK_OUT,
++            VERIMARK_IT_CLOSE_NOTIFY, sizeof(VERIMARK_IT_CLOSE_NOTIFY),
++            timeout_ms);
++        if (close_r != VERIMARK_OK)
++            return close_r;
++        /* Drain anything the firmware emits in response (often nothing,
++         * sometimes its own close_notify echo). */
++        uint8_t scratch[128];
++        size_t  drained = 0;
++        (void)verimark_bulk_in(h, VERIMARK_IT_EP_BULK_IN,
++                               scratch, sizeof(scratch),
++                               &drained, 500);
++    }
++    /* 3 attempts failed — the firmware is wedged. Caller must
++     * physically unplug + replug the sensor. */
++    return VERIMARK_ERR_TIMEOUT;
++}
++
++
+ VerimarkResult verimark_read_tls_status(VerimarkUsbHandle *h,
+                                         uint8_t status_bytes[2],
+                                         unsigned timeout_ms)
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+index a56b9f0..fe8c6c8 100644
+--- a/libfprint/drivers/verimark/transport.h
++++ b/libfprint/drivers/verimark/transport.h
+@@ -133,6 +133,45 @@ VerimarkResult verimark_bulk_in(VerimarkUsbHandle *h,
+                                 unsigned timeout_ms);
+ 
+ 
++/**
++ * Bring the IT into a "clean session-less" state and return the 38-byte
++ * device-info. Mirrors the Python reset_firmware_session() helper
++ * (handshake_attempt.py), runtime-validated 2026-06-07 against three
++ * firmware states :
++ *
++ *  a) Fresh / power-cycled — `01` immediately returns 38 B device-info
++ *     starting with `00 00`. One shot.
++ *  b) Stale Windows-side session still resident — `01` triggers a
++ *     plaintext TLS Alert `15 03 03 …` (the firmware reinterprets `01`
++ *     as encrypted AppData and fails decryption). We send a plaintext
++ *     host close_notify to ACK the firmware-initiated close, drain
++ *     the IN endpoint, and retry `01`.
++ *  c) Our own previous handshake left a live session — `01` is
++ *     silently dropped (firmware expects encrypted AppData from us).
++ *     Same recovery as (b) : send close_notify, drain, retry.
++ *
++ * On the wire the recovery never sends more than two close_notify
++ * frames before giving up. The function physically unblocks neither
++ * `01` not the subsequent ClientHello — if 3 attempts fail in a row,
++ * a USB unplug + replug is the only escape.
++ *
++ * @param[out] device_info       Buffer at least 38 B (canonical reply).
++ *                               Caller may pass NULL to discard the
++ *                               payload.
++ * @param[out] device_info_len   Bytes actually written to `device_info`,
++ *                               may be NULL.
++ * @param      timeout_ms        Total per-attempt timeout.
++ *
++ * @return VERIMARK_OK if a clean 38 B device-info reply was obtained,
++ *         VERIMARK_ERR_TIMEOUT / _TRANSPORT on persistent failure.
++ */
++VerimarkResult verimark_it_reset_session(VerimarkUsbHandle *h,
++                                          uint8_t *device_info,
++                                          size_t device_info_size,
++                                          size_t *device_info_len,
++                                          unsigned timeout_ms);
++
++
+ /* --- High-level helpers --------------------------------------------------- */
+ 
+ /**

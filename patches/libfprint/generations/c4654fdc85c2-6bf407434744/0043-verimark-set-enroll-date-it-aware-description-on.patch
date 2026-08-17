@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:10:17 +0200
+Subject: [PATCH 43/62] verimark: set enroll-date + IT-aware description on
+ enroll success
+
+Two bugs were tripping the fprintd crash visible during delete
+and post-verify on the IT path :
+
+1. The enroll-date was never explicitly set. fprintd's
+   delete_enrolled_fingers and verify_cb log the print metadata
+   via g_log %s, which calls strlen on NULL and SEGVs. The
+   verimark_print_from_tuid fallback path already had a comment
+   warning about this and set a synthetic GDate ; the primary
+   enroll-success path forgot it.
+
+2. The description was hardcoded as 'Kensington VeriMark DT'
+   even when the device is the IT. Cosmetic but fix it while
+   we're here, PID-aware now.
+
+Set both defensively if NULL (= fprintd didn't supply them) :
+- description : DT / IT label based on g_usb_device_get_pid
+- enroll-date : today's GDate (only used as display hint by
+                fprintd, not part of identity matching)
+
+Resolves the 'fprintd dumped core in delete_enrolled_fingers' and
+'fprintd dumped core in verify_cb -> check_local_storage' SEGVs
+observed during IT runtime tests.
+---
+ libfprint/drivers/verimark/verimark.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index d3bc8d1..ce2c9dd 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2688,10 +2688,26 @@ enroll_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+         fpi_print_set_type(template, FPI_PRINT_RAW);
+         fpi_print_set_device_stored(template, TRUE);
+         g_object_set(template, "fpi-data", data, NULL);
++        /* PID-aware description (DT vs IT). */
++        GUsbDevice *usb = fpi_device_get_usb_device(dev);
++        const gboolean is_it = (usb != NULL &&
++                                g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
+         if (fp_print_get_description(template) == NULL)
+-            fp_print_set_description(template, "Kensington VeriMark DT");
++            fp_print_set_description(template,
++                is_it ? "Kensington VeriMark IT"
++                       : "Kensington VeriMark DT");
+         if (fp_print_get_username(template) == NULL)
+             fp_print_set_username(template, "verimark");
++        /* fprintd logs print metadata during cleanup and crashes if
++         * enroll-date is NULL — same g_log %s on NULL → strlen fault
++         * the fallback path warns about below. Set a synthetic stamp
++         * if fprintd didn't (the value is only used as display hint). */
++        if (fp_print_get_enroll_date(template) == NULL) {
++            GDate *today = g_date_new();
++            g_date_set_time_t(today, time(NULL));
++            fp_print_set_enroll_date(template, today);
++            g_date_free(today);
++        }
+         fpi_device_enroll_complete(dev, g_object_ref(template), NULL);
+     } else {
+         /* Defensive fallback (shouldn't trigger on a real enroll). */

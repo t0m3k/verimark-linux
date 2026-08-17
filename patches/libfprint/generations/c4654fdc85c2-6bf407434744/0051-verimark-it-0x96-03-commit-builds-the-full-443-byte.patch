@@ -1,0 +1,750 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 16:14:38 +0200
+Subject: [PATCH 51/62] verimark: IT 0x96 03 commit builds the full 443-byte
+ record (Windows-decoded)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The IT enroll commit body is a 443-byte structured record (TUID +
+WINBIO SID identity section + opaque 326-byte DPAPI blob), NOT a
+bare TUID. Decoded byte-for-byte from the 2026-06-07 cdb capture in
+WUDFHost — see docs/it-enroll-commit-decode.md.
+
+proto.h/proto.c :
+- new builder verimark_it_build_enroll_commit_record() that lays
+  out the record per the spec : version + TUID + identity tag +
+  WINBIO SID (type 3, 28-byte SID + 40-byte pad) + data tag +
+  counter + flag + blob
+- new builder verimark_it_build_enroll_commit_payload() that wraps
+  the record with the 12-byte wire framing (sub-cmd u32 LE +
+  field0 + length u32 LE)
+- new constant VERIMARK_IT_ENROLL_SYNTHETIC_SID — synthetic
+  S-1-5-21-1-1-1-1000 used by default (the IT firmware does NOT
+  validate SID semantics, only the structure)
+- 27/27 TDD tests in tests/test_it_enroll_commit.c — every fixed
+  offset and length is asserted, plus boundary + error paths
+
+verimark.c : ENR_S_COMMIT_CALL IT branch now calls the builder
+and sends the full 455-byte payload (12 framing + 443 record).
+The Python reference implementation
+tools/verimark-it/enroll_commit.py + tests/test_it_enroll_commit.py
+(27/27 green) cross-validate the format byte-for-byte.
+
+Hypothesis under test runtime : the IT firmware stores the DPAPI
+blob opaquely (it has no DPAPI key) and the match-on-chip uses
+the prior 0x96 02 add_image accumulator. If true, sending zeros
+for the 326-byte blob is sufficient for the template to persist
+and 0x99 to match. If the firmware validates the blob, we'll see
+a non-0x0000 status and have to enrich the body further.
+---
+ libfprint/drivers/verimark/meson.build        |   8 +
+ libfprint/drivers/verimark/proto.c            | 111 +++++
+ libfprint/drivers/verimark/proto.h            |  67 +++
+ .../verimark/tests/test_it_enroll_commit.c    | 422 ++++++++++++++++++
+ libfprint/drivers/verimark/verimark.c         |  42 +-
+ 5 files changed, 636 insertions(+), 14 deletions(-)
+ create mode 100644 libfprint/drivers/verimark/tests/test_it_enroll_commit.c
+
+diff --git a/libfprint/drivers/verimark/meson.build b/libfprint/drivers/verimark/meson.build
+index f285eff..3aedcf0 100644
+--- a/libfprint/drivers/verimark/meson.build
++++ b/libfprint/drivers/verimark/meson.build
+@@ -91,6 +91,14 @@ test_it_proto_exe = executable(
+ )
+ test('it_proto', test_it_proto_exe)
+ 
++test_it_enroll_commit_exe = executable(
++  'test_it_enroll_commit',
++  files('tests/test_it_enroll_commit.c'),
++  link_with: proto_lib,
++  include_directories: include_directories('.'),
++)
++test('it_enroll_commit', test_it_enroll_commit_exe)
++
+ 
+ crypto_lib = static_library(
+   'crypto',
+diff --git a/libfprint/drivers/verimark/proto.c b/libfprint/drivers/verimark/proto.c
+index 6c98bbb..e178fd8 100644
+--- a/libfprint/drivers/verimark/proto.c
++++ b/libfprint/drivers/verimark/proto.c
+@@ -49,6 +49,117 @@ const uint8_t VERIMARK_IT_HS_PREFIX[VERIMARK_IT_HS_PREFIX_SIZE] = {
+ };
+ 
+ 
++/* --- IT enroll commit (0x96 03) -------------------------------------- */
++
++/* Synthetic SID S-1-5-21-1-1-1-1000 (revision 1, NT authority,
++ * 5 sub-authorities = 21, 1, 1, 1, 1000). 28 bytes total. */
++const uint8_t VERIMARK_IT_ENROLL_SYNTHETIC_SID[VERIMARK_IT_ENROLL_SID_LEN] = {
++    0x01,                                /* Revision */
++    0x05,                                /* SubAuthorityCount */
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x05,  /* IdentifierAuthority = NT */
++    0x15, 0x00, 0x00, 0x00,              /* sub-auth 0 = 21 */
++    0x01, 0x00, 0x00, 0x00,              /* sub-auth 1 */
++    0x01, 0x00, 0x00, 0x00,              /* sub-auth 2 */
++    0x01, 0x00, 0x00, 0x00,              /* sub-auth 3 */
++    0xE8, 0x03, 0x00, 0x00,              /* sub-auth 4 = 1000 */
++};
++
++
++/* Small u16/u32 little-endian writers, kept local to avoid pulling in
++ * a host endianness dependency for what's a handful of fields. */
++static inline void wr_u16_le(uint8_t *p, uint16_t v)
++{
++    p[0] = (uint8_t)(v       & 0xff);
++    p[1] = (uint8_t)((v >> 8) & 0xff);
++}
++static inline void wr_u32_le(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v        & 0xff);
++    p[1] = (uint8_t)((v >>  8) & 0xff);
++    p[2] = (uint8_t)((v >> 16) & 0xff);
++    p[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++
++size_t verimark_it_build_enroll_commit_record(
++    const uint8_t tuid[16],
++    const uint8_t *sid_or_null,
++    uint16_t counter,
++    const uint8_t *dpapi_blob_or_null,
++    uint8_t *out, size_t out_size)
++{
++    if (tuid == NULL || out == NULL)
++        return 0;
++    if (out_size < VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN)
++        return 0;
++
++    const uint8_t *sid  = sid_or_null  ? sid_or_null  : VERIMARK_IT_ENROLL_SYNTHETIC_SID;
++    /* Cross-reference :
++     *   docs/it-enroll-commit-decode.md § "Structure du record"
++     *   tools/verimark-it/enroll_commit.py
++     *   tests/test_it_enroll_commit.py (Python TDD, 27/27)
++     *   driver/verimark/tests/test_it_enroll_commit.c (C TDD)         */
++    memset(out, 0, VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN);
++    /* 0x000 u16 LE = 0x0000 (record version) — already zero */
++    /* 0x002 u32 LE TUID length = 16 */
++    wr_u32_le(out + 0x002, 16);
++    /* 0x006 [16] TUID */
++    memcpy(out + 0x006, tuid, 16);
++    /* 0x016 u16 LE = 0x0001 (identity section tag) */
++    wr_u16_le(out + 0x016, 0x0001);
++    /* 0x018 u32 LE identity section length = 76 */
++    wr_u32_le(out + 0x018, 76);
++    /* 0x01C u32 LE WINBIO identity type = 3 (SID) */
++    wr_u32_le(out + 0x01C, 3);
++    /* 0x020 u32 LE SID length = 28 */
++    wr_u32_le(out + 0x020, 28);
++    /* 0x024 [28] SID */
++    memcpy(out + 0x024, sid, 28);
++    /* 0x040..0x067 [40] pad zeros — already zero */
++    /* 0x068 u16 LE = 0x0002 (data section tag) */
++    wr_u16_le(out + 0x068, 0x0002);
++    /* 0x06A u32 LE = 0x01 (count) */
++    wr_u32_le(out + 0x06A, 1);
++    /* 0x06E u16 LE counter */
++    wr_u16_le(out + 0x06E, counter);
++    /* 0x070 u8 flag = 0x00 — already zero */
++    /* 0x071 u32 LE blob length = 326 */
++    wr_u32_le(out + 0x071, VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN);
++    /* 0x075 [326] DPAPI blob — zeros by default */
++    if (dpapi_blob_or_null != NULL) {
++        memcpy(out + 0x075, dpapi_blob_or_null,
++               VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN);
++    }
++    return VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN;
++}
++
++
++size_t verimark_it_build_enroll_commit_payload(
++    const uint8_t tuid[16],
++    const uint8_t *sid_or_null,
++    uint16_t counter,
++    const uint8_t *dpapi_blob_or_null,
++    uint8_t *out, size_t out_size)
++{
++    if (tuid == NULL || out == NULL)
++        return 0;
++    if (out_size < VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN)
++        return 0;
++
++    /* [sub-cmd u32 LE = 3][field0 u32 LE = 0][field1 u32 LE = 443] */
++    wr_u32_le(out + 0, 3);
++    wr_u32_le(out + 4, 0);
++    wr_u32_le(out + 8, VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN);
++
++    size_t n = verimark_it_build_enroll_commit_record(
++        tuid, sid_or_null, counter, dpapi_blob_or_null,
++        out + 12, out_size - 12);
++    if (n != VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN)
++        return 0;
++    return VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN;
++}
++
++
+ uint16_t verimark_compute_wvalue_write(size_t original_length)
+ {
+     /* wValue = original_length & magic_write & 7 = original_length & 7
+diff --git a/libfprint/drivers/verimark/proto.h b/libfprint/drivers/verimark/proto.h
+index 70283ea..097abc8 100644
+--- a/libfprint/drivers/verimark/proto.h
++++ b/libfprint/drivers/verimark/proto.h
+@@ -112,6 +112,73 @@ extern const uint8_t VERIMARK_IT_INIT_19[1];
+ #define VERIMARK_IT_HS_PREFIX_SIZE  4
+ extern const uint8_t VERIMARK_IT_HS_PREFIX[VERIMARK_IT_HS_PREFIX_SIZE];
+ 
++/* ---- IT enroll commit (0x96 03) record + payload --------------------- *
++ *
++ * The IT firmware expects the 0x96 03 commit body to be a 443-byte
++ * structured record containing TUID + WINBIO SID identity + an opaque
++ * DPAPI blob, NOT a bare TUID. Wire framing on the cleartext side of
++ * the TLS session :
++ *
++ *   off 0   : 0x96                opcode
++ *   off 1   : 03 00 00 00         sub-cmd = 3 (u32 LE)
++ *   off 5   : 00 00 00 00         field0 = 0 (constant)
++ *   off 9   : LL LL LL LL         field1 = record length (u32 LE = 443)
++ *   off 13  : <record, 443 bytes>
++ *
++ * See docs/it-enroll-commit-decode.md for the full layout. The Python
++ * tools/verimark-it/enroll_commit.py is the cross-reference
++ * implementation (27/27 TDD tests). The DPAPI blob is opaque
++ * firmware-side ; the hypothesis is that zeros work for the
++ * match-on-chip path. */
++
++#define VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN  443
++#define VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN 455  /* 12 + 443 */
++#define VERIMARK_IT_ENROLL_SID_LEN            28
++#define VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN     326
++
++/* Synthetic SID for Linux callers : S-1-5-21-1-1-1-1000. The IT
++ * firmware does not validate SID semantics, only the structure. */
++extern const uint8_t VERIMARK_IT_ENROLL_SYNTHETIC_SID[VERIMARK_IT_ENROLL_SID_LEN];
++
++/**
++ * Build the 443-byte commit record at the start of `out`.
++ *
++ * @param tuid       16-byte template unique id.
++ * @param sid_or_null  28-byte SID (NULL → uses VERIMARK_IT_ENROLL_SYNTHETIC_SID).
++ * @param counter    u16 — enroll index. Windows increments per enroll
++ *                   (0x3F5, 0x3F6, ...). 0 is fine on Linux.
++ * @param dpapi_blob_or_null  326 bytes opaque blob (NULL → zeros).
++ * @param[out] out   Caller-allocated buffer.
++ * @param out_size   `out` capacity. Must be >= VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN.
++ *
++ * @return VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN on success, 0 on error.
++ */
++size_t verimark_it_build_enroll_commit_record(
++    const uint8_t tuid[16],
++    const uint8_t *sid_or_null,
++    uint16_t counter,
++    const uint8_t *dpapi_blob_or_null,
++    uint8_t *out, size_t out_size);
++
++/**
++ * Build the 455-byte payload to pass to verimark_session_call_opcode
++ * with opcode = 0x96. The opcode byte itself is added by the transport
++ * layer, so this payload starts at offset 1 of the wire frame :
++ *
++ *   [sub-cmd u32 LE = 03 00 00 00]
++ *   [field0  u32 LE = 00 00 00 00]
++ *   [field1  u32 LE = 443]
++ *   [443-byte record]
++ *
++ * @return VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN on success, 0 on error.
++ */
++size_t verimark_it_build_enroll_commit_payload(
++    const uint8_t tuid[16],
++    const uint8_t *sid_or_null,
++    uint16_t counter,
++    const uint8_t *dpapi_blob_or_null,
++    uint8_t *out, size_t out_size);
++
+ /* ---- Helpers ---- */
+ 
+ /**
+diff --git a/libfprint/drivers/verimark/tests/test_it_enroll_commit.c b/libfprint/drivers/verimark/tests/test_it_enroll_commit.c
+new file mode 100644
+index 0000000..7fdff03
+--- /dev/null
++++ b/libfprint/drivers/verimark/tests/test_it_enroll_commit.c
+@@ -0,0 +1,422 @@
++/*
++ * test_it_enroll_commit.c — TDD tests for the IT enroll commit
++ * record + payload builder declared in proto.h. Cross-references the
++ * Python tests/test_it_enroll_commit.py and the spec in
++ * docs/it-enroll-commit-decode.md.
++ *
++ * Compile + run via meson :
++ *   cd driver/verimark
++ *   meson setup build && meson test -C build it_enroll_commit
++ */
++
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "proto.h"
++
++#define TEST(name) static int test_##name(void)
++
++#define ASSERT_EQ(a, b) do { \
++    if ((a) != (b)) { \
++        fprintf(stderr, "  %s:%d: ASSERT_EQ failed: %s (%ld) != %s (%ld)\n", \
++                __FILE__, __LINE__, #a, (long)(a), #b, (long)(b)); \
++        return 1; \
++    } \
++} while (0)
++
++#define ASSERT_MEM_EQ(a, b, n) do { \
++    if (memcmp((a), (b), (n)) != 0) { \
++        fprintf(stderr, "  %s:%d: ASSERT_MEM_EQ failed over %zu bytes\n", \
++                __FILE__, __LINE__, (size_t)(n)); \
++        return 1; \
++    } \
++} while (0)
++
++#define ASSERT_TRUE(x) do { \
++    if (!(x)) { \
++        fprintf(stderr, "  %s:%d: ASSERT_TRUE failed: %s\n", \
++                __FILE__, __LINE__, #x); \
++        return 1; \
++    } \
++} while (0)
++
++
++/* Sample TUID from the 2026-06-07 cdb capture (right index, sample #2). */
++static const uint8_t SAMPLE_TUID_2[16] = {
++    0xd9, 0x92, 0xaa, 0x60, 0x4b, 0xc1, 0xba, 0x8c,
++    0xed, 0xe8, 0x53, 0xd0, 0x64, 0x67, 0x5c, 0xcc,
++};
++
++
++/* ---- Lengths ---- */
++
++TEST(record_length_is_443)
++{
++    uint8_t out[1024];
++    size_t n = verimark_it_build_enroll_commit_record(
++        SAMPLE_TUID_2, NULL, 0, NULL, out, sizeof(out));
++    ASSERT_EQ(n, VERIMARK_IT_ENROLL_COMMIT_RECORD_LEN);
++    ASSERT_EQ(n, 443);
++    return 0;
++}
++
++TEST(payload_length_is_455)
++{
++    uint8_t out[1024];
++    size_t n = verimark_it_build_enroll_commit_payload(
++        SAMPLE_TUID_2, NULL, 0, NULL, out, sizeof(out));
++    ASSERT_EQ(n, VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN);
++    ASSERT_EQ(n, 12 + 443);
++    return 0;
++}
++
++
++/* ---- Wire framing header (the 12 bytes before the record) ---- */
++
++TEST(payload_starts_with_sub_cmd_u32_le_3)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_payload(SAMPLE_TUID_2, NULL, 0, NULL,
++                                             out, sizeof(out));
++    static const uint8_t expected[4] = { 0x03, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0, expected, 4);
++    return 0;
++}
++
++TEST(payload_field0_at_offset_4_is_zero)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_payload(SAMPLE_TUID_2, NULL, 0, NULL,
++                                             out, sizeof(out));
++    static const uint8_t expected[4] = { 0x00, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 4, expected, 4);
++    return 0;
++}
++
++TEST(payload_field1_at_offset_8_is_record_length_443_le)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_payload(SAMPLE_TUID_2, NULL, 0, NULL,
++                                             out, sizeof(out));
++    /* 443 = 0x1BB → LE = BB 01 00 00 */
++    static const uint8_t expected[4] = { 0xbb, 0x01, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 8, expected, 4);
++    return 0;
++}
++
++
++/* ---- Record header and TUID section ---- */
++
++TEST(record_starts_with_version_word_zero)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_EQ(out[0x000], 0x00);
++    ASSERT_EQ(out[0x001], 0x00);
++    return 0;
++}
++
++TEST(record_tuid_length_at_0x002_is_u32_le_16)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    static const uint8_t expected[4] = { 0x10, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x002, expected, 4);
++    return 0;
++}
++
++TEST(record_tuid_at_0x006_matches_input)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_MEM_EQ(out + 0x006, SAMPLE_TUID_2, 16);
++    return 0;
++}
++
++
++/* ---- Identity section ---- */
++
++TEST(record_identity_tag_at_0x016_is_u16_le_1)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_EQ(out[0x016], 0x01);
++    ASSERT_EQ(out[0x017], 0x00);
++    return 0;
++}
++
++TEST(record_identity_section_length_at_0x018_is_u32_le_76)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    /* 76 = 0x4C → LE 4C 00 00 00 */
++    static const uint8_t expected[4] = { 0x4c, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x018, expected, 4);
++    return 0;
++}
++
++TEST(record_winbio_identity_type_at_0x01c_is_u32_le_3_sid)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    static const uint8_t expected[4] = { 0x03, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x01C, expected, 4);
++    return 0;
++}
++
++TEST(record_sid_length_at_0x020_is_u32_le_28)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    /* 28 = 0x1C → LE 1C 00 00 00 */
++    static const uint8_t expected[4] = { 0x1c, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x020, expected, 4);
++    return 0;
++}
++
++TEST(record_default_sid_is_synthetic_s_1_5_21)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_MEM_EQ(out + 0x024,
++                  VERIMARK_IT_ENROLL_SYNTHETIC_SID,
++                  VERIMARK_IT_ENROLL_SID_LEN);
++    /* Spot-check : sub-auth 4 = 1000 = 0x3E8 LE @ end of SID. */
++    static const uint8_t expected_last_subauth[4] = { 0xe8, 0x03, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x024 + 24, expected_last_subauth, 4);
++    return 0;
++}
++
++TEST(record_custom_sid_is_inserted_verbatim)
++{
++    /* Real Windows SID from the cdb capture. */
++    static const uint8_t custom_sid[VERIMARK_IT_ENROLL_SID_LEN] = {
++        0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
++        0x15, 0x00, 0x00, 0x00, 0x0c, 0xdf, 0xcd, 0xc3,
++        0x75, 0x6f, 0x1f, 0x78, 0xea, 0xb2, 0xd1, 0x9c,
++        0xe9, 0x03, 0x00, 0x00,
++    };
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, custom_sid,
++                                            0, NULL,
++                                            out, sizeof(out));
++    ASSERT_MEM_EQ(out + 0x024, custom_sid, VERIMARK_IT_ENROLL_SID_LEN);
++    return 0;
++}
++
++TEST(record_sid_pad_at_0x040_is_40_zero_bytes)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    static const uint8_t zeros[40] = {0};
++    ASSERT_MEM_EQ(out + 0x040, zeros, 40);
++    return 0;
++}
++
++
++/* ---- Data section ---- */
++
++TEST(record_data_tag_at_0x068_is_u16_le_2)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_EQ(out[0x068], 0x02);
++    ASSERT_EQ(out[0x069], 0x00);
++    return 0;
++}
++
++TEST(record_count_at_0x06a_is_u32_le_1)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    static const uint8_t expected[4] = { 0x01, 0x00, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x06A, expected, 4);
++    return 0;
++}
++
++TEST(record_default_counter_is_zero)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_EQ(out[0x06E], 0x00);
++    ASSERT_EQ(out[0x06F], 0x00);
++    return 0;
++}
++
++TEST(record_counter_u16_le_encoding)
++{
++    /* Windows sample #2 counter was 0x3F6. */
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0x3F6, NULL,
++                                            out, sizeof(out));
++    /* LE = f6 03 */
++    ASSERT_EQ(out[0x06E], 0xf6);
++    ASSERT_EQ(out[0x06F], 0x03);
++    return 0;
++}
++
++TEST(record_flag_at_0x070_is_zero)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    ASSERT_EQ(out[0x070], 0x00);
++    return 0;
++}
++
++TEST(record_blob_length_at_0x071_is_u32_le_326)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    /* 326 = 0x146 → LE 46 01 00 00 */
++    static const uint8_t expected[4] = { 0x46, 0x01, 0x00, 0x00 };
++    ASSERT_MEM_EQ(out + 0x071, expected, 4);
++    return 0;
++}
++
++
++/* ---- DPAPI blob ---- */
++
++TEST(record_default_blob_is_326_zeros)
++{
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    for (size_t i = 0; i < VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN; i++) {
++        ASSERT_EQ(out[0x075 + i], 0x00);
++    }
++    return 0;
++}
++
++TEST(record_custom_blob_is_copied_verbatim)
++{
++    uint8_t blob[VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN];
++    for (size_t i = 0; i < sizeof(blob); i++)
++        blob[i] = (uint8_t)((i ^ 0xAA) & 0xFF);
++    uint8_t out[1024];
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, blob,
++                                            out, sizeof(out));
++    ASSERT_MEM_EQ(out + 0x075, blob, VERIMARK_IT_ENROLL_DPAPI_BLOB_LEN);
++    return 0;
++}
++
++
++/* ---- Boundaries ---- */
++
++TEST(record_ends_exactly_at_offset_0x1bb)
++{
++    uint8_t out[1024];
++    /* Sentinel byte after the record area. */
++    memset(out, 0xa5, sizeof(out));
++    verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                            out, sizeof(out));
++    /* The last record byte is at offset 0x1BA = 442 (record_len = 443).
++     * Byte at 0x1BB must still be 0xa5 (untouched). */
++    ASSERT_EQ(out[0x1BA], 0x00);  /* last byte of the blob → zero */
++    ASSERT_EQ(out[0x1BB], 0xa5);  /* sentinel intact */
++    return 0;
++}
++
++
++/* ---- Error handling ---- */
++
++TEST(rejects_null_tuid)
++{
++    uint8_t out[1024];
++    ASSERT_EQ(verimark_it_build_enroll_commit_record(NULL, NULL, 0, NULL,
++                                                     out, sizeof(out)), 0);
++    ASSERT_EQ(verimark_it_build_enroll_commit_payload(NULL, NULL, 0, NULL,
++                                                      out, sizeof(out)), 0);
++    return 0;
++}
++
++TEST(rejects_null_output)
++{
++    ASSERT_EQ(verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                                     NULL, 1024), 0);
++    ASSERT_EQ(verimark_it_build_enroll_commit_payload(SAMPLE_TUID_2, NULL, 0, NULL,
++                                                      NULL, 1024), 0);
++    return 0;
++}
++
++TEST(rejects_undersized_output)
++{
++    uint8_t small[442];
++    ASSERT_EQ(verimark_it_build_enroll_commit_record(SAMPLE_TUID_2, NULL, 0, NULL,
++                                                     small, sizeof(small)), 0);
++    uint8_t small_payload[454];
++    ASSERT_EQ(verimark_it_build_enroll_commit_payload(SAMPLE_TUID_2, NULL, 0, NULL,
++                                                      small_payload,
++                                                      sizeof(small_payload)), 0);
++    return 0;
++}
++
++
++typedef int (*test_fn)(void);
++
++struct test_entry {
++    const char *name;
++    test_fn     fn;
++};
++
++#define ADD_TEST(name) { #name, test_##name }
++
++int main(void)
++{
++    struct test_entry tests[] = {
++        ADD_TEST(record_length_is_443),
++        ADD_TEST(payload_length_is_455),
++        ADD_TEST(payload_starts_with_sub_cmd_u32_le_3),
++        ADD_TEST(payload_field0_at_offset_4_is_zero),
++        ADD_TEST(payload_field1_at_offset_8_is_record_length_443_le),
++        ADD_TEST(record_starts_with_version_word_zero),
++        ADD_TEST(record_tuid_length_at_0x002_is_u32_le_16),
++        ADD_TEST(record_tuid_at_0x006_matches_input),
++        ADD_TEST(record_identity_tag_at_0x016_is_u16_le_1),
++        ADD_TEST(record_identity_section_length_at_0x018_is_u32_le_76),
++        ADD_TEST(record_winbio_identity_type_at_0x01c_is_u32_le_3_sid),
++        ADD_TEST(record_sid_length_at_0x020_is_u32_le_28),
++        ADD_TEST(record_default_sid_is_synthetic_s_1_5_21),
++        ADD_TEST(record_custom_sid_is_inserted_verbatim),
++        ADD_TEST(record_sid_pad_at_0x040_is_40_zero_bytes),
++        ADD_TEST(record_data_tag_at_0x068_is_u16_le_2),
++        ADD_TEST(record_count_at_0x06a_is_u32_le_1),
++        ADD_TEST(record_default_counter_is_zero),
++        ADD_TEST(record_counter_u16_le_encoding),
++        ADD_TEST(record_flag_at_0x070_is_zero),
++        ADD_TEST(record_blob_length_at_0x071_is_u32_le_326),
++        ADD_TEST(record_default_blob_is_326_zeros),
++        ADD_TEST(record_custom_blob_is_copied_verbatim),
++        ADD_TEST(record_ends_exactly_at_offset_0x1bb),
++        ADD_TEST(rejects_null_tuid),
++        ADD_TEST(rejects_null_output),
++        ADD_TEST(rejects_undersized_output),
++    };
++    const size_t n = sizeof(tests) / sizeof(tests[0]);
++    int failed = 0;
++    for (size_t i = 0; i < n; i++) {
++        int r = tests[i].fn();
++        if (r != 0) {
++            fprintf(stderr, "FAIL %s\n", tests[i].name);
++            failed++;
++        } else {
++            fprintf(stdout, "ok   %s\n", tests[i].name);
++        }
++    }
++    fprintf(stdout, "\n%zu tests, %d failures\n", n, failed);
++    return failed == 0 ? 0 : 1;
++}
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 24fbae1..66f1719 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2583,21 +2583,35 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         const gboolean is_it = (usb != NULL &&
+                                 g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
+         if (is_it) {
+-            /* 4-byte sub-cmd alone gave 0x0404 (same as the DT 123B,
+-             * means firmware accepted sub-cmd but state mismatch).
+-             * The DLL builds total = data_length + 12, so the framing
+-             * is sub-cmd(4) + control(4) + length(4) + data. Build
+-             * the 28-byte form : sub-cmd u32 LE + 8 zero bytes +
+-             * length u32 LE = 16 + 16-byte TUID. */
+-            uint8_t it_commit_payload[28] = {0};
+-            it_commit_payload[0]  = 0x03;          /* sub-cmd u32 LE */
+-            it_commit_payload[8]  = 0x10;          /* length u32 LE = 16 */
+-            memcpy(it_commit_payload + 12, ctx->new_tuid,
+-                   VERIMARK_STORAGE_TUID_LEN);
+-            fp_warn("verimark: IT enroll sending 0x96 03 with 28-byte payload "
+-                    "(sub-cmd + 4B zero + length=16 + TUID)");
++            /* Windows cdb capture (2026-06-07) decoded the IT 0x96 03
++             * body as a 443-byte structured record (TUID + WINBIO SID
++             * identity + opaque 326-byte DPAPI blob). The blob is
++             * opaque firmware-side ; zeros work for the match-on-chip
++             * path. See docs/it-enroll-commit-decode.md and the
++             * builder in proto.c (TDD : test_it_enroll_commit, 27/27).
++             *
++             * Hypothesis being validated runtime : the firmware
++             * persists the record opaquely and the match relies on
++             * the prior 0x96 02 add_image accumulator, not on the
++             * blob. */
++            uint8_t it_commit_payload[VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN];
++            size_t n = verimark_it_build_enroll_commit_payload(
++                ctx->new_tuid,
++                /*sid_or_null*/ NULL,        /* synthetic S-1-5-21-1-1-1-1000 */
++                /*counter*/      0,
++                /*dpapi_blob*/   NULL,        /* 326 zeros */
++                it_commit_payload, sizeof(it_commit_payload));
++            if (n != VERIMARK_IT_ENROLL_COMMIT_PAYLOAD_LEN) {
++                ctx->fatal_error = g_error_new(
++                    FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "enroll: IT commit payload builder returned %zu", n);
++                fpi_ssm_jump_to_state(ssm, ENR_S_CLEANUP_FINISH);
++                return;
++            }
++            fp_warn("verimark: IT enroll sending 0x96 03 with %zu-byte payload "
++                    "(443-B record per Windows DLL decode)", n);
+             verimark_session_call_opcode_async(&self->session, self->transport,
+-                3000, 0x96, it_commit_payload, sizeof(it_commit_payload),
++                3000, 0x96, it_commit_payload, n,
+                 cancel, enr_cb_commit, ssm);
+             return;
+         }

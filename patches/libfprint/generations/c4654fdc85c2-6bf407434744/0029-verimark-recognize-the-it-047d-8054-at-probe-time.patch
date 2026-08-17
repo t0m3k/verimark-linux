@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 21:31:20 +0200
+Subject: [PATCH 29/62] verimark: recognize the IT (047d:8054) at probe time
+ (POC step 1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the Kensington VeriMark IT (K64704WW, 047d:8054) to id_table.
+Two flavors of the same Synaptics Tudor family but with different
+USB topologies :
+
+  - DT (047d:00f2) : two interfaces (HID + vendor MI_01) ; Tudor
+    spoken over EP0 control transfers with a custom wValue chunking
+    formula. Fully supported.
+  - IT (047d:8054) : single vendor interface MI_00 with BULK EP1
+    OUT + EP81 IN + interrupt EP83 IN ; Tudor spoken over BULK.
+    Recognized by probe / open as introspection-only until the BULK
+    transport backend lands.
+
+What this step adds :
+
+- `proto.h` : `VERIMARK_PID_DT` / `VERIMARK_PID_IT` and matching
+  `VERIMARK_MI_BIO_DT` / `VERIMARK_MI_BIO_IT`. Legacy aliases
+  `VERIMARK_PID` / `VERIMARK_MI_BIO` keep pointing at the DT values
+  so older callers still build.
+- `verimark.c` : second id_table entry for the IT, helper
+  `verimark_mi_bio_for(usb)` that picks the right interface, and
+  per-PID branches in probe / open / close.
+- `verimark_open` returns success with `session_active = FALSE`
+  for the IT (same fallback as a DT with no sub1 pairing). list /
+  delete still work via the fprintd local DB ; verify / enroll /
+  identify will fail cleanly with "TLS session not active" until
+  the BULK backend lands.
+
+Probe pcap from issue #590 (138 frames, load/unload cycle) shows
+the IT speaks the same TLS 1.2 + cipher 0xc02e protocol with the
+same `44 00 00 00` handshake-mode prefix as the DT — only the USB
+transport layer differs. Estimated ~70-80% of the DT driver code
+will be reusable once the BULK transport is in place.
+
+Standalone tests : 11/11 green.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/proto.h    | 11 ++++--
+ libfprint/drivers/verimark/verimark.c | 57 +++++++++++++++++++++++----
+ 2 files changed, 57 insertions(+), 11 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/proto.h b/libfprint/drivers/verimark/proto.h
+index e2e6e14..31d3f74 100644
+--- a/libfprint/drivers/verimark/proto.h
++++ b/libfprint/drivers/verimark/proto.h
+@@ -22,9 +22,14 @@ extern "C" {
+ 
+ /* ---- USB IDs ---- */
+ 
+-#define VERIMARK_VID       0x047D
+-#define VERIMARK_PID       0x00F2
+-#define VERIMARK_MI_BIO    1     /* Interface MI_01 (biometric, vendor 0xff) */
++#define VERIMARK_VID         0x047D
++#define VERIMARK_PID_DT      0x00F2  /* VeriMark DT (K62330WW) — Tudor over EP0 ctrl */
++#define VERIMARK_PID_IT      0x8054  /* VeriMark IT (K64704WW) — Tudor over BULK EP1 */
++#define VERIMARK_PID         VERIMARK_PID_DT  /* legacy alias kept for callers
++                                                 that hardcode the DT PID. */
++#define VERIMARK_MI_BIO_DT   1   /* DT : 2 interfaces (HID + vendor) ; we claim MI_01. */
++#define VERIMARK_MI_BIO_IT   0   /* IT : single vendor interface MI_00 with BULK EPs. */
++#define VERIMARK_MI_BIO      VERIMARK_MI_BIO_DT  /* legacy alias. */
+ 
+ /* ---- Vendor control transfer codes ---- */
+ 
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 48e1faa..fc950e4 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -78,11 +78,29 @@ G_DEFINE_TYPE(FpiDeviceVerimark, fpi_device_verimark, FP_TYPE_DEVICE)
+ /* ---- USB ID table -------------------------------------------------------- */
+ 
+ static const FpIdEntry id_table[] = {
+-    { .vid = VERIMARK_VID, .pid = VERIMARK_PID },
++    { .vid = VERIMARK_VID, .pid = VERIMARK_PID_DT },  /* DT — fully supported */
++    { .vid = VERIMARK_VID, .pid = VERIMARK_PID_IT },  /* IT — POC / partial */
+     { .vid = 0, .pid = 0 },
+ };
+ 
+ 
++/* Per-device USB topology. The DT (K62330WW) exposes two interfaces and
++ * speaks Tudor over EP0 vendor control transfers. The IT (K64704WW)
++ * exposes a single vendor interface with BULK EP1 OUT + EP81 IN + an
++ * EP83 interrupt channel for async finger events.
++ *
++ * Until the BULK transport backend lands, IT support stops at probe + open
++ * recognition ; verify/enroll/list/delete will fail at the first opcode
++ * because the underlying transport assumes EP0 control transfers.
++ */
++static inline guint8 verimark_mi_bio_for(GUsbDevice *usb)
++{
++    return (g_usb_device_get_pid(usb) == VERIMARK_PID_IT)
++             ? VERIMARK_MI_BIO_IT
++             : VERIMARK_MI_BIO_DT;
++}
++
++
+ /* ---- Internal helpers ---------------------------------------------------- */
+ 
+ /**
+@@ -168,6 +186,9 @@ static void verimark_probe(FpDevice *device)
+      * storage path stays consistent. The bio-serial read (opcode 0x01)
+      * is a best-effort secondary that populates `self->dev_info` for
+      * the optional `sub1_<bio_serial>.bin` lookup in open(). */
++    const guint8 mi_bio = verimark_mi_bio_for(usb);
++    const gboolean is_it = (g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
++
+     GError *err = NULL;
+     if (g_usb_device_open(usb, &err)) {
+         /* USB iSerial (string descriptor) — needs open but no claim. */
+@@ -179,8 +200,11 @@ static void verimark_probe(FpDevice *device)
+                 device_id = g_strdup(iserial);
+         }
+ 
+-        /* Best-effort bio-serial read for dev_info (sub1 lookup). */
+-        if (g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, NULL)) {
++        /* Best-effort bio-serial read for dev_info (sub1 lookup) —
++         * DT only. The IT uses BULK transport with a different init
++         * sequence ; until that backend lands, skip this read for IT. */
++        if (!is_it
++            && g_usb_device_claim_interface(usb, mi_bio, 0, NULL)) {
+             self->transport = verimark_handle_new(usb);
+             uint8_t init_status = 0;
+             if (verimark_init_sequence(self->transport, &init_status, 2000)
+@@ -198,7 +222,7 @@ static void verimark_probe(FpDevice *device)
+             }
+             verimark_handle_free(self->transport);
+             self->transport = NULL;
+-            g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++            g_usb_device_release_interface(usb, mi_bio, 0, NULL);
+         }
+         g_usb_device_close(usb, NULL);
+     }
+@@ -214,9 +238,11 @@ static void verimark_probe(FpDevice *device)
+                                      g_usb_device_get_pid(usb));
+     }
+ 
++    const char *model_name = is_it ? "Kensington VeriMark IT"
++                                   : "Kensington VeriMark DT";
+     fpi_device_probe_complete(device,
+                               g_steal_pointer(&device_id),
+-                              g_strdup("Kensington VeriMark DT"),
++                              g_strdup(model_name),
+                               NULL);
+ }
+ 
+@@ -477,17 +503,32 @@ static void verimark_open(FpDevice *device)
+     g_usb_device_reset(usb, NULL);
+     g_usleep(300 * 1000);   /* 0.3s post-reset settle */
+ 
+-    if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
++    const guint8 mi_bio = verimark_mi_bio_for(usb);
++
++    if (!g_usb_device_claim_interface(usb, mi_bio, 0, &error)) {
+         fpi_device_open_complete(device, error);
+         return;
+     }
+     self->transport = verimark_handle_new(usb);
++
++    /* The IT (BULK transport) needs a separate init sequence and a
++     * BULK-based transport backend that aren't implemented yet. Open
++     * succeeds with `session_active = FALSE` so probe / list still work,
++     * but verify / enroll / identify will fail with "TLS session not
++     * active" — same fallback as a DT with no sub1 pairing. */
++    if (g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
++        fp_warn("verimark: IT (047d:8054) BULK transport not yet implemented ; "
++                "device opens in introspection-only mode (no TLS session)");
++        fpi_device_open_complete(device, NULL);
++        return;
++    }
++
+     uint8_t init_status = 0;
+     VerimarkResult r = verimark_init_sequence(self->transport, &init_status, 2000);
+     if (r != VERIMARK_OK) {
+         verimark_handle_free(self->transport);
+         self->transport = NULL;
+-        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++        g_usb_device_release_interface(usb, mi_bio, 0, NULL);
+         g_set_error(&error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                     "init sequence failed (%d)", r);
+         fpi_device_open_complete(device, error);
+@@ -562,7 +603,7 @@ static void verimark_close(FpDevice *device)
+         verimark_handle_free(self->transport);
+         self->transport = NULL;
+     }
+-    g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, &error);
++    g_usb_device_release_interface(usb, verimark_mi_bio_for(usb), 0, &error);
+     fpi_device_close_complete(device, error);
+ }
+ 

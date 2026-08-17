@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:02:37 +0200
+Subject: [PATCH 42/62] verimark: log all vfy_cb_match branches at WARN level
+ for IT diagnose
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous fp_warn on the no-match else branch produced zero
+journalctl output during the IT verify diagnose, which means
+either (a) the function isn't being reached, or (b) the positive
+match branch is hit but the matched_tuid doesn't match fprintd's
+expected enrolled TUID.
+
+Add 3 fp_warn lines covering the entry, the call_opcode_finish
+failure case, and the matched_tuid contents on positive verdict.
+Next verify-no-match attempt will surface which branch is hit
+and what status / TUID / payload bytes the IT firmware actually
+returns.
+
+All TEMP — to be reverted once the IT match verdict is decoded.
+---
+ libfprint/drivers/verimark/verimark.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 964d461..d3bc8d1 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1182,14 +1182,32 @@ vfy_cb_match(GObject *src, GAsyncResult *res, gpointer ud)
+     GError  *err = NULL;
+     if (!verimark_session_call_opcode_finish(res, &status, &payload,
+                                               &payload_len, &err)) {
++        fp_warn("verify: 0x99 call_opcode_finish FAILED on attempt %d: %s",
++                ctx->attempt, err ? err->message : "no GError");
+         fpi_ssm_mark_failed(ssm, err);
+         return;
+     }
++    fp_warn("verify: vfy_cb_match entered, attempt %d, status 0x%04x, "
++            "payload_len %zu", ctx->attempt, status, payload_len);
+     if (status == 0x0000 && payload && payload_len >= VERIMARK_STORAGE_TUID_LEN) {
+         ctx->matched = TRUE;
+         memcpy(ctx->matched_tuid, payload, VERIMARK_STORAGE_TUID_LEN);
+-        fp_info("verify: positive verdict on attempt %d (%zu bytes)",
+-                ctx->attempt, payload_len);
++        /* TEMP fp_warn (diagnose) — comparing matched_tuid against the
++         * enrolled TUID will tell whether the IT firmware is using a
++         * different TUID scheme than the DT (matched_tuid would then
++         * always be «right but unrecognized» by fprintd). */
++        fp_warn("verify: positive verdict on attempt %d (%zu bytes), "
++                "matched_tuid[0..16] = %02x %02x %02x %02x %02x %02x %02x %02x "
++                "%02x %02x %02x %02x %02x %02x %02x %02x",
++                ctx->attempt, payload_len,
++                ctx->matched_tuid[0], ctx->matched_tuid[1],
++                ctx->matched_tuid[2], ctx->matched_tuid[3],
++                ctx->matched_tuid[4], ctx->matched_tuid[5],
++                ctx->matched_tuid[6], ctx->matched_tuid[7],
++                ctx->matched_tuid[8], ctx->matched_tuid[9],
++                ctx->matched_tuid[10], ctx->matched_tuid[11],
++                ctx->matched_tuid[12], ctx->matched_tuid[13],
++                ctx->matched_tuid[14], ctx->matched_tuid[15]);
+     } else {
+         /* Temporarily logged at WARN level so the firmware status/
+          * payload shape always reaches journalctl during IT diagnose

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:32:34 +0200
+Subject: [PATCH 47/62] verimark: try 17-byte 0x96 03 commit on IT (sub-cmd +
+ TUID, no SID)
+
+1-byte payload returned 0x0504 (vs 0x0404 with the DT 123-byte
+payload). The status change tells us the IT firmware does NOT
+reject the request as out-of-state with the shorter form ; it
+just complains about something missing. Next smallest natural
+shape : sub-command + TUID only, drop the SID + footer that the
+DT carries. 17 bytes total.
+---
+ libfprint/drivers/verimark/verimark.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index ac2e73b..4c22873 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2583,12 +2583,16 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         const gboolean is_it = (usb != NULL &&
+                                 g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
+         if (is_it) {
+-            /* Minimal payload : just the sub-command byte 0x03 = commit.
+-             * The DT's 123-byte body (TUID + SID + footer) was rejected
+-             * with 0x0404 on the IT. Try the smallest valid framing
+-             * first ; we can grow it incrementally if needed. */
+-            static const uint8_t it_commit_payload[1] = { 0x03 };
+-            fp_warn("verimark: IT enroll sending 0x96 03 with 1-byte payload");
++            /* 1-byte payload gave 0x0504 (vs 0x0404 from DT 123-byte) —
++             * progress, but still rejected. Next hypothesis : the IT
++             * commit just needs sub-cmd + TUID, no SID footer. Build
++             * [0x03][TUID 16B] = 17 bytes. */
++            uint8_t it_commit_payload[17];
++            it_commit_payload[0] = 0x03;
++            memcpy(it_commit_payload + 1, ctx->new_tuid,
++                   VERIMARK_STORAGE_TUID_LEN);
++            fp_warn("verimark: IT enroll sending 0x96 03 with 17-byte payload "
++                    "(sub-cmd + 16B TUID)");
+             verimark_session_call_opcode_async(&self->session, self->transport,
+                 3000, 0x96, it_commit_payload, sizeof(it_commit_payload),
+                 cancel, enr_cb_commit, ssm);

@@ -11,14 +11,15 @@ from tests.fixtures import valid_blob
 from verimark_support.credential import CredentialError, validate_blob
 
 
-PIN = "66591aae03856bcefa7d7b4c0f08ea630f64b623"
+PIN = "c4654fdc85c25afdd9115bec2f95a44145ae3b94"
 REPOSITORY = Path(__file__).resolve().parents[1]
 PACKAGE_DIRECTORY = REPOSITORY / "packaging" / "arch"
 PACKAGE_BUILD = PACKAGE_DIRECTORY / "PKGBUILD"
 PACKAGE_SOURCE_INFO = PACKAGE_DIRECTORY / ".SRCINFO"
-GENERATED_DATA_PATCH = PACKAGE_DIRECTORY / "fix-generated-data-checks.patch"
 PATCH_SERIES_DIRECTORY = REPOSITORY / "patches" / "libfprint"
-PATCH_SERIES = PATCH_SERIES_DIRECTORY / "series"
+PATCH_GENERATION = PATCH_SERIES_DIRECTORY / "current"
+PATCH_SERIES = PATCH_GENERATION / "series"
+DRIVER_WORKTREE = REPOSITORY / ".driver-worktrees" / "libfprint"
 SOURCE_CACHE = PACKAGE_DIRECTORY / "libfprint"
 PACKAGE_METADATA = {".BUILDINFO", ".MTREE", ".PKGINFO"}
 EXPECTED_DIRECTORIES = {
@@ -104,6 +105,30 @@ def run_checked(test_case, *arguments):
     return result.stdout
 
 
+def clone_source(test_case, destination, revision=PIN):
+    cloned = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--shared",
+            "--no-checkout",
+            str(DRIVER_WORKTREE),
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    test_case.assertEqual(cloned.returncode, 0, cloned.stderr)
+    checked_out = subprocess.run(
+        ["git", "-C", str(destination), "checkout", "--detach", revision],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    test_case.assertEqual(checked_out.returncode, 0, checked_out.stderr)
+
+
 def parse_srcinfo(output):
     info = {}
     for line in output.splitlines():
@@ -148,7 +173,7 @@ def build_package_fixture(directory, extra_path=None, extra_content=b"fixture"):
         ".PKGINFO": (
             b"pkgname = libfprint-verimark\n"
             b"pkgbase = libfprint-verimark\n"
-            b"pkgver = 1.94.10.r1.g66591aa-1\n"
+            b"pkgver = 1.94.100.r1.gc4654fd-1\n"
             b"pkgdesc = Synthetic libfprint package for safety tests\n"
             b"arch = x86_64\n"
         ),
@@ -304,13 +329,13 @@ class GeneratedMetadataTests(unittest.TestCase):
 
     def test_generated_metadata_exposes_replacement_package_contract(self):
         self.assertEqual(self.info["pkgbase"], ["libfprint-verimark"])
-        self.assertEqual(self.info["pkgver"], ["1.94.10.r1.g66591aa"])
+        self.assertEqual(self.info["pkgver"], ["1.94.100.r1.gc4654fd"])
         self.assertEqual(self.info["conflicts"], ["libfprint"])
         self.assertCountEqual(
             self.info["provides"], ["libfprint", "libfprint-2.so"]
         )
         self.assertIn(
-            "libfprint::git+https://gitlab.freedesktop.org/s-celles/"
+            "libfprint::git+https://gitlab.freedesktop.org/libfprint/"
             "libfprint.git#commit=" + PIN,
             self.info["source"],
         )
@@ -330,7 +355,12 @@ class GeneratedMetadataTests(unittest.TestCase):
 
         for patch_source in patch_sources:
             with self.subTest(patch_source=patch_source):
-                source = f"{patch_source}::../../patches/libfprint/{patch_source}"
+                relative_source = (
+                    "../../patches/libfprint/series"
+                    if patch_source == "series"
+                    else f"../../patches/libfprint/current/{patch_source}"
+                )
+                source = f"{patch_source}::{relative_source}"
                 self.assertIn(source, self.info["source"])
                 patch_index = self.info["source"].index(source)
                 self.assertRegex(
@@ -343,44 +373,108 @@ class GeneratedMetadataTests(unittest.TestCase):
         self.assertEqual(len(package_paths), 1)
         self.assertTrue(
             Path(package_paths[0]).name.startswith(
-                "libfprint-verimark-1.94.10.r1.g66591aa-1-x86_64.pkg.tar."
+                "libfprint-verimark-1.94.100.r1.gc4654fd-1-x86_64.pkg.tar."
             )
         )
 
 
 class PackageSourceBoundaryTests(unittest.TestCase):
-    def test_generated_data_patch_supports_only_the_desktop_verimark_device(self):
-        patch = GENERATED_DATA_PATCH.read_text()
-
-        self.assert_desktop_only_generated_data_patch(patch)
-
-    def test_active_patch_series_supports_only_the_desktop_verimark_device(self):
+    def test_active_patch_series_supports_both_verimark_devices(self):
         patches = [
-            (PATCH_SERIES_DIRECTORY / name).read_text()
+            (PATCH_GENERATION / name).read_text()
             for name in PATCH_SERIES.read_text().splitlines()
         ]
 
-        self.assert_desktop_only_generated_data_patch("\n".join(patches))
-
-    def assert_desktop_only_generated_data_patch(self, patch):
-        self.assertIn("+usb:v047Dp00F2*", patch)
-        self.assertIn("-usb:v047Dp00F2*", patch)
-        self.assertIn("-  { .vid = 0x047d, .pid = 0x00f2 },", patch)
-        self.assertNotIn("+usb:v047Dp8054*", patch)
-        self.assertNotIn("-usb:v047Dp8054*", patch)
-        self.assertNotIn("+  { .vid = 0x047d, .pid = 0x8054 },", patch)
-        self.assertNotIn("-  { .vid = 0x047d, .pid = 0x8054 },", patch)
+        patch = "\n".join(patches)
+        for marker in (
+            "+usb:v047Dp00F2*",
+            "+usb:v047Dp8054*",
+            "0x00f2",
+            "0x8054",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, patch)
 
     def test_package_metadata_has_no_maintainer_contact_and_matches_patch_digest(self):
         package_build = PACKAGE_BUILD.read_text()
         source_info = PACKAGE_SOURCE_INFO.read_text()
 
         self.assertNotIn("Maintainer:", package_build)
-        for patch_path in (PATCH_SERIES, *sorted(PATCH_SERIES_DIRECTORY.glob("*.patch"))):
+        for patch_path in (PATCH_SERIES, *sorted(PATCH_GENERATION.glob("*.patch"))):
             with self.subTest(patch_path=patch_path):
                 patch_digest = hashlib.blake2b(patch_path.read_bytes()).hexdigest()
                 self.assertIn(patch_digest, package_build)
                 self.assertIn("b2sums = " + patch_digest, source_info)
+
+
+class PackageSeriesValidationTests(unittest.TestCase):
+    def test_prepare_rejects_blank_duplicate_traversal_and_symlink_entries(self):
+        cases = {
+            "blank": (
+                "0001-valid.patch\n\n0002-valid.patch\n",
+                "blank libfprint patch-series entry",
+                False,
+            ),
+            "duplicate": (
+                "0001-valid.patch\n0001-valid.patch\n",
+                "duplicate libfprint patch-series entry",
+                False,
+            ),
+            "traversal": (
+                "../outside.patch\n",
+                "invalid libfprint patch-series entry",
+                False,
+            ),
+            "symlink": (
+                "0001-valid.patch\n",
+                "regular non-symlink",
+                True,
+            ),
+        }
+
+        for name, (series, message, symlink_patch) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                source_directory = Path(directory)
+                checkout = source_directory / "libfprint"
+                clone_source(self, checkout)
+                (source_directory / "series").write_text(series)
+                for patch_name in ("0001-valid.patch", "0002-valid.patch"):
+                    (source_directory / patch_name).write_text("fixture\n")
+                if symlink_patch:
+                    (source_directory / "0001-valid.patch").unlink()
+                    (source_directory / "target.patch").write_text("fixture\n")
+                    (source_directory / "0001-valid.patch").symlink_to("target.patch")
+                command = (
+                    'error() { printf "error: %s\\n" "$*" >&2; }\n'
+                    'source "$1"\n'
+                    'srcdir="$2"\n'
+                    "prepare\n"
+                )
+
+                result = subprocess.run(
+                    ["bash", "-c", command, "prepare-test", str(PACKAGE_BUILD), str(source_directory)],
+                    cwd=source_directory,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                resolved = subprocess.run(
+                    ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(resolved.stdout.strip(), PIN)
+                status = subprocess.run(
+                    ["git", "-C", str(checkout), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(status.stdout, "")
 
 
 @unittest.skipUnless(SOURCE_CACHE.is_dir(), "run makepkg --verifysource first")
@@ -405,7 +499,7 @@ class ResolvedSourceTests(unittest.TestCase):
         ).strip()
 
         self.assertEqual(
-            origin, "https://gitlab.freedesktop.org/s-celles/libfprint.git"
+            origin, "https://gitlab.freedesktop.org/libfprint/libfprint.git"
         )
         self.assertEqual(resolved, PIN)
 
@@ -418,7 +512,7 @@ class BuiltPackageTests(unittest.TestCase):
         identity = run_checked(self, "pacman", "-Qp", str(self.package)).strip()
 
         self.assertEqual(
-            identity, "libfprint-verimark 1.94.10.r1.g66591aa-1"
+            identity, "libfprint-verimark 1.94.100.r1.gc4654fd-1"
         )
 
     def test_package_archive_provides_the_fprintd_abi_without_credentials(self):
