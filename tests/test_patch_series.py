@@ -12,7 +12,7 @@ import unittest
 
 
 BASE_COMMIT = "c4654fdc85c25afdd9115bec2f95a44145ae3b94"
-DRIVER_REF = "verimark-both-publishable"
+DRIVER_REF = "verimark-both-source-clean"
 REPOSITORY = Path(__file__).resolve().parents[1]
 DRIVER_WORKTREE = REPOSITORY / ".driver-worktrees" / "libfprint"
 PATCH_ROOT = REPOSITORY / "patches" / "libfprint"
@@ -37,8 +37,42 @@ PROHIBITED_RESIDUE = {
         r"fresh-pairing-bootstrap\.pcapng",
         re.IGNORECASE,
     ),
+    "generic capture provenance": re.compile(
+        r"\bmatik\s+captures?\b|"
+        r"\bcdb\s+capture\b|"
+        r"\bcaptures/|"
+        r"\bprobe-run-\d{8}(?:\.[a-z0-9]+)?\b|"
+        r"\breal\s+(?:runtime\s+)?captur(?:e|ed)\b|"
+        r"\bcaptured\s+runtime\b",
+        re.IGNORECASE,
+    ),
+    "capture-derived TUID": re.compile(
+        r"\b(?:sample|test)\s+tuid\b[^\n]{0,100}\b(?:from|taken\s+from)\b"
+        r"[^\n]{0,100}\bcaptur(?:e|ed)\b|"
+        r"\bcaptur(?:e|ed)\b[^\n]{0,100}\b(?:sample|test)\s+tuid\b",
+        re.IGNORECASE,
+    ),
+    "capture-derived opaque identifier": re.compile(
+        r"0xd9\s*,\s*0x92\s*,\s*0xaa\s*,\s*0x60|"
+        r"0x1f\s*,\s*0x80\s*,\s*0x8b\s*,\s*0x28|"
+        r"0xb5\s*,\s*0x08\s*,\s*0x52\s*,\s*0x0a|"
+        r"0xad\s*,\s*0x05\s*,\s*0x86\s*,\s*0x70|"
+        r"0x77\s*,\s*0xd2\s*,\s*0x04\s*,\s*0x99|"
+        r"0x64\s*,\s*0xe5\s*,\s*0x73\s*,\s*0x41|"
+        r"0x89\s*,\s*0x03\s*,\s*0xce\s*,\s*0x97|"
+        r"0xe7\s*,\s*0x92\s*,\s*0xe7\s*,\s*0xc5|"
+        r"0x01\s*,\s*0xbf\s*,\s*0x69\s*,\s*0x2c|"
+        r"0xad\s*,\s*0xea\s*,\s*0x42\s*,\s*0x74|"
+        r"0x87\s*,\s*0x81\s*,\s*0xeb\s*,\s*0xa2",
+        re.IGNORECASE,
+    ),
     "absolute temporary harness path": re.compile(r"/tmp/"),
 }
+SYNTHETIC_FIXTURE_MARKERS = (
+    "Synthetic TUID used only to exercise record layout and byte preservation.",
+    "Synthetic 0x9f 01 response fixture for the documented layout",
+    "Synthetic matched_tuid used to exercise request framing.",
+)
 
 
 def run(*arguments, cwd=REPOSITORY, env=None):
@@ -171,6 +205,9 @@ class PatchSeriesTests(unittest.TestCase):
         for description, pattern in PROHIBITED_RESIDUE.items():
             with self.subTest(description=description):
                 self.assertIsNone(pattern.search(patch_text))
+        for marker in SYNTHETIC_FIXTURE_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, patch_text)
 
     def test_active_patch_series_registers_both_verimark_ids(self):
         patch_text = "\n".join((CURRENT / name).read_text() for name in read_series())
@@ -254,9 +291,12 @@ class PatchSeriesTests(unittest.TestCase):
                 checkout / "libfprint" / "drivers" / "verimark"
             )
 
-            for description, pattern in PROHIBITED_RESIDUE.items():
-                with self.subTest(description=description):
-                    self.assertIsNone(pattern.search(driver_text))
+        for description, pattern in PROHIBITED_RESIDUE.items():
+            with self.subTest(description=description):
+                self.assertIsNone(pattern.search(driver_text))
+        for marker in SYNTHETIC_FIXTURE_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, driver_text)
 
     def test_pkgbuild_applies_the_checked_series_in_order(self):
         package_build = (REPOSITORY / "packaging" / "arch" / "PKGBUILD").read_text()

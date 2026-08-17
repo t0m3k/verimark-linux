@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:52:01 +0200
+Subject: [PATCH 38/62] verimark: accept 0x96 02 add_image status 0x8006 as
+ IT-side complete signal
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Runtime enroll on the IT (047d:8054) accumulated 7 successful
+swipes — each returning status 0x0000 with the per-area bitmask
+advancing — and then failed on the next add_image with status
+0x8006, which the DT code path treated as a fatal protocol error.
+
+Interpretation: the IT firmware signals "no more images needed,
+template complete" with 0x8006 instead of advancing the bitmask
+to 0x7f the DT way. The behaviour is consistent across runs.
+
+Patch enr_cb_add_image to recognize this : when status == 0x8006
+AND the device is the IT, synthesize a complete state
+(bitmask == VERIMARK_ENROLL_TARGET_BITMASK_7F, verdict ==
+ACCEPTED) so the SSM continues to ENR_S_COMMIT_GATE through the
+normal path. The gate's only check is that the bitmask hits 0x7f,
+which the synthetic value satisfies.
+
+The DT path is unchanged (the PID guard returns the original
+fatal-error behaviour for the DT).
+
+If commit (0x96 03) or finish (0x96 04) reveal additional IT-
+specific protocol details, those will surface as separate clearly-
+labelled errors rather than the generic add_image one.
+---
+ libfprint/drivers/verimark/verimark.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 50645c2..76bab2f 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2107,6 +2107,29 @@ enr_cb_add_image(GObject *src, GAsyncResult *res, gpointer ud)
+     if (status == 0x0000 && payload && payload_len >= 64) {
+         ctx->add_image_bitmask = (uint16_t)(payload[0x14] | (payload[0x15] << 8));
+         ctx->add_image_verdict = payload[0x16];
++    } else if (status == 0x8006) {
++        /* IT-specific : the firmware signals "no more images needed,
++         * template complete" with status 0x8006 instead of advancing
++         * the bitmask. Observed runtime 2026-06-07 after 7 successful
++         * 0x96 02 calls. Synthesize a complete state so the SSM moves
++         * to commit. The 7-sub-area bitmask is the DT's notion of
++         * "done" — the IT may use a different internal coverage
++         * model, but for the SSM gate at ENR_S_COMMIT_GATE only the
++         * fact that bitmask == 0x7f matters. */
++        FpDevice *dev = fpi_ssm_get_device(ssm);
++        GUsbDevice *usb = fpi_device_get_usb_device(dev);
++        if (usb != NULL && g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
++            fp_info("verimark: IT enroll done (0x8006 from add_image)");
++            ctx->add_image_bitmask = VERIMARK_ENROLL_TARGET_BITMASK_7F;
++            ctx->add_image_verdict = VERIMARK_ENROLL_VERDICT_ACCEPTED;
++        } else {
++            ctx->fatal_error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                            "enroll: 0x96 02 add_image status 0x%04x",
++                                            status);
++            g_free(payload);
++            fpi_ssm_jump_to_state(ssm, ENR_S_CLEANUP_FINISH);
++            return;
++        }
+     } else if (status != 0x0000) {
+         ctx->fatal_error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                         "enroll: 0x96 02 add_image status 0x%04x",

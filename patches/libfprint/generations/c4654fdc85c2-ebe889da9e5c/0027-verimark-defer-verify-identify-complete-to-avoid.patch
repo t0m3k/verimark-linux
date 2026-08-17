@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 19:46:14 +0200
+Subject: [PATCH 27/62] verimark: defer verify/identify complete to avoid
+ pam_fprintd race
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pam_fprintd discards VerifyResult signals whose `verify_started` is
+not yet true. `verify_started` is set inside an async callback fired
+when the VerifyStart D-Bus method reply arrives. With our async SSM
+the VerifyResult signal can be emitted in the same GMainLoop iteration
+as the VerifyStart reply lands inside fprintd ; pam_fprintd then sees
+the signal before its own async callback fires, and logs:
+
+  "Unexpected VerifyResult 'verify-match', 1 signal"
+
+Auth falls back to password — observed on GDM 49 / fprintd 1.94.5
+on Wayland.
+
+Defer `fpi_device_verify_complete` / `fpi_device_identify_complete`
+through `g_idle_add`. The VerifyResult signal still fires synchronously
+from `fpi_device_*_report`, but the next-tick deferral gives the
+GMainLoop a chance to dispatch :
+- the VerifyResult signal to fprintd's bus, which serializes it after
+  the VerifyStart reply,
+- and pam_fprintd's verify_started_cb, before VerifyResult is
+  processed by pam_fprintd's signal handler.
+
+The verify operation is still completed cleanly ; we just shift the
+"done" marker by one idle tick (microseconds). The internal cleanup
+(`self->task_ssm = NULL`, `self->verify_ctx = NULL`) happens
+immediately so a subsequent verify/identify can be started right
+away if needed.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/verimark.c | 82 ++++++++++++++++++++++-----
+ 1 file changed, 67 insertions(+), 15 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index e2e0a52..9c858af 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1377,12 +1377,69 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+ 
+ /* ---- Verdict reporting (verify vs identify dispatch) -------------------- */
+ 
++/* ---- Deferred verify/identify complete ---------------------------------- *
++ *
++ * pam_fprintd handles VerifyStart asynchronously :
++ *   sd_bus_call_method_async(..., "VerifyStart", verify_started_cb, ...)
++ *
++ * `verify_started_cb` sets `data->verify_started = true`. The VerifyResult
++ * signal handler checks this flag — if VerifyResult arrives BEFORE
++ * verify_started_cb has fired, the result is logged as
++ *
++ *   "Unexpected VerifyResult 'verify-match', 1 signal"
++ *
++ * and discarded. The auth then falls back to password.
++ *
++ * Our async SSM is fast enough that `fpi_device_verify_report` (which
++ * emits the VerifyResult signal) AND `fpi_device_verify_complete` (which
++ * triggers fprintd to send the VerifyStart reply) can land in the same
++ * GMainLoop iteration. From pam_fprintd's point of view the signal can
++ * then arrive before the method reply.
++ *
++ * Deferring `fpi_device_*_complete` by one idle tick lets the
++ * GMainLoop dispatch the VerifyResult signal — and let fprintd flush
++ * the VerifyStart reply — before we mark the operation done. That
++ * guarantees pam_fprintd's `verify_started_cb` fires before the signal
++ * is processed, so `verify_started == true` when VerifyResult arrives.
++ */
++
++typedef struct {
++    FpDevice *dev;
++    GError   *error;            /* NULL = success ; owned */
++    gboolean  is_identify;
++} VerimarkDeferredComplete;
++
++static gboolean
++verimark_deferred_complete_cb(gpointer user_data)
++{
++    VerimarkDeferredComplete *d = user_data;
++    if (d->is_identify)
++        fpi_device_identify_complete(d->dev, d->error);
++    else
++        fpi_device_verify_complete(d->dev, d->error);
++    g_object_unref(d->dev);
++    g_free(d);
++    return G_SOURCE_REMOVE;
++}
++
++static void
++verimark_schedule_complete(FpDevice *dev, GError *error, gboolean is_identify)
++{
++    VerimarkDeferredComplete *d = g_new0(VerimarkDeferredComplete, 1);
++    d->dev = g_object_ref(dev);
++    d->error = error;          /* ownership transferred */
++    d->is_identify = is_identify;
++    g_idle_add(verimark_deferred_complete_cb, d);
++}
++
++
+ static void
+ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(dev);
+     VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
+     FpiDeviceAction action = fpi_device_get_current_action(dev);
++    gboolean is_identify = (action != FPI_DEVICE_ACTION_VERIFY);
+ 
+     /* Drop any pending timer source — defensive, in case the SSM failed
+      * while a timer was scheduled. */
+@@ -1391,14 +1448,12 @@ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+         ctx->pending_timer_id = 0;
+     }
+ 
++    self->task_ssm = NULL;
++    self->verify_ctx = NULL;
++
+     if (error) {
+         fp_info("verify: SSM failed (%s)", error->message ? error->message : "?");
+-        if (action == FPI_DEVICE_ACTION_VERIFY)
+-            fpi_device_verify_complete(dev, error);
+-        else
+-            fpi_device_identify_complete(dev, error);
+-        self->task_ssm = NULL;
+-        self->verify_ctx = NULL;
++        verimark_schedule_complete(dev, error, is_identify);
+         return;
+     }
+ 
+@@ -1431,11 +1486,11 @@ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+         if (reported_match) {
+             fp_info("verify: MATCH_SUCCESS");
+             fpi_device_verify_report(dev, FPI_MATCH_SUCCESS, NULL, NULL);
+-            fpi_device_verify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, FALSE);
+         } else if (ctx && ctx->frame_ready) {
+             fp_info("verify: MATCH_FAIL (finger seen, no enrollment matched)");
+             fpi_device_verify_report(dev, FPI_MATCH_FAIL, NULL, NULL);
+-            fpi_device_verify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, FALSE);
+         } else {
+             fp_info("verify: MATCH_ERROR (no finger after %d attempts)",
+                     VERIMARK_VERIFY_MAX_ATTEMPTS);
+@@ -1445,7 +1500,7 @@ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+                                         VERIMARK_VERIFY_MAX_ATTEMPTS);
+             fpi_device_verify_report(dev, FPI_MATCH_ERROR, NULL,
+                                      g_steal_pointer(&retry));
+-            fpi_device_verify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, FALSE);
+         }
+     } else { /* IDENTIFY */
+         FpPrint *gallery_hit = NULL;
+@@ -1458,11 +1513,11 @@ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+         }
+         if (gallery_hit) {
+             fpi_device_identify_report(dev, gallery_hit, NULL, NULL);
+-            fpi_device_identify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, TRUE);
+         } else if (ctx && ctx->frame_ready) {
+             /* Finger seen, no gallery hit (or resolver failed). */
+             fpi_device_identify_report(dev, NULL, NULL, NULL);
+-            fpi_device_identify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, TRUE);
+         } else {
+             GError *retry = g_error_new(FP_DEVICE_RETRY,
+                                         FP_DEVICE_RETRY_TOO_SHORT,
+@@ -1470,12 +1525,9 @@ verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
+                                         VERIMARK_VERIFY_MAX_ATTEMPTS);
+             fpi_device_identify_report(dev, NULL, NULL,
+                                        g_steal_pointer(&retry));
+-            fpi_device_identify_complete(dev, NULL);
++            verimark_schedule_complete(dev, NULL, TRUE);
+         }
+     }
+-
+-    self->task_ssm = NULL;
+-    self->verify_ctx = NULL;
+ }
+ 
+ 

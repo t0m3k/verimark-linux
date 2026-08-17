@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:02:50 +0200
+Subject: [PATCH 33/62] verimark: handshake orchestrator becomes IT-aware
+ (is_it_variant flag)
+
+Adds a bool is_it_variant parameter to verimark_handshake_perform()
+(sync) and verimark_handshake_perform_async() so the orchestrator
+can advertise the IT-specific 5-cipher ClientHello when needed,
+without duplicating the ~500-LOC handshake machinery. The flag is
+stored on HandshakeAsyncCtx for the async path.
+
+Branching at the two existing build_client_hello call sites:
+
+    ch_n = is_it_variant
+        ? verimark_tls_build_client_hello_it(...)   // 78 B, 5 ciphers
+        : verimark_tls_build_client_hello(...);     // 80 B, 6 ciphers
+
+All other handshake steps (ServerHello parse, cipher check against
+0xc02e, cert/CKE/CV/CCS/Finished build, AES-256-GCM, KDF) are
+shared verbatim with the DT path: the runtime end-to-end validation
+of voie A on 2026-06-07 proved the IT firmware accepts the same
+cipher + KDF + format as the DT, so reusing the orchestrator is
+correct.
+
+Callers updated to pass false (DT path preserved bit-for-bit):
+- verimark.c: open() first attempt + stale-state recovery retry
+- tests/test_handshake.c: 7 existing sync calls
+
+New TDD test first_write_is_expected_client_hello_it_variant
+asserts that when is_it_variant=true:
+- the wire is the byte-for-byte IT ClientHello (78 B)
+- is_handshake=true is still set on the transport (44 00 00 00
+  prefix still applied)
+
+All 12 standalone tests green (was 12, now 12 with 1 new IT
+assertion folded into test_handshake).
+---
+ libfprint/drivers/verimark/handshake.c        | 18 +++++--
+ libfprint/drivers/verimark/handshake.h        |  5 ++
+ .../drivers/verimark/tests/test_handshake.c   | 53 +++++++++++++++----
+ libfprint/drivers/verimark/verimark.c         |  2 +
+ 4 files changed, 65 insertions(+), 13 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+index e99f43f..cd591fa 100644
+--- a/libfprint/drivers/verimark/handshake.c
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -85,6 +85,7 @@ VerimarkHandshakeResult
+ verimark_handshake_perform(VerimarkTransportIO *io,
+                             const VerimarkPairingData *pairing,
+                             const VerimarkHandshakeReproducibleParams *repro_or_null,
++                            bool is_it_variant,
+                             VerimarkSession *session_out)
+ {
+     if (!io || !io->write || !io->read || !pairing || !session_out)
+@@ -112,9 +113,12 @@ verimark_handshake_perform(VerimarkTransportIO *io,
+         }
+     }
+ 
+-    /* ---- 2. ClientHello ---- */
+-    size_t ch_n = verimark_tls_build_client_hello(client_random,
+-                                                   b->ch_record, sizeof(b->ch_record));
++    /* ---- 2. ClientHello (DT 80 B / 6 ciphers, IT 78 B / 5 ciphers) ---- */
++    size_t ch_n = is_it_variant
++        ? verimark_tls_build_client_hello_it(client_random,
++                                              b->ch_record, sizeof(b->ch_record))
++        : verimark_tls_build_client_hello(client_random,
++                                           b->ch_record, sizeof(b->ch_record));
+     if (ch_n == 0) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
+     if (!io->write(io->ctx, b->ch_record, ch_n, /*is_handshake*/ true)) {
+         result = VERIMARK_HANDSHAKE_ERR_WRITE;
+@@ -480,6 +484,7 @@ typedef struct {
+     VerimarkPairingData pairing;             /* SECRET — wiped on free */
+     bool               has_repro;
+     VerimarkHandshakeReproducibleParams repro;
++    bool               is_it_variant;        /* 5-cipher ClientHello (IT) */
+     GCancellable      *cancellable;          /* not owned */
+ 
+     /* --- Working buffers : same layout as sync HandshakeBufs. --- */
+@@ -555,7 +560,10 @@ handshake_async_build_client_hello(HandshakeAsyncCtx *ctx)
+             return VERIMARK_HANDSHAKE_ERR_CRYPTO;
+     }
+ 
+-    size_t ch_n = verimark_tls_build_client_hello(ctx->client_random,
++    size_t ch_n = ctx->is_it_variant
++        ? verimark_tls_build_client_hello_it(ctx->client_random,
++                                              b->ch_record, sizeof(b->ch_record))
++        : verimark_tls_build_client_hello(ctx->client_random,
+                                                    b->ch_record,
+                                                    sizeof(b->ch_record));
+     if (ch_n == 0)
+@@ -916,6 +924,7 @@ verimark_handshake_perform_async(
+     unsigned timeout_ms,
+     const VerimarkPairingData *pairing,
+     const VerimarkHandshakeReproducibleParams *repro_or_null,
++    bool is_it_variant,
+     GCancellable *cancellable,
+     GAsyncReadyCallback callback,
+     gpointer user_data)
+@@ -937,6 +946,7 @@ verimark_handshake_perform_async(
+     ctx->has_repro   = (repro_or_null != NULL);
+     if (ctx->has_repro)
+         ctx->repro = *repro_or_null;
++    ctx->is_it_variant = is_it_variant;
+     ctx->cancellable = cancellable;
+     ctx->bufs = (HandshakeBufs *)calloc(1, sizeof(HandshakeBufs));
+     if (ctx->bufs == NULL) {
+diff --git a/libfprint/drivers/verimark/handshake.h b/libfprint/drivers/verimark/handshake.h
+index 01f2cb5..80c2c1a 100644
+--- a/libfprint/drivers/verimark/handshake.h
++++ b/libfprint/drivers/verimark/handshake.h
+@@ -100,11 +100,15 @@ typedef struct {
+  *
+  * If `repro_or_null` is non-NULL, the contained random values are used
+  * for reproducible test runs. Otherwise system entropy is queried.
++ *
++ * If `is_it_variant` is true, the orchestrator advertises the 5-cipher
++ * IT ClientHello (no 0x00a9). Pass `false` for the DT.
+  */
+ VerimarkHandshakeResult
+ verimark_handshake_perform(VerimarkTransportIO *io,
+                             const VerimarkPairingData *pairing,
+                             const VerimarkHandshakeReproducibleParams *repro_or_null,
++                            bool is_it_variant,
+                             VerimarkSession *session_out);
+ 
+ 
+@@ -140,6 +144,7 @@ void verimark_handshake_perform_async(
+     unsigned timeout_ms,
+     const VerimarkPairingData *pairing,
+     const VerimarkHandshakeReproducibleParams *repro_or_null,
++    bool is_it_variant,
+     GCancellable *cancellable,
+     GAsyncReadyCallback callback,
+     gpointer user_data);
+diff --git a/libfprint/drivers/verimark/tests/test_handshake.c b/libfprint/drivers/verimark/tests/test_handshake.c
+index 20fdab0..f8d5602 100644
+--- a/libfprint/drivers/verimark/tests/test_handshake.c
++++ b/libfprint/drivers/verimark/tests/test_handshake.c
+@@ -109,17 +109,17 @@ static void load_synthetic_pairing(VerimarkPairingData *out)
+ 
+ TEST(rejects_null_pointers)
+ {
+-    VerimarkSession s;
++    VerimarkSession s = {0};
+     VerimarkTransportIO io = { mock_write, mock_read, NULL };
+-    VerimarkPairingData p;
++    VerimarkPairingData p = {0};
+     /* NULL io */
+-    ASSERT_EQ(verimark_handshake_perform(NULL, &p, NULL, &s),
++    ASSERT_EQ(verimark_handshake_perform(NULL, &p, NULL, false, &s),
+               VERIMARK_HANDSHAKE_ERR_PARAM);
+     /* NULL pairing */
+-    ASSERT_EQ(verimark_handshake_perform(&io, NULL, NULL, &s),
++    ASSERT_EQ(verimark_handshake_perform(&io, NULL, NULL, false, &s),
+               VERIMARK_HANDSHAKE_ERR_PARAM);
+     /* NULL session_out */
+-    ASSERT_EQ(verimark_handshake_perform(&io, &p, NULL, NULL),
++    ASSERT_EQ(verimark_handshake_perform(&io, &p, NULL, false, NULL),
+               VERIMARK_HANDSHAKE_ERR_PARAM);
+     return 0;
+ }
+@@ -133,7 +133,7 @@ TEST(write_fail_returns_err_write)
+     m.write_should_fail = true;
+     VerimarkTransportIO io = { mock_write, mock_read, &m };
+     VerimarkSession s;
+-    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, &s);
++    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, false, &s);
+     ASSERT_EQ(r, VERIMARK_HANDSHAKE_ERR_WRITE);
+     /* Session zeroed on error. */
+     uint8_t zero[32] = {0};
+@@ -150,7 +150,7 @@ TEST(read_fail_returns_err_read)
+     m.read_should_fail = true;
+     VerimarkTransportIO io = { mock_write, mock_read, &m };
+     VerimarkSession s;
+-    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, &s);
++    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, false, &s);
+     ASSERT_EQ(r, VERIMARK_HANDSHAKE_ERR_READ);
+     return 0;
+ }
+@@ -169,7 +169,7 @@ TEST(server_alert_returns_err_server_alert)
+     m.next_response_len = sizeof(alert_record);
+     VerimarkTransportIO io = { mock_write, mock_read, &m };
+     VerimarkSession s;
+-    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, &s);
++    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, NULL, false, &s);
+     ASSERT_EQ(r, VERIMARK_HANDSHAKE_ERR_SERVER_ALERT);
+     return 0;
+ }
+@@ -196,7 +196,7 @@ TEST(first_write_is_expected_client_hello)
+     VerimarkTransportIO io = { mock_write, mock_read, &m };
+ 
+     VerimarkSession s;
+-    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, &repro, &s);
++    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, &repro, false, &s);
+     /* We expect a server_alert (we sent CH then read a fake alert) */
+     ASSERT_EQ(r, VERIMARK_HANDSHAKE_ERR_SERVER_ALERT);
+ 
+@@ -210,6 +210,40 @@ TEST(first_write_is_expected_client_hello)
+ }
+ 
+ 
++TEST(first_write_is_expected_client_hello_it_variant)
++{
++    /* When is_it_variant=true the orchestrator must emit the 78-byte
++     * IT ClientHello (5 ciphers, no 0x00a9) rather than the 80-byte DT
++     * one. The 44 00 00 00 prefix handling is unchanged. */
++    VerimarkPairingData pairing;
++    load_synthetic_pairing(&pairing);
++
++    VerimarkHandshakeReproducibleParams repro;
++    memcpy(repro.client_random, TV_HS_FIXED_CLIENT_RANDOM, 32);
++    memset(repro.eph_priv_be, 0x42, 32);
++
++    static const uint8_t alert_record[] = {
++        0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28
++    };
++    MockTransport m = {0};
++    m.next_response = alert_record;
++    m.next_response_len = sizeof(alert_record);
++    VerimarkTransportIO io = { mock_write, mock_read, &m };
++
++    VerimarkSession s;
++    VerimarkHandshakeResult r = verimark_handshake_perform(&io, &pairing, &repro,
++                                                            /*is_it_variant*/ true,
++                                                            &s);
++    ASSERT_EQ(r, VERIMARK_HANDSHAKE_ERR_SERVER_ALERT);
++
++    ASSERT_EQ(m.last_write_len, TV_HS_CLIENT_HELLO_IT_RECORD_LEN);
++    ASSERT_MEM_EQ(m.last_write, TV_HS_CLIENT_HELLO_IT_RECORD, m.last_write_len);
++    ASSERT_TRUE(m.last_write_is_handshake);
++    ASSERT_EQ(m.write_count, 1);
++    return 0;
++}
++
++
+ /* ---- main --------------------------------------------------------------- */
+ 
+ #define RUN(name) do { \
+@@ -229,6 +263,7 @@ int main(void)
+     RUN(read_fail_returns_err_read);
+     RUN(server_alert_returns_err_server_alert);
+     RUN(first_write_is_expected_client_hello);
++    RUN(first_write_is_expected_client_hello_it_variant);
+ 
+     fprintf(stderr, "\n%d passed, %d failed\n", passed, failed);
+     return failed == 0 ? 0 : 1;
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index fc950e4..3113859 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -462,6 +462,7 @@ verimark_open_handshake_done(GObject *src, GAsyncResult *res, gpointer ud)
+         verimark_handshake_perform_async(
+             ctx->self->transport, /*timeout_ms*/ 5000,
+             &ctx->pairing, /*repro_or_null*/ NULL,
++            /*is_it_variant*/ FALSE,   /* DT recovery path */
+             /*cancellable*/ NULL,
+             verimark_open_handshake_done, ctx);
+         return;
+@@ -574,6 +575,7 @@ static void verimark_open(FpDevice *device)
+     verimark_handshake_perform_async(
+         self->transport, /*timeout_ms*/ 5000,
+         &ctx->pairing, /*repro_or_null*/ NULL,
++        /*is_it_variant*/ FALSE,   /* DT first-attempt path */
+         /*cancellable*/ NULL,
+         verimark_open_handshake_done, ctx);
+ }

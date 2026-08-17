@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 16:25:58 +0200
+Subject: [PATCH 52/62] verimark: cleanup IT diagnostic logs + decline
+ delete-IT cleanly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase-4 closure of the IT runtime work :
+
+- Demote temp fp_warn diagnostics added during the 0x96 03 commit
+  hunt back to fp_dbg / fp_info :
+    verify: vfy_cb_match entry log → removed
+    verify: positive verdict full TUID dump → trimmed to fp_info
+    verify: attempt %d no-match → fp_dbg
+    verify: AFTER_POLL / MATCH transitions → fp_dbg
+    enroll: RESOLVE_TUID counters → fp_dbg, no full TUID dump
+    verimark: IT enroll sending 0x96 03 with %zu-byte payload → fp_dbg
+
+- verimark_delete : IT branch returns FP_DEVICE_ERROR_NOT_SUPPORTED
+  with a precise message pointing at /var/lib/fprint/<user>/ for
+  host-side reset. The IT delete opcode is 0xA4 with a 1-byte sub-
+  factor selector (≠ DT 0xa3 + TUID) ; the FpFinger → byte mapping
+  hasn't been runtime-captured yet and sending a wrong byte risks a
+  full firmware-side wipe. Documented as a known limitation in the
+  CHANGELOG and ROADMAP.
+
+13/13 standalone tests still green. Full libfprint build clean.
+Runtime IT path : enroll-completed + verify-match validated 2026-06-07.
+---
+ libfprint/drivers/verimark/verimark.c | 78 ++++++++++++---------------
+ 1 file changed, 33 insertions(+), 45 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 1c1abcd..980d815 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1182,39 +1182,17 @@ vfy_cb_match(GObject *src, GAsyncResult *res, gpointer ud)
+     GError  *err = NULL;
+     if (!verimark_session_call_opcode_finish(res, &status, &payload,
+                                               &payload_len, &err)) {
+-        fp_warn("verify: 0x99 call_opcode_finish FAILED on attempt %d: %s",
+-                ctx->attempt, err ? err->message : "no GError");
+         fpi_ssm_mark_failed(ssm, err);
+         return;
+     }
+-    fp_warn("verify: vfy_cb_match entered, attempt %d, status 0x%04x, "
+-            "payload_len %zu", ctx->attempt, status, payload_len);
+     if (status == 0x0000 && payload && payload_len >= VERIMARK_STORAGE_TUID_LEN) {
+         ctx->matched = TRUE;
+         memcpy(ctx->matched_tuid, payload, VERIMARK_STORAGE_TUID_LEN);
+-        /* TEMP fp_warn (diagnose) — comparing matched_tuid against the
+-         * enrolled TUID will tell whether the IT firmware is using a
+-         * different TUID scheme than the DT (matched_tuid would then
+-         * always be «right but unrecognized» by fprintd). */
+-        fp_warn("verify: positive verdict on attempt %d (%zu bytes), "
+-                "matched_tuid[0..16] = %02x %02x %02x %02x %02x %02x %02x %02x "
+-                "%02x %02x %02x %02x %02x %02x %02x %02x",
+-                ctx->attempt, payload_len,
+-                ctx->matched_tuid[0], ctx->matched_tuid[1],
+-                ctx->matched_tuid[2], ctx->matched_tuid[3],
+-                ctx->matched_tuid[4], ctx->matched_tuid[5],
+-                ctx->matched_tuid[6], ctx->matched_tuid[7],
+-                ctx->matched_tuid[8], ctx->matched_tuid[9],
+-                ctx->matched_tuid[10], ctx->matched_tuid[11],
+-                ctx->matched_tuid[12], ctx->matched_tuid[13],
+-                ctx->matched_tuid[14], ctx->matched_tuid[15]);
++        fp_info("verify: positive verdict on attempt %d (%zu bytes)",
++                ctx->attempt, payload_len);
+     } else {
+-        /* Temporarily logged at WARN level so the firmware status/
+-         * payload shape always reaches journalctl during IT diagnose
+-         * (info/dbg get filtered out by default fprintd config). Once
+-         * the IT match verdict is decoded, downgrade back to info. */
+-        fp_warn("verify: attempt %d no-match (status 0x%04x, %zu bytes, "
+-                "first 8 = %02x %02x %02x %02x %02x %02x %02x %02x)",
++        fp_dbg("verify: attempt %d no-match (status 0x%04x, %zu bytes, "
++               "first 8 = %02x %02x %02x %02x %02x %02x %02x %02x)",
+                 ctx->attempt, status, payload_len,
+                 payload && payload_len >= 1 ? payload[0] : 0,
+                 payload && payload_len >= 2 ? payload[1] : 0,
+@@ -1459,8 +1437,8 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+ 
+     /* ===== After-poll dispatch ========================================= */
+     case VFY_S_AFTER_POLL:
+-        fp_warn("verify: AFTER_POLL attempt=%d frame_ready=%d polls=%d "
+-                "false_detect=%d",
++        fp_dbg("verify: AFTER_POLL attempt=%d frame_ready=%d polls=%d "
++               "false_detect=%d",
+                 ctx->attempt, ctx->frame_ready_this_attempt,
+                 ctx->poll_count, ctx->saw_false_detect);
+         if (ctx->frame_ready_this_attempt) {
+@@ -1470,8 +1448,8 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         /* No finger → next attempt or end. */
+         ctx->attempt++;
+         if (ctx->attempt > VERIMARK_VERIFY_MAX_ATTEMPTS) {
+-            fp_warn("verify: AFTER_POLL → max attempts (%d) reached, "
+-                    "going to POSTAMBLE",
++            fp_dbg("verify: AFTER_POLL → max attempts (%d) reached, "
++                   "going to POSTAMBLE",
+                     VERIMARK_VERIFY_MAX_ATTEMPTS);
+             fpi_ssm_jump_to_state(ssm, VFY_S_POST_CFG_MIXED);
+         } else {
+@@ -1481,8 +1459,6 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+ 
+     /* ===== Match + dispatch ============================================ */
+     case VFY_S_MATCH:
+-        fp_warn("verify: MATCH state — sending 0x99 (attempt %d)",
+-                ctx->attempt);
+         verimark_session_call_opcode_async(&self->session, self->transport,
+             3000, 0x99, VFY_MATCH_PAYLOAD, sizeof(VFY_MATCH_PAYLOAD),
+             cancel, vfy_cb_match, ssm);
+@@ -2608,8 +2584,8 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+                 fpi_ssm_jump_to_state(ssm, ENR_S_CLEANUP_FINISH);
+                 return;
+             }
+-            fp_warn("verimark: IT enroll sending 0x96 03 with %zu-byte payload "
+-                    "(443-B record per the documented protocol layout)", n);
++            fp_dbg("verimark: IT enroll sending 0x96 03 with %zu-byte payload "
++                   "(443-B record per the documented protocol layout)", n);
+             verimark_session_call_opcode_async(&self->session, self->transport,
+                 3000, 0x96, it_commit_payload, n,
+                 cancel, enr_cb_commit, ssm);
+@@ -2664,17 +2640,10 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+                 break;
+             }
+         }
+-        /* TEMP diag : confirm the template was actually persisted on the
+-         * sensor by checking that getlist post-enroll grew vs pre-enroll. */
+-        fp_warn("enroll: RESOLVE_TUID — pre_count=%u post_count=%u found_new=%d, "
+-                "effective_tuid[0..8] = %02x %02x %02x %02x %02x %02x %02x %02x",
+-                (unsigned)ctx->pre_list.count,
+-                (unsigned)ctx->post_list.count,
+-                (int)found_new,
+-                ctx->effective_tuid[0], ctx->effective_tuid[1],
+-                ctx->effective_tuid[2], ctx->effective_tuid[3],
+-                ctx->effective_tuid[4], ctx->effective_tuid[5],
+-                ctx->effective_tuid[6], ctx->effective_tuid[7]);
++        fp_dbg("enroll: RESOLVE_TUID — pre_count=%u post_count=%u found_new=%d",
++               (unsigned)ctx->pre_list.count,
++               (unsigned)ctx->post_list.count,
++               (int)found_new);
+         fpi_ssm_mark_completed(ssm);
+         return;
+     }
+@@ -3028,6 +2997,25 @@ static void verimark_delete(FpDevice *device)
+         return;
+     }
+ 
++    /* The IT uses opcode 0xa4 with a 1-byte "sub-factor selector"
++     * payload (no TUID) — see docs/it-verify-decode.md § "Delete".
++     * Values 0x80 / 0x81 are special (delete-all categories). The
++     * mapping from FpFinger to sub-factor byte hasn't been runtime-
++     * captured yet, and sending a wrong byte risks wiping ALL
++     * templates on the firmware. Until that work is done we just
++     * decline cleanly so the host-side print list stays consistent
++     * (caller can wipe /var/lib/fprint/<user> manually to reset). */
++    GUsbDevice *usb = fpi_device_get_usb_device(device);
++    if (usb != NULL && g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "delete: IT sensor uses opcode 0xa4 with a "
++                            "sub-factor selector that hasn't been decoded "
++                            "yet — to remove the host-side print, delete "
++                            "/var/lib/fprint/<user>/ then re-enroll");
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++
+     VerimarkTransportIoCtx io_ctx = {
+         .h = self->transport,
+         .timeout_ms = 3000,

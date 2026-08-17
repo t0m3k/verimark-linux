@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 17:04:46 +0200
+Subject: [PATCH 56/62] verimark: revert IT 0xA4 to 1-byte payload + add
+ granular failure logging
+
+The 12-byte framing hypothesis was wrong : it-verify-decode.md and the
+re-read of fcn.18009a5a0 are explicit :
+
+    mov edx, 1            ; taille payload = 1
+    buffer[1] = <byte>    ; sous-facteur
+
+So the on-wire plaintext is [0xA4][sub_factor] = 2 bytes total, payload
+size 1. Restore that.
+
+To diagnose why the 1-byte payload was already failing at runtime,
+inline the call_opcode flow directly so each failure mode produces a
+distinct error message :
+
+  - encrypt_appdata failed         (host-side crypto bug)
+  - USB OUT write failed           (transport layer)
+  - USB IN read failed / timeout   (firmware silent)
+  - TLS decrypt failed             (MAC mismatch, nonce desync)
+  - short response (< 2 B)         (malformed reply)
+  - status 0x%04x                  (firmware refused with status code)
+
+This replaces the opaque "transport/crypto failure" blanket so the
+next test tells us exactly which step is breaking.
+---
+ libfprint/drivers/verimark/verimark.c | 81 ++++++++++++++++++---------
+ 1 file changed, 55 insertions(+), 26 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 28a769c..ab9b9cd 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3057,37 +3057,66 @@ static void verimark_delete(FpDevice *device)
+         };
+         VerimarkTransportIO it_io;
+         verimark_transport_io_bind(&it_io, &it_io_ctx);
+-        /* Synaptics opcodes use a standard 12-byte framing prefix :
+-         *   [sub_cmd u32 LE][field0 u32 LE][record_len u32 LE][record...]
++        /* Per RE of fcn.18009a5a0 + doc (it-verify-decode.md § Delete) :
++         *   mov edx, 1            ; taille payload = 1
++         *   buffer[1] = <byte>    ; sous-facteur ANSI-381
++         * → on-wire plaintext = [0xA4][sub_factor] = 2 bytes total.
+          *
+-         * For 0xA4 delete, the RE'd DLL builder (fcn.18009a5a0) writes the
+-         * sub_factor byte at buffer[1] (= the low byte of sub_cmd u32 LE).
+-         * The remaining 11 bytes of the framing are zero (sub_cmd high
+-         * bytes = 0, field0 = 0, record_len = 0 since the sub-factor IS
+-         * the carrying datum). Initial 1-byte payload returned 0x04xx
+-         * BAD_STATE at runtime ; the full 12-byte framing was confirmed
+-         * 2026-06-07 by comparison with 0x99 verify (12-byte) and 0x96
+-         * enroll commit (455-byte = 12 framing + 443 record). */
+-        uint8_t it_a4_payload[12] = {
+-            sub_factor, 0x00, 0x00, 0x00,   /* sub_cmd u32 LE */
+-            0x00, 0x00, 0x00, 0x00,         /* field0 u32 LE */
+-            0x00, 0x00, 0x00, 0x00,         /* record_len u32 LE */
+-        };
+-        uint8_t  resp[64];
+-        uint16_t it_status = 0;
+-        const uint8_t *it_payload = NULL;
+-        size_t          it_payload_len = 0;
+-        if (!verimark_session_call_opcode(&self->session, &it_io,
+-                                           /*opcode*/ 0xA4,
+-                                           /*payload*/ it_a4_payload, sizeof(it_a4_payload),
+-                                           resp, sizeof(resp),
+-                                           &it_status, &it_payload,
+-                                           &it_payload_len)) {
++         * Inline the call here (instead of verimark_session_call_opcode)
++         * so we can disambiguate the failure step : write vs read vs
++         * decrypt vs short response. The opaque "transport/crypto failure"
++         * black box hid which step was failing at runtime. */
++        uint8_t req_record[64];
++        size_t req_record_len = verimark_session_encrypt_appdata(
++            &self->session, 0xA4, &sub_factor, 1,
++            /*nonce*/ NULL,
++            req_record, sizeof(req_record));
++        if (req_record_len == 0) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                                "delete: 0xa4 transport/crypto failure");
++                                "delete: 0xa4 encrypt_appdata failed (sub-factor 0x%02x)",
++                                sub_factor);
+             fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
++        if (!it_io.write(it_io.ctx, req_record, req_record_len,
++                         /*is_handshake*/ false)) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 USB OUT write failed "
++                                "(record %zu B, sub-factor 0x%02x)",
++                                req_record_len, sub_factor);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
++            return;
++        }
++        uint8_t resp_record[4096];
++        size_t resp_record_len = 0;
++        if (!it_io.read(it_io.ctx, resp_record, sizeof(resp_record),
++                        &resp_record_len)) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 USB IN read failed/timeout "
++                                "(sub-factor 0x%02x)", sub_factor);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
++            return;
++        }
++        uint8_t  resp[64];
++        size_t plaintext_len = verimark_session_decrypt_appdata(
++            &self->session, resp_record, resp_record_len,
++            resp, sizeof(resp));
++        if (plaintext_len == 0) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 TLS decrypt failed "
++                                "(response record %zu B)", resp_record_len);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
++            return;
++        }
++        if (plaintext_len < 2) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 short response "
++                                "(%zu B plaintext, expected >= 2)", plaintext_len);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
++            return;
++        }
++        uint16_t it_status = (uint16_t)((resp[0] << 8) | resp[1]);
++        size_t   it_payload_len = plaintext_len - 2;
+         if (it_status != 0x0000) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                 "delete: 0xa4 status 0x%04x (sub-factor 0x%02x)",

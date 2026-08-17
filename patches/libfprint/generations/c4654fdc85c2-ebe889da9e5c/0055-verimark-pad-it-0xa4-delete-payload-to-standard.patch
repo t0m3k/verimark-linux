@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 16:59:52 +0200
+Subject: [PATCH 55/62] verimark: pad IT 0xA4 delete payload to standard
+ 12-byte Synaptics framing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first runtime test with a 1-byte payload (just the ANSI-381 sub-factor)
+returned at the transport layer (verimark_session_call_opcode → false),
+strongly suggesting the firmware refused the truncated plaintext.
+
+Every other IT opcode wired through the same TLS AppData channel uses
+the standard Synaptics 12-byte framing :
+
+    [sub_cmd u32 LE] [field0 u32 LE] [record_len u32 LE] [record...]
+
+  - 0x99 verify  : 12-byte payload (sub_cmd=0x01, rest zero)
+  - 0x96 enroll  : 455-byte payload (12 framing + 443 commit record)
+
+The RE of fcn.18009a5a0 puts the sub_factor byte at buffer[1], which
+is exactly the low byte of sub_cmd u32 LE — consistent with this
+framing. Pad to 12 bytes with sub_factor as the first byte and the
+remaining 11 bytes zero.
+---
+ libfprint/drivers/verimark/verimark.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 0fcb600..28a769c 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3057,13 +3057,29 @@ static void verimark_delete(FpDevice *device)
+         };
+         VerimarkTransportIO it_io;
+         verimark_transport_io_bind(&it_io, &it_io_ctx);
++        /* Synaptics opcodes use a standard 12-byte framing prefix :
++         *   [sub_cmd u32 LE][field0 u32 LE][record_len u32 LE][record...]
++         *
++         * For 0xA4 delete, the RE'd DLL builder (fcn.18009a5a0) writes the
++         * sub_factor byte at buffer[1] (= the low byte of sub_cmd u32 LE).
++         * The remaining 11 bytes of the framing are zero (sub_cmd high
++         * bytes = 0, field0 = 0, record_len = 0 since the sub-factor IS
++         * the carrying datum). Initial 1-byte payload returned 0x04xx
++         * BAD_STATE at runtime ; the full 12-byte framing was confirmed
++         * 2026-06-07 by comparison with 0x99 verify (12-byte) and 0x96
++         * enroll commit (455-byte = 12 framing + 443 record). */
++        uint8_t it_a4_payload[12] = {
++            sub_factor, 0x00, 0x00, 0x00,   /* sub_cmd u32 LE */
++            0x00, 0x00, 0x00, 0x00,         /* field0 u32 LE */
++            0x00, 0x00, 0x00, 0x00,         /* record_len u32 LE */
++        };
+         uint8_t  resp[64];
+         uint16_t it_status = 0;
+         const uint8_t *it_payload = NULL;
+         size_t          it_payload_len = 0;
+         if (!verimark_session_call_opcode(&self->session, &it_io,
+                                            /*opcode*/ 0xA4,
+-                                           /*payload*/ &sub_factor, 1,
++                                           /*payload*/ it_a4_payload, sizeof(it_a4_payload),
+                                            resp, sizeof(resp),
+                                            &it_status, &it_payload,
+                                            &it_payload_len)) {

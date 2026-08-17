@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:11:49 +0200
+Subject: [PATCH 34/62] =?UTF-8?q?verimark:=20wire=20the=20IT=20path=20insi?=
+ =?UTF-8?q?de=20open()=20=E2=80=94=20full=20Tudor=20TLS=20session?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces the introspection-only stub for the VeriMark IT
+(047d:8054) with the complete open flow, using the building
+blocks landed in the previous commits (BULK transport, IT
+session-reset helper, IT ClientHello, IT-aware orchestrator).
+
+Sequence inside open() when PID == 0x8054:
+
+  1. verimark_it_reset_session() : drains EP81, sends 01, handles
+     the three observed firmware initial states (fresh, stale
+     Windows session, or our own previous session) with up to two
+     plaintext close_notify recoveries, returns the 38-byte
+     device-info.
+  2. verimark_parse_device_info() : populates self->dev_info with
+     the bio-serial — same struct the DT path uses.
+  3. find_sub1_path() : now PID-aware. For the IT it picks
+     sub1_it_<BIO-SERIAL>0000.bin files, matching the output of
+     an authenticated pairing-state export.
+  4. verimark_pairing_load_from_file() + heap copy into
+     VerimarkOpenCtx (same lifecycle as DT).
+  5. verimark_handshake_perform_async(..., is_it_variant=TRUE,
+     ...) : the orchestrator emits the 78-byte IT ClientHello,
+     reuses the shared cert/CKE/CV/CCS/Finished + AES-256-GCM
+     stack, returns through verimark_open_handshake_done.
+
+VerimarkOpenCtx gains an is_it_variant gboolean so the
+stale-state recovery retry inside the callback re-uses the same
+variant rather than defaulting to the DT 6-cipher ClientHello.
+
+find_sub1_path is now PID-aware:
+- /var/lib/fprintd/verimark/sub1_<serial>.bin              (DT prod)
+- /var/lib/fprintd/verimark/sub1_it_<BIO-SERIAL>0000.bin   (IT prod)
+- $XDG_CONFIG_HOME/verimark/sub1-<iserial>.bin             (DT dev)
+- $XDG_CONFIG_HOME/verimark/sub1-it-<BIO-SERIAL>0000.bin   (IT dev)
+- Fallbacks: sub1.bin / sub1-it.bin in both locations.
+
+Both DT call sites in open() now set ctx->is_it_variant = FALSE
+explicitly (the heap allocation zeroes it, but explicit is
+clearer).
+
+The driver build inside libfprint passes cleanly (all 13 verimark
+TUs compile, including verimark.c). 12/12 standalone tests still
+green. Runtime validation pending : with the IT sub1 placed at
+the canonical path and the sensor plugged, open() should leave
+the device with session_active=TRUE, unlocking verify / enroll /
+identify exactly as on the DT.
+---
+ libfprint/drivers/verimark/verimark.c | 141 +++++++++++++++++++++++---
+ 1 file changed, 126 insertions(+), 15 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 3113859..50645c2 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -264,20 +264,48 @@ static void verimark_probe(FpDevice *device)
+  */
+ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+ {
++    GUsbDevice *usb = fpi_device_get_usb_device(FP_DEVICE(self));
++    const gboolean is_it = (usb != NULL &&
++                            g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
++    /* IT sub1 files are extracted by tools/pairing_state_
++     * import with names like sub1-it-0011223344556677.bin
++     * (bio-serial in uppercase hex + literal "0000"). DT files keep
++     * their historical pattern. */
++    const gchar *prefix_var = is_it ? "sub1_it_" : "sub1_";
++    const gchar *prefix_user = is_it ? "sub1-it-" : "sub1-";
++    const gchar *fallback_var  = is_it
++        ? "/var/lib/fprintd/verimark/sub1-it.bin"
++        : "/var/lib/fprintd/verimark/sub1.bin";
++    const gchar *fallback_user_name = is_it ? "sub1-it.bin" : "sub1.bin";
++
+     if (self->dev_info_valid) {
+         char serial[13];
+         verimark_format_serial(&self->dev_info, serial);
+-        gchar *p = g_strdup_printf("/var/lib/fprintd/verimark/sub1_%s.bin", serial);
++        /* For the IT, mirror the Windows-side blob value name
++         * (uppercase + "0000" suffix). The DT uses lowercase 12-char
++         * bio-serial as-is. */
++        gchar *p;
++        if (is_it) {
++            char serial_upper[13];
++            for (int i = 0; i < 12; i++) {
++                serial_upper[i] = (gchar)g_ascii_toupper(serial[i]);
++            }
++            serial_upper[12] = '\0';
++            p = g_strdup_printf("/var/lib/fprintd/verimark/%s%s0000.bin",
++                                prefix_var, serial_upper);
++        } else {
++            p = g_strdup_printf("/var/lib/fprintd/verimark/%s%s.bin",
++                                prefix_var, serial);
++        }
+         if (g_file_test(p, G_FILE_TEST_EXISTS)) return p;
+         g_free(p);
+     }
+-    gchar *fallback = g_strdup("/var/lib/fprintd/verimark/sub1.bin");
++    gchar *fallback = g_strdup(fallback_var);
+     if (g_file_test(fallback, G_FILE_TEST_EXISTS)) return fallback;
+     g_free(fallback);
+ 
+     /* Developer / single-user paths under XDG_CONFIG_HOME. */
+     const gchar *xdg_cfg = g_get_user_config_dir();   /* never NULL */
+-    GUsbDevice *usb = fpi_device_get_usb_device(FP_DEVICE(self));
+     g_autofree gchar *iserial = NULL;
+     if (usb != NULL) {
+         guint8 idx = g_usb_device_get_serial_number_index(usb);
+@@ -286,12 +314,29 @@ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+         }
+     }
+     if (iserial != NULL && iserial[0] != '\0') {
+-        gchar *user_p = g_strdup_printf("%s/verimark/sub1-%s.bin",
+-                                         xdg_cfg, iserial);
++        gchar *user_p;
++        if (is_it && self->dev_info_valid) {
++            /* Prefer bio-serial (uppercase, "0000" suffix) for the IT —
++             * matches the file naming our PS1 extractor produces. */
++            char serial[13];
++            verimark_format_serial(&self->dev_info, serial);
++            char serial_upper[13];
++            for (int i = 0; i < 12; i++) {
++                serial_upper[i] = (gchar)g_ascii_toupper(serial[i]);
++            }
++            serial_upper[12] = '\0';
++            user_p = g_strdup_printf("%s/verimark/%s%s0000.bin",
++                                      xdg_cfg, prefix_user, serial_upper);
++            if (g_file_test(user_p, G_FILE_TEST_EXISTS)) return user_p;
++            g_free(user_p);
++        }
++        user_p = g_strdup_printf("%s/verimark/%s%s.bin",
++                                  xdg_cfg, prefix_user, iserial);
+         if (g_file_test(user_p, G_FILE_TEST_EXISTS)) return user_p;
+         g_free(user_p);
+     }
+-    gchar *user_fb = g_strdup_printf("%s/verimark/sub1.bin", xdg_cfg);
++    gchar *user_fb = g_strdup_printf("%s/verimark/%s",
++                                      xdg_cfg, fallback_user_name);
+     if (g_file_test(user_fb, G_FILE_TEST_EXISTS)) return user_fb;
+     g_free(user_fb);
+ 
+@@ -404,6 +449,9 @@ typedef struct {
+     FpiDeviceVerimark   *self;
+     VerimarkPairingData  pairing;          /* heap-owned ; SECRET — wiped on free */
+     gboolean             attempted_recovery;
++    gboolean             is_it_variant;    /* TRUE if this is the IT (5-cipher
++                                              ClientHello) — passed through to
++                                              the recovery retry. */
+ } VerimarkOpenCtx;
+ 
+ 
+@@ -462,7 +510,7 @@ verimark_open_handshake_done(GObject *src, GAsyncResult *res, gpointer ud)
+         verimark_handshake_perform_async(
+             ctx->self->transport, /*timeout_ms*/ 5000,
+             &ctx->pairing, /*repro_or_null*/ NULL,
+-            /*is_it_variant*/ FALSE,   /* DT recovery path */
++            ctx->is_it_variant,        /* preserve per-device variant */
+             /*cancellable*/ NULL,
+             verimark_open_handshake_done, ctx);
+         return;
+@@ -512,15 +560,77 @@ static void verimark_open(FpDevice *device)
+     }
+     self->transport = verimark_handle_new(usb);
+ 
+-    /* The IT (BULK transport) needs a separate init sequence and a
+-     * BULK-based transport backend that aren't implemented yet. Open
+-     * succeeds with `session_active = FALSE` so probe / list still work,
+-     * but verify / enroll / identify will fail with "TLS session not
+-     * active" — same fallback as a DT with no sub1 pairing. */
++    /* IT path (BULK transport, separate init sequence, 5-cipher
++     * ClientHello). All building blocks were validated runtime
++     * 2026-06-07 via the Python harness ; this open() flow mirrors
++     * it inside the libfprint driver. */
+     if (g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
+-        fp_warn("verimark: IT (047d:8054) BULK transport not yet implemented ; "
+-                "device opens in introspection-only mode (no TLS session)");
+-        fpi_device_open_complete(device, NULL);
++        /* Step 1 : bring the firmware to a clean session-less state
++         * and read the 38-byte device-info. The helper handles the
++         * three observed initial firmware states (fresh, stale
++         * Windows session, our own previous session) with up to two
++         * plaintext close_notify recoveries. */
++        uint8_t info[64];
++        size_t  info_len = 0;
++        VerimarkResult rs = verimark_it_reset_session(
++            self->transport, info, sizeof(info), &info_len, 2000);
++        if (rs != VERIMARK_OK) {
++            verimark_handle_free(self->transport);
++            self->transport = NULL;
++            g_usb_device_release_interface(usb, mi_bio, 0, NULL);
++            g_set_error(&error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                        "IT session reset failed (%d) — unplug+replug the sensor",
++                        rs);
++            fpi_device_open_complete(device, error);
++            return;
++        }
++
++        /* Step 2 : decode bio-serial from the device-info payload
++         * (the 2-byte status header is stripped before parsing). */
++        if (info_len >= 2 + 36) {
++            self->dev_info_valid = verimark_parse_device_info(
++                info + 2, info_len - 2, &self->dev_info);
++        }
++        if (self->dev_info_valid) {
++            char ser[13];
++            verimark_format_serial(&self->dev_info, ser);
++            fp_info("verimark: IT initialized (bio-serial %s)", ser);
++        }
++
++        /* Step 3 : locate the IT-specific sub1. The find helper
++         * picks `sub1-it-…` filenames for PID 0x8054, matching the
++         * extraction script's output convention. */
++        g_autofree gchar *sub1_path = find_sub1_path(self);
++        if (!sub1_path) {
++            fp_warn("verimark: no IT sub1 pairing data found ; "
++                    "device opens in cleartext-only mode (no TLS session)");
++            fpi_device_open_complete(device, NULL);
++            return;
++        }
++
++        VerimarkPairingData stack_pairing;
++        if (!verimark_pairing_load_from_file(sub1_path, &stack_pairing)) {
++            fp_warn("verimark: failed to load IT sub1 from %s", sub1_path);
++            fpi_device_open_complete(device, NULL);
++            return;
++        }
++
++        VerimarkOpenCtx *ctx = g_new0(VerimarkOpenCtx, 1);
++        ctx->self = self;
++        ctx->pairing = stack_pairing;
++        ctx->attempted_recovery = FALSE;
++        ctx->is_it_variant = TRUE;
++        verimark_pairing_data_zero(&stack_pairing);
++
++        /* Step 4 : fire the async TLS handshake with the 5-cipher
++         * ClientHello. The callback (shared with the DT path) sets
++         * session_active = TRUE on success and frees ctx. */
++        verimark_handshake_perform_async(
++            self->transport, /*timeout_ms*/ 5000,
++            &ctx->pairing, /*repro_or_null*/ NULL,
++            /*is_it_variant*/ TRUE,
++            /*cancellable*/ NULL,
++            verimark_open_handshake_done, ctx);
+         return;
+     }
+ 
+@@ -568,6 +678,7 @@ static void verimark_open(FpDevice *device)
+     ctx->self = self;
+     ctx->pairing = stack_pairing;     /* deep copy (struct value) */
+     ctx->attempted_recovery = FALSE;
++    ctx->is_it_variant = FALSE;
+     verimark_pairing_data_zero(&stack_pairing);
+ 
+     /* Fire the async handshake. The callback will set session_active,

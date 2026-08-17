@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:33:40 +0200
+Subject: [PATCH 35/62] verimark: BULK async transceive for the IT handshake
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first IT runtime open() returned VERIMARK_HANDSHAKE_ERR_READ
+(-3) because the async orchestrator was routing both TX1
+(ClientHello -> ServerHello) and TX2 (Flight2 -> Server CCS +
+encrypted Finished) through verimark_transceive_async, which is
+hard-wired to vendor CONTROL transfers (bRequest 0x16 / 0x17
+DT-only). The IT speaks the same Tudor TLS family but over BULK
+endpoints (EP01 OUT, EP81 IN) — control transfers on the IT
+return nothing, the read side times out, hence -3.
+
+Adds verimark_transceive_async_bulk in transport.{h,c}, sharing
+the existing VerimarkTransceiveAsyncCtx and verimark_transceive_
+finish so the orchestrator just dispatches on is_it_variant:
+
+    if (ctx->is_it_variant) {
+        verimark_transceive_async_bulk(...);
+    } else {
+        verimark_transceive_async(...);
+    }
+
+Done at both TX1 and TX2 sites in handshake.c. The IT path drops
+the 8-byte alignment and the wValue-from-length trick that only
+apply to the DT's vendor control framing.
+
+Buffers carry the 4-byte 44 00 00 00 transport prefix on
+handshake records (already prepended in handshake_async_build_
+client_hello and the flight2 builder) — no change needed there.
+
+Response buffers are 256 bytes, plenty for the IT's known reply
+sizes (66 B ServerHello + CertReq + ServerHelloDone ; 51 B
+ServerCCS + encrypted Finished). The single bulk_transfer_async
+IN call returns once the firmware sends a short packet (< 64 B),
+which all IT handshake replies do — same termination semantics
+the Python harness uses, runtime-validated 2026-06-07.
+
+verimark_bulk_in already mirrors the Python bulk_read_all multi-
+chunk loop for the sync path used by verimark_it_reset_session ;
+the async transceive is one bulk_out + one bulk_in, which is
+sufficient for the handshake TXs.
+
+12 standalone tests still green. Full libfprint build clean.
+---
+ libfprint/drivers/verimark/handshake.c |  55 +++++++++----
+ libfprint/drivers/verimark/transport.c | 108 +++++++++++++++++++++++++
+ libfprint/drivers/verimark/transport.h |  18 +++++
+ 3 files changed, 165 insertions(+), 16 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+index cd591fa..f56b140 100644
+--- a/libfprint/drivers/verimark/handshake.c
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -907,14 +907,25 @@ handshake_async_tx1_done(GObject *obj, GAsyncResult *res, gpointer ud)
+         return;
+     }
+ 
+-    /* Kick off TX2 : send flight2, read server response. */
+-    verimark_transceive_async(ctx->transport,
+-                              ctx->wire_flight, ctx->wire_flight_len,
+-                              ctx->bufs->server_response,
+-                              sizeof(ctx->bufs->server_response),
+-                              ctx->timeout_ms,
+-                              ctx->cancellable,
+-                              handshake_async_tx2_done, task);
++    /* Kick off TX2 : send flight2, read server response. Same DT/IT
++     * dispatch as TX1. */
++    if (ctx->is_it_variant) {
++        verimark_transceive_async_bulk(ctx->transport,
++                                        ctx->wire_flight, ctx->wire_flight_len,
++                                        ctx->bufs->server_response,
++                                        sizeof(ctx->bufs->server_response),
++                                        ctx->timeout_ms,
++                                        ctx->cancellable,
++                                        handshake_async_tx2_done, task);
++    } else {
++        verimark_transceive_async(ctx->transport,
++                                  ctx->wire_flight, ctx->wire_flight_len,
++                                  ctx->bufs->server_response,
++                                  sizeof(ctx->bufs->server_response),
++                                  ctx->timeout_ms,
++                                  ctx->cancellable,
++                                  handshake_async_tx2_done, task);
++    }
+ }
+ 
+ 
+@@ -969,14 +980,26 @@ verimark_handshake_perform_async(
+         return;
+     }
+ 
+-    /* Kick off TX1 : send ClientHello, read ServerHello. */
+-    verimark_transceive_async(transport,
+-                              ctx->wire_ch, ctx->wire_ch_len,
+-                              ctx->bufs->sh_record,
+-                              sizeof(ctx->bufs->sh_record),
+-                              timeout_ms,
+-                              cancellable,
+-                              handshake_async_tx1_done, task);
++    /* Kick off TX1 : send ClientHello, read ServerHello.
++     * IT uses BULK on EP01/EP81 ; DT uses vendor control transfers
++     * (0x16 / 0x17). Both async helpers share the same finish API. */
++    if (ctx->is_it_variant) {
++        verimark_transceive_async_bulk(transport,
++                                        ctx->wire_ch, ctx->wire_ch_len,
++                                        ctx->bufs->sh_record,
++                                        sizeof(ctx->bufs->sh_record),
++                                        timeout_ms,
++                                        cancellable,
++                                        handshake_async_tx1_done, task);
++    } else {
++        verimark_transceive_async(transport,
++                                  ctx->wire_ch, ctx->wire_ch_len,
++                                  ctx->bufs->sh_record,
++                                  sizeof(ctx->bufs->sh_record),
++                                  timeout_ms,
++                                  cancellable,
++                                  handshake_async_tx1_done, task);
++    }
+ }
+ 
+ 
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index 0991a9f..8340341 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -528,6 +528,114 @@ verimark_transceive_async(VerimarkUsbHandle *h,
+ }
+ 
+ 
++/* --- transceive_async_bulk : OUT EP01 then IN EP81 (IT) ------------- */
++
++static void
++verimark_transceive_bulk_in_cb(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    GTask *task = G_TASK(ud);
++    VerimarkTransceiveAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    /* libgusb returns the byte count via gssize, mirroring the
++     * synchronous bulk_transfer's `actual_length` out parameter. */
++    gssize n = g_usb_device_bulk_transfer_finish(G_USB_DEVICE(obj),
++                                                  res, &err);
++    if (n < 0) {
++        if (err == NULL)
++            err = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED,
++                              "transceive_bulk: IN failed");
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    ctx->resp_len = (size_t)n;
++    g_task_return_boolean(task, TRUE);
++    g_object_unref(task);
++}
++
++
++static void
++verimark_transceive_bulk_out_cb(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    GTask *task = G_TASK(ud);
++    VerimarkTransceiveAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    gssize n = g_usb_device_bulk_transfer_finish(G_USB_DEVICE(obj),
++                                                  res, &err);
++    if (n < 0) {
++        if (err == NULL)
++            err = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED,
++                              "transceive_bulk: OUT failed");
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    if ((size_t)n != ctx->send_aligned) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "transceive_bulk: OUT short write %zd / %zu",
++                                n, ctx->send_aligned);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Chain the IN on EP81. The firmware terminates handshake responses
++     * with a short packet (< 64 B), so libusb returns once the full
++     * record has been read into resp. */
++    GUsbDevice *dev = (GUsbDevice *)ctx->h->native;
++    g_usb_device_bulk_transfer_async(
++        dev,
++        VERIMARK_IT_EP_BULK_IN,
++        ctx->resp, ctx->resp_size,
++        ctx->timeout_ms,
++        ctx->cancellable,
++        verimark_transceive_bulk_in_cb, task);
++}
++
++
++void
++verimark_transceive_async_bulk(VerimarkUsbHandle *h,
++                                const uint8_t *data,
++                                size_t data_len,
++                                uint8_t *resp,
++                                size_t resp_size,
++                                unsigned timeout_ms,
++                                GCancellable *cancellable,
++                                GAsyncReadyCallback callback,
++                                gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_transceive_async_bulk);
++
++    if (h == NULL || data == NULL || data_len == 0 || resp == NULL) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "transceive_async_bulk: invalid arg");
++        g_object_unref(task);
++        return;
++    }
++
++    VerimarkTransceiveAsyncCtx *ctx = g_new0(VerimarkTransceiveAsyncCtx, 1);
++    ctx->h = h;
++    ctx->resp = resp;
++    ctx->resp_size = resp_size;
++    ctx->timeout_ms = timeout_ms;
++    ctx->cancellable = cancellable;
++    /* BULK has no alignment / wValue quirks — copy `data` as-is. */
++    ctx->send_buf = g_malloc(data_len);
++    memcpy(ctx->send_buf, data, data_len);
++    ctx->send_aligned = data_len;
++    g_task_set_task_data(task, ctx, verimark_transceive_async_ctx_free);
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_usb_device_bulk_transfer_async(
++        dev,
++        VERIMARK_IT_EP_BULK_OUT,
++        ctx->send_buf, data_len,
++        timeout_ms,
++        cancellable,
++        verimark_transceive_bulk_out_cb, task);
++}
++
++
+ VerimarkResult
+ verimark_transceive_finish(GAsyncResult *res, size_t *out_resp_len,
+                           GError **error)
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+index fe8c6c8..4d5af2c 100644
+--- a/libfprint/drivers/verimark/transport.h
++++ b/libfprint/drivers/verimark/transport.h
+@@ -360,6 +360,24 @@ void verimark_transceive_async(VerimarkUsbHandle *h,
+                                GAsyncReadyCallback callback,
+                                gpointer user_data);
+ 
++/**
++ * BULK variant of `verimark_transceive_async` for the IT (047d:8054) :
++ * writes `data` to EP01 OUT then reads the response on EP81 IN. No
++ * wValue / 8-byte alignment quirks (those are DT control-transfer
++ * specifics). Completion semantics and finish API are identical to
++ * `verimark_transceive_async` — the same `verimark_transceive_finish`
++ * is used to retrieve the actual byte count.
++ */
++void verimark_transceive_async_bulk(VerimarkUsbHandle *h,
++                                     const uint8_t *data,
++                                     size_t data_len,
++                                     uint8_t *resp,
++                                     size_t resp_size,
++                                     unsigned timeout_ms,
++                                     GCancellable *cancellable,
++                                     GAsyncReadyCallback callback,
++                                     gpointer user_data);
++
+ VerimarkResult verimark_transceive_finish(GAsyncResult *res,
+                                           size_t *out_resp_len,
+                                           GError **error);
