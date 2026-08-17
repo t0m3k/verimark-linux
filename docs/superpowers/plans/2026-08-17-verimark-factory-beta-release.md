@@ -19,6 +19,8 @@
 - Private keys, credential blobs, certificate bodies, session secrets, biometric data, raw serials, Windows registry data, packet captures, and unrestricted journals must never appear in logs, reports, commits, packages, or release archives.
 - Preserve the existing Windows-compatible credential reader internally, but ship no Windows extraction, DPAPI, registry, import, export, or credential-install tooling.
 - The package must not pair hardware, enable PAM, enroll a finger, reset a device, or create a credential during installation or upgrade.
+- Normal and AUR builds pass `-Dverimark_dev_reset=false`; they contain no reset protocol code, native helper, `verimarkctl factory-reset` command, reset opcode, or reset confirmation string.
+- A developer source build may enable `-Dverimark_dev_reset=true` only after a verified reset protocol record exists; it requires the destructive confirmation, journal, helper, and disposable-hardware gates in Tasks 18–22.
 - The AUR package is `libfprint-verimark`, provides/conflicts with `libfprint`, and preserves the stock `libfprint-2.so` ABI required by fprintd.
 - Do not create a GitHub repository, release, issue, author contact, AUR package, or upstream merge request without a fresh explicit user authorization for that external action.
 - The existing Windows-paired reader and its credential are protected fixtures: never remove the credential, send an unauthenticated pairing request to that reader, reset it, or delete an unknown template.
@@ -819,7 +821,7 @@ int`.
 
 - [ ] **Step 1: Replace old CLI tests with the allowed command surface**
 
-Assert `status`, `doctor`, and `report` exist; `pair`, `reset`, `delete`, `import`, `export`, `install`, and `windows` are rejected. Assert every probe is injectable and read-only, the CLI refuses to run as a USB claimant, and `report` uses `O_CREAT|O_EXCL` with mode `0600`.
+Assert `status`, `doctor`, and `report` exist; `pair`, `reset`, `delete`, `import`, `export`, `install`, and `windows` are rejected in the normal build. Assert every probe is injectable and read-only, the CLI refuses to run as a USB claimant, and `report` uses `O_CREAT|O_EXCL` with mode `0600`. Task 21 adds the developer-gated `factory-reset` command without changing this normal-build surface.
 
 - [ ] **Step 2: Add adversarial redaction tests**
 
@@ -1330,6 +1332,445 @@ Expected: the local repository contains a reproducible, Desktop-only upstream
 series and privacy-safe evidence; external state changes are separately
 authorized and recorded.
 
+### Task 18: Establish the Developer Reset Protocol Gate and Build Boundary
+
+**Files:**
+- Create in driver: `libfprint/drivers/verimark/reset-protocol.h`
+- Create in driver: `libfprint/drivers/verimark/tests/test-reset-policy.c`
+- Modify in driver: `meson_options.txt`
+- Modify in driver: `libfprint/drivers/verimark/meson.build`
+- Create: `docs/hardware/reset-protocol-record.md`
+- Create: `tests/test_reset_build_policy.py`
+- Modify: `packaging/arch/PKGBUILD`
+- Modify: `packaging/arch/.SRCINFO`
+
+**Interfaces:**
+- Consumes: the protected device boundary `047d:00f2`, existing authenticated-session transport, and the developer reset design.
+- Produces:
+
+```c
+typedef enum {
+  VERIMARK_RESET_PROTOCOL_UNVERIFIED,
+  VERIMARK_RESET_PROTOCOL_VERIFIED,
+} VerimarkResetProtocolStatus;
+
+typedef struct {
+  guint8 request_opcode;
+  guint16 success_status;
+  guint16 already_fresh_status;
+  gsize request_length;
+  gsize response_length;
+} VerimarkResetProtocol;
+
+gboolean verimark_reset_protocol_get (VerimarkResetProtocol *out,
+                                      GError **error);
+```
+
+`verimark_reset_protocol_get()` returns an error while the status is
+unverified. No reset request builder or USB submission symbol exists before
+the protocol record is verified.
+
+- [ ] **Step 1: Write failing normal/developer build-policy tests**
+
+Create Python tests that configure the standalone VeriMark driver twice. The
+normal configuration omits the option and must report
+`verimark_dev_reset=false`; the developer configuration passes
+`-Dverimark_dev_reset=true`. Assert the normal build contains no
+`factory-reset`, `ERASE WINDOWS PAIRING`, or reset-helper filename in its
+compiled targets, generated introspection data, installed files, or
+`verimarkctl --help` output. Assert the AUR PKGBUILD explicitly passes the
+false value.
+
+Add C tests that `verimark_reset_protocol_get()` rejects with
+`G_IO_ERROR_NOT_SUPPORTED` while no verified record exists and that no public
+driver device table entry changes.
+
+- [ ] **Step 2: Run the tests and capture the expected red result**
+
+```bash
+python -m unittest -v tests.test_reset_build_policy
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-policy --print-errorlogs
+```
+
+Expected: FAIL because the Meson option and reset-protocol boundary do not
+exist.
+
+- [ ] **Step 3: Add the inert opt-in boundary**
+
+Add Meson boolean option `verimark_dev_reset` with default `false`. Build
+only the protocol-status test module in both modes. Do not compile a helper,
+CLI command, request constant, or raw USB operation at this stage. Change the
+Arch build options to include `-Dverimark_dev_reset=false` explicitly and
+regenerate `.SRCINFO`.
+
+- [ ] **Step 4: Create the immutable protocol record template and evidence rule**
+
+`docs/hardware/reset-protocol-record.md` requires a source revision, reader
+model and firmware, redacted serial hash, authenticated-session prerequisite,
+full request and response lengths, status values, frame digest, independent
+capture provenance, and proof that the observed operation erases both pairing
+and templates. The record contains no frame bytes, credentials, serials, or
+Windows artifacts.
+
+Verification requires two matching captures from a disposable `047d:00f2`
+reader or a vendor-authored protocol specification plus one matching capture.
+Until that requirement is met, leave the status unverified and stop before
+Task 19.
+
+- [ ] **Step 5: Verify the feature remains inert in public builds**
+
+```bash
+python -m unittest -v tests.test_reset_build_policy tests.test_arch_package
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-policy --print-errorlogs
+```
+
+Expected: PASS. The public package and ordinary `verimarkctl` expose no reset
+capability; an unverified protocol cannot reach USB code.
+
+- [ ] **Step 6: Export and commit the gate**
+
+```bash
+git -C .driver-worktrees/libfprint add meson_options.txt libfprint/drivers/verimark
+git -C .driver-worktrees/libfprint commit -m "test: gate VeriMark developer reset on protocol evidence"
+tools/export-libfprint-patches 66591aae03856bcefa7d7b4c0f08ea630f64b623 verimark-factory-beta-driver
+git add patches/libfprint docs/hardware/reset-protocol-record.md tests/test_reset_build_policy.py packaging/arch
+git commit -m "test: enforce developer reset build boundary"
+```
+
+### Task 19: Add a Versioned Non-Secret Reset Journal
+
+**Files:**
+- Create in driver: `libfprint/drivers/verimark/reset-journal.h`
+- Create in driver: `libfprint/drivers/verimark/reset-journal.c`
+- Create in driver: `libfprint/drivers/verimark/tests/test-reset-journal.c`
+- Modify in driver: `libfprint/drivers/verimark/persist-store.[ch]`
+- Modify in driver: `libfprint/drivers/verimark/meson.build`
+- Regenerate: `patches/libfprint/series`
+
+**Interfaces:**
+- Consumes: Tasks 4 and 5's versioned persistence parser, dirfd-pinned store, six-byte biometric serial, and no-replace publication rules.
+- Produces:
+
+```c
+typedef enum {
+  VERIMARK_RESET_PREPARED = 1,
+  VERIMARK_RESET_SUBMITTED = 2,
+  VERIMARK_RESET_CONFIRMED = 3,
+  VERIMARK_RESET_AMBIGUOUS = 4,
+} VerimarkResetJournalState;
+
+typedef struct {
+  guint16 format_version;
+  guint8 serial_hash[32];
+  VerimarkResetJournalState state;
+  guint64 created_unix_seconds;
+  guint64 updated_unix_seconds;
+  guint16 sensor_status;
+  gchar *pending_filename;
+  gchar *ready_filename;
+} VerimarkResetJournal;
+
+gboolean verimark_reset_journal_create (VerimarkPersistStore *store,
+                                        const guint8 serial[6],
+                                        const gchar *pending_filename,
+                                        const gchar *ready_filename,
+                                        VerimarkResetJournal *out,
+                                        GError **error);
+gboolean verimark_reset_journal_transition (VerimarkPersistStore *store,
+                                            VerimarkResetJournal *journal,
+                                            VerimarkResetJournalState next,
+                                            guint16 sensor_status,
+                                            GError **error);
+VerimarkStoreResult verimark_reset_journal_load (VerimarkPersistStore *store,
+                                                 const guint8 serial[6],
+                                                 VerimarkResetJournal *out,
+                                                 GError **error);
+void verimark_reset_journal_clear (VerimarkResetJournal *journal);
+```
+
+Journal filename is `v1-<12-lowercase-hex-serial>.reset`. The serialized body
+has no credential material and accepts only the exact canonical pending and
+ready filenames for that serial.
+
+- [ ] **Step 1: Write failing serialization and transition tests**
+
+Test round trips for each state, serial-hash binding, exact canonical
+filenames, monotonic timestamps, and valid transitions
+`PREPARED -> SUBMITTED -> CONFIRMED` and
+`PREPARED -> SUBMITTED -> AMBIGUOUS`. Reject skipped, backward, duplicate,
+wrong-device, symlink, corrupt, truncated, unsupported-version, and
+no-replace-race journals. Inject failure before and after each file and
+directory `fsync`.
+
+- [ ] **Step 2: Run the new test before implementation**
+
+```bash
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-journal --print-errorlogs
+```
+
+Expected: FAIL because reset journal symbols do not exist.
+
+- [ ] **Step 3: Implement the journal using the existing store discipline**
+
+Derive `serial_hash` with SHA-256 over exactly the raw six serial bytes. Use
+the Task 5 directory descriptor, modes, regular-file checks, temporary-file
+publication, and durability sequence. A state transition creates a new
+versioned record only after the prior journal is loaded and validated; it
+never replaces a different serial or filename binding.
+
+- [ ] **Step 4: Verify normal and sanitizer behavior**
+
+```bash
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-journal --print-errorlogs
+meson test -C .driver-worktrees/libfprint/build-verimark-asan test-reset-journal --print-errorlogs
+```
+
+Expected: PASS with no secret in fixture diagnostics and no sanitizer finding.
+
+- [ ] **Step 5: Export and commit**
+
+```bash
+git -C .driver-worktrees/libfprint add libfprint/drivers/verimark
+git -C .driver-worktrees/libfprint commit -m "feat: journal VeriMark developer resets"
+tools/export-libfprint-patches 66591aae03856bcefa7d7b4c0f08ea630f64b623 verimark-factory-beta-driver
+git add patches/libfprint
+git commit -m "feat: add reset journal patch"
+```
+
+### Task 20: Implement the One-Shot Authenticated Reset Helper
+
+**Files:**
+- Create in driver: `libfprint/drivers/verimark/reset-helper.c`
+- Create in driver: `libfprint/drivers/verimark/reset-helper.h`
+- Create in driver: `libfprint/drivers/verimark/tests/test-reset-helper.c`
+- Modify in driver: `libfprint/drivers/verimark/meson.build`
+- Modify in driver: `libfprint/drivers/verimark/reset-protocol.[ch]`
+- Regenerate: `patches/libfprint/series`
+
+**Interfaces:**
+- Consumes: verified Task 18 protocol record, Task 19 journal, valid ready pairing data, and existing asynchronous authenticated-session transport.
+- Produces:
+
+```c
+typedef enum {
+  VERIMARK_RESET_SUCCESS,
+  VERIMARK_RESET_ALREADY_FRESH,
+  VERIMARK_RESET_REFUSED,
+  VERIMARK_RESET_AMBIGUOUS,
+} VerimarkResetResult;
+
+typedef struct {
+  const gchar *sysfs_device_path;
+  int state_dirfd;
+  const gchar *journal_filename;
+} VerimarkResetHelperRequest;
+
+gboolean verimark_reset_helper_run (const VerimarkResetHelperRequest *request,
+                                   VerimarkResetResult *result,
+                                   GError **error);
+```
+
+- [ ] **Step 1: Enforce the evidence precondition**
+
+Before creating reset request bytes, require the signed-off Task 18 protocol
+record and two matching disposable-reader captures. If the record is absent,
+incomplete, or inconsistent, record `G_IO_ERROR_NOT_SUPPORTED`; do not create
+this helper binary or progress to later steps.
+
+- [ ] **Step 2: Write fake-transport helper tests**
+
+Cover supported single device success, already-fresh response, non-success
+status, malformed response, timeout, cancellation, disconnect, duplicate
+completion, invalid journal, mismatched serial hash, missing credential,
+multiple devices, non-root execution, noninteractive terminal, claimed
+interface, and syscall path replacement. Assert exactly one submission at
+most, no enrollment/pairing invocation, and state transitions matching the
+design.
+
+- [ ] **Step 3: Run focused tests and confirm the absent helper**
+
+```bash
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-helper --print-errorlogs
+```
+
+Expected: FAIL because the reset helper is not yet built after the verified
+protocol prerequisite has been met.
+
+- [ ] **Step 4: Implement the bounded helper**
+
+Build the helper only when `verimark_dev_reset=true`. It accepts exactly the
+pinned sysfs path, inherited directory descriptor, and journal filename; it
+reopens and validates each identity after CLI preflight. Establish TLS with a
+validated ready credential, persist `SUBMITTED`, send the single verified
+request, parse the complete response, and persist `CONFIRMED` or
+`AMBIGUOUS`. A definite refusal retains the credential and leaves a terminal
+journal; no path retries or generates pairing data.
+
+- [ ] **Step 5: Verify helper isolation and recovery**
+
+```bash
+meson test -C .driver-worktrees/libfprint/build-verimark-tests test-reset-helper --print-errorlogs
+meson test -C .driver-worktrees/libfprint/build-verimark-asan test-reset-helper --print-errorlogs
+```
+
+Expected: PASS. Every post-submission loss of certainty yields `AMBIGUOUS` and
+retains the old credential.
+
+- [ ] **Step 6: Export and commit**
+
+```bash
+git -C .driver-worktrees/libfprint add libfprint/drivers/verimark
+git -C .driver-worktrees/libfprint commit -m "feat: add gated VeriMark reset helper"
+tools/export-libfprint-patches 66591aae03856bcefa7d7b4c0f08ea630f64b623 verimark-factory-beta-driver
+git add patches/libfprint
+git commit -m "feat: add developer reset helper patch"
+```
+
+### Task 21: Add the Confirmed Developer `verimarkctl factory-reset` Command
+
+**Files:**
+- Modify: `tools/verimarkctl`
+- Modify: `verimark_support/cli.py`
+- Create: `verimark_support/reset.py`
+- Modify: `verimark_support/probe.py`
+- Modify: `verimark_support/report.py`
+- Modify: `tests/test_cli.py`
+- Create: `tests/test_reset_cli.py`
+- Modify: `packaging/arch/PKGBUILD`
+
+**Interfaces:**
+- Consumes: Task 20 developer helper, journal states, a sysfs device observation, and root-only terminal interaction.
+- Produces:
+
+```python
+@dataclass(frozen=True)
+class ResetTarget:
+    sysfs_path: Path
+    serial_hash: str
+    pending_filename: str | None
+    ready_filename: str | None
+
+```
+
+The module exports the exact callable signatures
+`preflight_reset(probe: SystemProbe) -> ResetTarget`,
+`confirm_reset(target: ResetTarget, stdin: TextIO, stderr: TextIO) -> None`,
+and `run_reset(target: ResetTarget, helper: Path) -> int`.
+
+`factory-reset` is registered only when an adjacent build manifest contains
+`verimark_dev_reset=true` and the exact matching helper exists with trusted
+ownership and mode.
+
+- [ ] **Step 1: Write normal-build absence and developer-build confirmation tests**
+
+Test that normal CLI help omits `factory-reset` and invoking it exits 2. In a
+synthetic developer build, test refusal for non-root, no TTY, piped stdin,
+wrong USB ID, zero/two supported devices, busy fprintd, absent credential,
+corrupt journal, and helper mismatch. Test that success requires the displayed
+serial-hash suffix followed by exact `ERASE WINDOWS PAIRING`; `--yes`,
+`--force`, and response files are rejected.
+
+- [ ] **Step 2: Run the focused test and capture RED**
+
+```bash
+python -m unittest -v tests.test_reset_cli
+```
+
+Expected: FAIL because no developer reset command exists.
+
+- [ ] **Step 3: Implement preflight and confirmations without USB access**
+
+Use only read-only sysfs, D-Bus/service checks, and state metadata in Python.
+Create the `PREPARED` journal only after both confirmations. Invoke the helper
+with a fixed argument vector and inherited directory descriptor. The CLI never
+opens USB, writes pairing data, deletes files, or chooses an arbitrary helper
+path.
+
+- [ ] **Step 4: Implement post-helper cleanup rules**
+
+For `SUCCESS` or a journal-confirmed factory-fresh state, remove only the
+canonical state files named by the journal, `fsync` the directory, then remove
+the confirmed journal and `fsync` again. For `REFUSED` retain credential and
+journal. For `AMBIGUOUS`, print redacted recovery guidance and perform no
+automatic retry or cleanup.
+
+- [ ] **Step 5: Verify command surface and redaction**
+
+```bash
+python -m unittest -v tests.test_cli tests.test_reset_cli tests.test_report
+tools/verimarkctl --help
+```
+
+Expected: all normal-build tests PASS and help still lists only `status`,
+`doctor`, and `report`.
+
+- [ ] **Step 6: Commit the developer command without packaging it**
+
+```bash
+git add tools/verimarkctl verimark_support tests/test_cli.py tests/test_reset_cli.py packaging/arch/PKGBUILD
+git commit -m "feat: gate VeriMark developer factory reset"
+```
+
+### Task 22: Validate Reset on Disposable Hardware and Protect Public Builds
+
+**Files:**
+- Create: `docs/hardware/developer-reset-acceptance.md`
+- Modify: `tests/test_arch_package.py`
+- Modify: `tests/test_package_hooks.py`
+- Modify: `tests/test_hardware_reports.py`
+- Modify: `docs/release/beta-known-limitations.md`
+
+**Interfaces:**
+- Consumes: verified protocol evidence, developer helper/CLI, disposable `047d:00f2` unit, and the normal package build.
+- Produces: redacted developer reset acceptance evidence and public-package proof that reset is absent.
+
+- [ ] **Step 1: Write package and hardware-report tests**
+
+Require the release package to contain explicit
+`-Dverimark_dev_reset=false`, no reset helper, no reset command, no reset
+binary markers, and no reset documentation that tells ordinary users to run
+it. Require the acceptance report to identify a disposable unit by serial hash
+only and record pre-reset enrollment, one reset submission, pairing/template
+absence, limited local cleanup, re-pair/re-enroll, lifecycle verification, and
+the protected-reader exclusions.
+
+- [ ] **Step 2: Run tests before hardware work**
+
+```bash
+python -m unittest -v tests.test_arch_package tests.test_package_hooks tests.test_hardware_reports
+```
+
+Expected: FAIL until explicit public-build reset exclusions and report schema
+are implemented.
+
+- [ ] **Step 3: Verify normal package absence**
+
+Build the package with its explicit false Meson flag. Inspect file manifest,
+strings, CLI help, installed Python modules, and generated driver metadata.
+Any reset helper, command, opcode, confirmation string, or enabled option
+blocks release.
+
+- [ ] **Step 4: Run one disposable-device acceptance cycle**
+
+With `-Dverimark_dev_reset=true`, pair and enroll test-only prints on a
+disposable reader. Verify across fprintd restart, USB reconnect, and reboot.
+Stop fprintd, invoke the two-confirmation reset once without interruption,
+then prove templates/pairing are absent and old credentials cannot authenticate.
+Confirm cleanup touched only the target serial's files. Re-pair/re-enroll
+through normal fprintd and repeat lifecycle verification.
+
+- [ ] **Step 5: Record evidence and enforce the release boundary**
+
+```bash
+python -m unittest -v tests.test_arch_package tests.test_package_hooks tests.test_hardware_reports
+git add docs/hardware/developer-reset-acceptance.md docs/release/beta-known-limitations.md tests/test_arch_package.py tests/test_package_hooks.py tests/test_hardware_reports.py
+git commit -m "test: validate gated VeriMark developer reset"
+```
+
+Expected: all tests PASS, public package has no reset capability, and the
+report proves that neither the Windows-paired reference reader nor the
+factory-fresh beta acceptance reader was reset.
+
 ## Final Completion Criteria
 
-The beta implementation is complete when G1–G5 pass, every automated suite is green, the two hardware reports satisfy their schemas, the package is reproducible from the public tag, and a clean Arch user can enroll a factory-fresh `047d:00f2` through normal fprintd without Windows files or special pairing tooling. Mainstream upstream work is ready when Task 17 also produces independently sourced evidence and a maintainer-aligned Desktop-only series. Any failure of same-identity recovery, already-paired refusal, secret containment, reference-reader compatibility, or rollback reopens the corresponding task and blocks the beta.
+The beta implementation is complete when G1–G5 pass, every automated suite is green, the two hardware reports satisfy their schemas, the package is reproducible from the public tag, and a clean Arch user can enroll a factory-fresh `047d:00f2` through normal fprintd without Windows files or special pairing tooling. Mainstream upstream work is ready when Task 17 also produces independently sourced evidence and a maintainer-aligned Desktop-only series. Developer reset is complete only when Tasks 18–22 pass; it remains absent from the public package. Any failure of same-identity recovery, already-paired refusal, secret containment, reference-reader compatibility, reset ambiguity, or rollback reopens the corresponding task and blocks the relevant release.

@@ -45,9 +45,12 @@ The default is `false`. With the default:
 - reset opcodes and confirmation strings are absent from binaries; and
 - package policy tests reject any reset helper or reset-enabled configuration.
 
-With `-Dverimark_dev_reset=true`, the build produces an uninstalled native
-helper and enables the developer `verimarkctl factory-reset` command in the
-matching source-tree invocation. The Arch/AUR PKGBUILD always passes
+With `-Dverimark_dev_reset=true` and a verified reset protocol record, the
+build produces an uninstalled native helper and enables the developer
+`verimarkctl factory-reset` command in the matching source-tree invocation.
+Before the protocol record is verified, the opt-in build contains only the
+test boundary that reports reset as unsupported; it has no helper and no CLI
+subcommand. The Arch/AUR PKGBUILD always passes
 `-Dverimark_dev_reset=false` explicitly.
 
 The feature cannot be enabled through an environment variable, marker file,
