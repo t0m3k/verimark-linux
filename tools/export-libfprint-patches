@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly EXPECTED_BASE_COMMIT="66591aae03856bcefa7d7b4c0f08ea630f64b623"
+readonly REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly DRIVER_WORKTREE="${REPOSITORY_ROOT}/.driver-worktrees/libfprint"
+readonly PATCH_PARENT="${REPOSITORY_ROOT}/patches"
+readonly PATCH_DIRECTORY="${PATCH_PARENT}/libfprint"
+
+temporary_directory=""
+previous_directory=""
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "${temporary_directory}" && -d "${temporary_directory}" ]]; then
+    rm -rf "${temporary_directory}"
+  fi
+  if [[ -n "${previous_directory}" && -d "${previous_directory}" ]]; then
+    if [[ ! -e "${PATCH_DIRECTORY}" ]]; then
+      mv "${previous_directory}" "${PATCH_DIRECTORY}"
+    else
+      rm -rf "${previous_directory}"
+    fi
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+
+fail() {
+  printf '%s\n' "error: $*" >&2
+  exit 1
+}
+
+if [[ $# -ne 2 ]]; then
+  fail "usage: $0 BASE_COMMIT DRIVER_REF"
+fi
+
+base_argument=$1
+driver_ref=$2
+
+[[ -d "${DRIVER_WORKTREE}/.git" || -f "${DRIVER_WORKTREE}/.git" ]] || \
+  fail "missing driver checkout: ${DRIVER_WORKTREE}"
+
+resolved_base=$(git -C "${DRIVER_WORKTREE}" rev-parse --verify "${base_argument}^{commit}") || \
+  fail "could not resolve base commit: ${base_argument}"
+[[ "${resolved_base}" == "${EXPECTED_BASE_COMMIT}" ]] || \
+  fail "base commit must resolve to ${EXPECTED_BASE_COMMIT}"
+
+resolved_ref=$(git -C "${DRIVER_WORKTREE}" rev-parse --verify "${driver_ref}^{commit}") || \
+  fail "could not resolve driver ref: ${driver_ref}"
+
+if [[ -n $(git -C "${DRIVER_WORKTREE}" status --porcelain --untracked-files=all) ]]; then
+  fail "driver checkout is dirty"
+fi
+
+git -C "${DRIVER_WORKTREE}" merge-base --is-ancestor "${resolved_base}" "${resolved_ref}" || \
+  fail "driver ref is not based on ${EXPECTED_BASE_COMMIT}"
+
+if [[ -n $(git -C "${DRIVER_WORKTREE}" rev-list --merges "${resolved_base}..${resolved_ref}") ]]; then
+  fail "driver range contains merge commits"
+fi
+
+mkdir -p "${PATCH_PARENT}"
+temporary_directory=$(mktemp -d "${PATCH_PARENT}/.libfprint-patches.XXXXXX")
+mkdir "${temporary_directory}/raw"
+
+git -C "${DRIVER_WORKTREE}" format-patch \
+  --zero-commit \
+  --no-signature \
+  --numbered-files \
+  --output-directory "${temporary_directory}/raw" \
+  "${resolved_base}..${resolved_ref}"
+
+mapfile -t raw_patches < <(find "${temporary_directory}/raw" -maxdepth 1 -type f -printf '%f\n' | sort -V)
+[[ ${#raw_patches[@]} -gt 0 ]] || fail "driver range contains no commits"
+
+for index in "${!raw_patches[@]}"; do
+  raw_patch="${temporary_directory}/raw/${raw_patches[index]}"
+  subject=$(sed -n 's/^Subject: //p' "${raw_patch}" | head -n 1 | \
+    sed -E 's/^\[PATCH[^]]*\][[:space:]]*//')
+  slug=$(printf '%s' "${subject}" | tr '[:upper:]' '[:lower:]' | \
+    sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  [[ -n "${slug}" ]] || fail "could not derive patch filename from subject"
+  printf -v patch_name '%04d-%s.patch' "$((index + 1))" "${slug}"
+  mv "${raw_patch}" "${temporary_directory}/${patch_name}"
+  printf '%s\n' "${patch_name}" >> "${temporary_directory}/series"
+done
+rmdir "${temporary_directory}/raw"
+
+if [[ -e "${PATCH_DIRECTORY}" ]]; then
+  previous_directory=$(mktemp -d "${PATCH_PARENT}/.libfprint-previous.XXXXXX")
+  rmdir "${previous_directory}"
+  mv "${PATCH_DIRECTORY}" "${previous_directory}"
+fi
+mv "${temporary_directory}" "${PATCH_DIRECTORY}"
+temporary_directory=""
+
+if [[ -n "${previous_directory}" ]]; then
+  rm -rf "${previous_directory}"
+  previous_directory=""
+fi

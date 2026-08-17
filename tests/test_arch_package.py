@@ -17,6 +17,8 @@ PACKAGE_DIRECTORY = REPOSITORY / "packaging" / "arch"
 PACKAGE_BUILD = PACKAGE_DIRECTORY / "PKGBUILD"
 PACKAGE_SOURCE_INFO = PACKAGE_DIRECTORY / ".SRCINFO"
 GENERATED_DATA_PATCH = PACKAGE_DIRECTORY / "fix-generated-data-checks.patch"
+PATCH_SERIES_DIRECTORY = REPOSITORY / "patches" / "libfprint"
+PATCH_SERIES = PATCH_SERIES_DIRECTORY / "series"
 SOURCE_CACHE = PACKAGE_DIRECTORY / "libfprint"
 PACKAGE_METADATA = {".BUILDINFO", ".MTREE", ".PKGINFO"}
 EXPECTED_DIRECTORIES = {
@@ -324,11 +326,16 @@ class GeneratedMetadataTests(unittest.TestCase):
         self.assertEqual(repeated["pkgver"], self.info["pkgver"])
 
     def test_generated_metadata_pins_local_check_fix(self):
-        patch_source = "fix-generated-data-checks.patch"
+        patch_sources = ["series", *PATCH_SERIES.read_text().splitlines()]
 
-        self.assertIn(patch_source, self.info["source"])
-        patch_index = self.info["source"].index(patch_source)
-        self.assertRegex(self.info["b2sums"][patch_index], r"^[0-9a-f]{128}$")
+        for patch_source in patch_sources:
+            with self.subTest(patch_source=patch_source):
+                source = f"{patch_source}::../../patches/libfprint/{patch_source}"
+                self.assertIn(source, self.info["source"])
+                patch_index = self.info["source"].index(source)
+                self.assertRegex(
+                    self.info["b2sums"][patch_index], r"^[0-9a-f]{128}$"
+                )
 
     def test_package_plan_produces_one_replacement_archive(self):
         package_paths = run_checked(self, "makepkg", "--packagelist").splitlines()
@@ -345,19 +352,35 @@ class PackageSourceBoundaryTests(unittest.TestCase):
     def test_generated_data_patch_supports_only_the_desktop_verimark_device(self):
         patch = GENERATED_DATA_PATCH.read_text()
 
+        self.assert_desktop_only_generated_data_patch(patch)
+
+    def test_active_patch_series_supports_only_the_desktop_verimark_device(self):
+        patches = [
+            (PATCH_SERIES_DIRECTORY / name).read_text()
+            for name in PATCH_SERIES.read_text().splitlines()
+        ]
+
+        self.assert_desktop_only_generated_data_patch("\n".join(patches))
+
+    def assert_desktop_only_generated_data_patch(self, patch):
         self.assertIn("+usb:v047Dp00F2*", patch)
         self.assertIn("-usb:v047Dp00F2*", patch)
         self.assertIn("-  { .vid = 0x047d, .pid = 0x00f2 },", patch)
-        self.assertNotIn("8054", patch)
+        self.assertNotIn("+usb:v047Dp8054*", patch)
+        self.assertNotIn("-usb:v047Dp8054*", patch)
+        self.assertNotIn("+  { .vid = 0x047d, .pid = 0x8054 },", patch)
+        self.assertNotIn("-  { .vid = 0x047d, .pid = 0x8054 },", patch)
 
     def test_package_metadata_has_no_maintainer_contact_and_matches_patch_digest(self):
         package_build = PACKAGE_BUILD.read_text()
         source_info = PACKAGE_SOURCE_INFO.read_text()
-        patch_digest = hashlib.blake2b(GENERATED_DATA_PATCH.read_bytes()).hexdigest()
 
         self.assertNotIn("Maintainer:", package_build)
-        self.assertIn(patch_digest, package_build)
-        self.assertIn("b2sums = " + patch_digest, source_info)
+        for patch_path in (PATCH_SERIES, *sorted(PATCH_SERIES_DIRECTORY.glob("*.patch"))):
+            with self.subTest(patch_path=patch_path):
+                patch_digest = hashlib.blake2b(patch_path.read_bytes()).hexdigest()
+                self.assertIn(patch_digest, package_build)
+                self.assertIn("b2sums = " + patch_digest, source_info)
 
 
 @unittest.skipUnless(SOURCE_CACHE.is_dir(), "run makepkg --verifysource first")

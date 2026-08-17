@@ -31,8 +31,10 @@ pkgbase = libfprint-verimark
 	conflicts = libfprint
 	options = !debug
 	source = libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=66591aae03856bcefa7d7b4c0f08ea630f64b623
-	source = fix-generated-data-checks.patch
+	source = series::../../patches/libfprint/series
+	source = 0001-build-make-generated-data-checks-deterministic.patch::../../patches/libfprint/0001-build-make-generated-data-checks-deterministic.patch
 	b2sums = SKIP
-	b2sums = db41b94eb90e369e89eb172312ecb1ab8f23943cfc0841a8023ee7960f386ca851304d42f652bce83923c241ff65ea199eab4f274187af7cfa1f96543cd3dfd1
+	b2sums = e2ce873c8b4790b6064ab6aeeee8a3610cfa674f0f24da0a32eeaecc4d1d56892d64d2538ff06a253624189322f783296bce287d822aab4ea257e53d967c6c0b
+	b2sums = 50836dfff9c20118963b1d565f63ebf2b297bc775fb903be14fe851427ea9d091c87f3b4b7938fe7419876dd1eab5058e5836792bd3f3631720f30adfd97ea72
 
 pkgname = libfprint-verimark

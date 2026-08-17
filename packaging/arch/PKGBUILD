@@ -38,11 +38,13 @@ groups=(fprint)
 _commit=66591aae03856bcefa7d7b4c0f08ea630f64b623
 source=(
   "libfprint::git+https://gitlab.freedesktop.org/s-celles/libfprint.git#commit=$_commit"
-  fix-generated-data-checks.patch
+  "series::../../patches/libfprint/series"
+  "0001-build-make-generated-data-checks-deterministic.patch::../../patches/libfprint/0001-build-make-generated-data-checks-deterministic.patch"
 )
 b2sums=(
   SKIP
-  db41b94eb90e369e89eb172312ecb1ab8f23943cfc0841a8023ee7960f386ca851304d42f652bce83923c241ff65ea199eab4f274187af7cfa1f96543cd3dfd1
+  e2ce873c8b4790b6064ab6aeeee8a3610cfa674f0f24da0a32eeaecc4d1d56892d64d2538ff06a253624189322f783296bce287d822aab4ea257e53d967c6c0b
+  50836dfff9c20118963b1d565f63ebf2b297bc775fb903be14fe851427ea9d091c87f3b4b7938fe7419876dd1eab5058e5836792bd3f3631720f30adfd97ea72
 )
 
 prepare() {
@@ -51,7 +53,13 @@ prepare() {
     error "resolved source does not match pinned commit $_commit"
     return 1
   fi
-  patch -Np1 -i "$srcdir/fix-generated-data-checks.patch"
+  while IFS= read -r patch_name; do
+    if [[ ! $patch_name =~ ^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$ ]]; then
+      error "invalid libfprint patch-series entry: $patch_name"
+      return 1
+    fi
+    git apply --index "${srcdir}/${patch_name}"
+  done < "${srcdir}/series"
 }
 
 build() {
