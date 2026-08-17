@@ -1,5 +1,3 @@
-# Maintainer: Tomasz Tracz <t@t90.dev>
-
 pkgname=libfprint-verimark
 pkgver=1.94.10.r1.g66591aa
 pkgrel=1
@@ -44,7 +42,7 @@ source=(
 )
 b2sums=(
   SKIP
-  a00743a99d8f1d1a9b7b61d6a84d002e1aa56fa9ed74224c277f23161005088a5206c8691e337c6044414e31df04f2e4ec6ae78bb1111e0e0543c921b9b714ad
+  db41b94eb90e369e89eb172312ecb1ab8f23943cfc0841a8023ee7960f386ca851304d42f652bce83923c241ff65ea199eab4f274187af7cfa1f96543cd3dfd1
 )
 
 prepare() {

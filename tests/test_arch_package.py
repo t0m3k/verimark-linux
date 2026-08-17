@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -13,6 +14,9 @@ from verimark_support.credential import CredentialError, validate_blob
 PIN = "66591aae03856bcefa7d7b4c0f08ea630f64b623"
 REPOSITORY = Path(__file__).resolve().parents[1]
 PACKAGE_DIRECTORY = REPOSITORY / "packaging" / "arch"
+PACKAGE_BUILD = PACKAGE_DIRECTORY / "PKGBUILD"
+PACKAGE_SOURCE_INFO = PACKAGE_DIRECTORY / ".SRCINFO"
+GENERATED_DATA_PATCH = PACKAGE_DIRECTORY / "fix-generated-data-checks.patch"
 SOURCE_CACHE = PACKAGE_DIRECTORY / "libfprint"
 PACKAGE_METADATA = {".BUILDINFO", ".MTREE", ".PKGINFO"}
 EXPECTED_DIRECTORIES = {
@@ -335,6 +339,25 @@ class GeneratedMetadataTests(unittest.TestCase):
                 "libfprint-verimark-1.94.10.r1.g66591aa-1-x86_64.pkg.tar."
             )
         )
+
+
+class PackageSourceBoundaryTests(unittest.TestCase):
+    def test_generated_data_patch_supports_only_the_desktop_verimark_device(self):
+        patch = GENERATED_DATA_PATCH.read_text()
+
+        self.assertIn("+usb:v047Dp00F2*", patch)
+        self.assertIn("-usb:v047Dp00F2*", patch)
+        self.assertIn("-  { .vid = 0x047d, .pid = 0x00f2 },", patch)
+        self.assertNotIn("8054", patch)
+
+    def test_package_metadata_has_no_maintainer_contact_and_matches_patch_digest(self):
+        package_build = PACKAGE_BUILD.read_text()
+        source_info = PACKAGE_SOURCE_INFO.read_text()
+        patch_digest = hashlib.blake2b(GENERATED_DATA_PATCH.read_bytes()).hexdigest()
+
+        self.assertNotIn("Maintainer:", package_build)
+        self.assertIn(patch_digest, package_build)
+        self.assertIn("b2sums = " + patch_digest, source_info)
 
 
 @unittest.skipUnless(SOURCE_CACHE.is_dir(), "run makepkg --verifysource first")
