@@ -197,7 +197,7 @@ class PatchSeriesTests(unittest.TestCase):
 
         self.assertEqual(
             authors,
-            [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 6,
+            [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 7,
         )
 
     def test_active_patches_exclude_prohibited_provenance_residue(self):
@@ -239,7 +239,7 @@ class PatchSeriesTests(unittest.TestCase):
         patch_text = "\n".join((CURRENT / name).read_text() for name in read_series())
 
         self.assertIn("O_NOFOLLOW", patch_text)
-        self.assertIn("st_mode & 0777", patch_text)
+        self.assertIn("st_mode & 07777", patch_text)
         self.assertIn("reserved != 0", patch_text)
         self.assertIn("got_tag1", patch_text)
         self.assertIn("off == blob_len", patch_text)
@@ -263,7 +263,7 @@ class PatchSeriesTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(
                 authors,
-                [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 6,
+                [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 7,
             )
 
     def test_materialized_driver_has_only_implemented_features_for_desktop_id(self):

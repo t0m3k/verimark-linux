@@ -1,0 +1,454 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 08:44:04 +0100
+Subject: [PATCH 25/33] fix: harden Desktop factory pairing
+
+---
+ data/autosuspend.hwdb                 |   6 +-
+ libfprint/drivers/verimark/pairing.c  |  41 ++++++-
+ libfprint/drivers/verimark/verimark.c | 165 +++++++++++++++++++-------
+ libfprint/meson.build                 |  20 ++++
+ meson.build                           |   1 +
+ 5 files changed, 181 insertions(+), 52 deletions(-)
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 5482fc9..dc50c0d 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -352,6 +352,11 @@ usb:v061Ap0110*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver verimark
++usb:v047Dp00F2*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver vfs0050
+ usb:v138Ap0050*
+  ID_AUTOSUSPEND=1
+@@ -386,7 +391,6 @@ usb:v138Ap0091*
+ usb:v006Bp00DA*
+ usb:v0413p2766*
+ usb:v045Ep0815*
+-usb:v047Dp00F2*
+ usb:v047Dp8054*
+ usb:v047Dp8055*
+ usb:v04E8p730B*
+diff --git a/libfprint/drivers/verimark/pairing.c b/libfprint/drivers/verimark/pairing.c
+index e465272..70b23ac 100644
+--- a/libfprint/drivers/verimark/pairing.c
++++ b/libfprint/drivers/verimark/pairing.c
+@@ -10,7 +10,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <fcntl.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ 
+ /* TLV record header : 6 octets [tag:u16 LE][len:u16 LE][2 reserved]. */
+@@ -47,10 +49,14 @@ bool verimark_pairing_parse_blob(const uint8_t *blob, size_t blob_len,
+     bool got_tag1 = false, got_tag2 = false, got_tag3 = false;
+ 
+     size_t off = 0;
+-    while (off + TLV_HEADER_SIZE <= blob_len) {
++    while (off < blob_len) {
++        if (blob_len - off < TLV_HEADER_SIZE)
++            return false;
+         uint16_t tag = read_le16(blob + off);
+         uint16_t len = read_le16(blob + off + 2);
+-        /* off+2..off+4 = length, off+4..off+6 = 2 reserved/pad octets */
++        uint16_t reserved = read_le16(blob + off + 4);
++        if (reserved != 0)
++            return false;
+ 
+         /* Tag 0 + len 0 = sentinel/end-of-table for some Synaptics dumps. */
+         if (tag == 0 && len == 0) {
+@@ -65,17 +71,20 @@ bool verimark_pairing_parse_blob(const uint8_t *blob, size_t blob_len,
+         switch (tag) {
+             case 1:
+                 if (len != 400) return false;
++                if (got_tag1) return false;
+                 memcpy(out->client_cert, value, 400);
+                 got_tag1 = true;
+                 break;
+             case 2:
+                 if (len != 32) return false;
++                if (got_tag2) return false;
+                 /* sub1 stores priv in little-endian, normalize to BE for crypto. */
+                 reverse_bytes(out->client_priv_be, value, 32);
+                 got_tag2 = true;
+                 break;
+             case 3: {
+                 if (len != 400) return false;
++                if (got_tag3) return false;
+                 /* Server pubkey : X at offset 0x04, Y at offset 0x48, in LE.
+                  * Reconstruct uncompressed `04 || X_BE || Y_BE`. */
+                 out->server_pub_uncompressed[0] = 0x04;
+@@ -94,7 +103,7 @@ bool verimark_pairing_parse_blob(const uint8_t *blob, size_t blob_len,
+         off += TLV_HEADER_SIZE + len;
+     }
+ 
+-    return got_tag1 && got_tag2 && got_tag3;
++    return off == blob_len && got_tag1 && got_tag2 && got_tag3;
+ }
+ 
+ 
+@@ -103,13 +112,30 @@ bool verimark_pairing_load_from_file(const char *path,
+ {
+     if (!path || !out) return false;
+ 
+-    FILE *fp = fopen(path, "rb");
+-    if (!fp) return false;
++    struct stat st;
++    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
++        S_IMODE(st.st_mode) != 0600)
++        return false;
++
++    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++    if (fd < 0) return false;
++    struct stat opened;
++    if (fstat(fd, &opened) != 0 || opened.st_dev != st.st_dev ||
++        opened.st_ino != st.st_ino || !S_ISREG(opened.st_mode) ||
++        S_IMODE(opened.st_mode) != 0600) {
++        close(fd);
++        return false;
++    }
++    FILE *fp = fdopen(fd, "rb");
++    if (!fp) {
++        close(fd);
++        return false;
++    }
+ 
+     /* Get file size. */
+     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return false; }
+     long sz = ftell(fp);
+-    if (sz < 0 || sz > (1L << 20)) {   /* sane upper bound 1 MiB */
++    if (sz <= 0 || sz > (1L << 20)) {   /* sane upper bound 1 MiB */
+         fclose(fp);
+         return false;
+     }
+@@ -128,7 +154,10 @@ bool verimark_pairing_load_from_file(const char *path,
+         return false;
+     }
+ 
++    memset(out, 0, sizeof(*out));
+     bool ok = verimark_pairing_parse_blob(blob, (size_t)sz, out);
++    if (!ok)
++        verimark_pairing_data_zero(out);
+ 
+     /* Wipe the heap copy. */
+     volatile uint8_t *p = (volatile uint8_t *)blob;
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 3bfc339..e9925e1 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -47,8 +47,10 @@
+ #include <gusb.h>
+ #include <gio/gio.h>
+ #include <glib/gstdio.h>   /* g_chmod, g_rename */
++#include <fcntl.h>
+ #include <string.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ 
+ struct _FpiDeviceVerimark {
+@@ -78,6 +80,7 @@ struct _FpiDeviceVerimark {
+     FpiSsm  *task_ssm;
+     gpointer verify_ctx;
+     gpointer enroll_ctx;
++    gboolean pairing_pending;
+ };
+ 
+ G_DEFINE_TYPE(FpiDeviceVerimark, fpi_device_verimark, FP_TYPE_DEVICE)
+@@ -93,6 +96,34 @@ static const FpIdEntry id_table[] = {
+ 
+ /* ---- Internal helpers ---------------------------------------------------- */
+ 
++static gchar *
++verimark_safe_component(const gchar *value)
++{
++    GString *safe = g_string_new(NULL);
++
++    if (value != NULL) {
++        for (const gchar *p = value; *p != '\0'; p++) {
++            if (g_ascii_isalnum(*p) || *p == '.' || *p == '_' || *p == '-')
++                g_string_append_c(safe, *p);
++            else
++                g_string_append_c(safe, '_');
++        }
++    }
++    if (safe->len == 0)
++        g_string_assign(safe, "unknown");
++    return g_string_free(safe, FALSE);
++}
++
++static gchar *
++verimark_usb_fallback_id(GUsbDevice *usb)
++{
++    const gchar *platform_id = g_usb_device_get_platform_id(usb);
++    if (platform_id != NULL && *platform_id != '\0')
++        return verimark_safe_component(platform_id);
++    return g_strdup_printf("usb-%u-%u", g_usb_device_get_bus(usb),
++                           g_usb_device_get_address(usb));
++}
++
+ /**
+  * Send `[opcode]` in cleartext, read the response, parse `[status][payload]`.
+  * Returns TRUE if status == 0x0000, FALSE otherwise. On success, the output
+@@ -211,8 +242,14 @@ static void verimark_probe(FpDevice *device)
+     if (self->dev_info_valid)
+         verimark_format_serial(&self->dev_info, serial);
+ 
++    g_autofree gchar *device_id = NULL;
++    if (self->dev_info_valid)
++        device_id = verimark_safe_component(serial);
++    else
++        device_id = verimark_usb_fallback_id(usb);
++
+     fpi_device_probe_complete(device,
+-                              g_strdup(serial),
++                              g_steal_pointer(&device_id),
+                               g_strdup("Kensington VeriMark DT"),
+                               NULL);
+ }
+@@ -260,8 +297,9 @@ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+         }
+     }
+     if (iserial != NULL && iserial[0] != '\0') {
++        g_autofree gchar *safe_iserial = verimark_safe_component(iserial);
+         gchar *user_p = g_strdup_printf("%s/verimark/sub1-%s.bin",
+-                                         xdg_cfg, iserial);
++                                         xdg_cfg, safe_iserial);
+         if (g_file_test(user_p, G_FILE_TEST_EXISTS)) return user_p;
+         g_free(user_p);
+     }
+@@ -280,30 +318,13 @@ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+  * crypto, transport, sensor refusal) — caller falls back to cleartext
+  * mode without a fatal error.
+  *
+- * GUARDED by either :
+- *   - environment variable VERIMARK_ALLOW_BOOTSTRAP=1
+- *   - marker file        /var/lib/fprint/verimark/.allow_bootstrap
+- *
+- * Bootstrap is DESTRUCTIVE (rewrites the sensor's pairing slot) so we
+- * require explicit opt-in. Once a sub1 exists the marker can be
+- * deleted ; the file is not read again.
++ * This function is called only from the explicit fprintd enroll action.
++ * Opening a device must remain non-mutating.
+  */
+ static gchar *
+-verimark_try_bootstrap(FpiDeviceVerimark *self)
++verimark_enroll_bootstrap(FpiDeviceVerimark *self)
+ {
+-    const gchar *env = g_getenv("VERIMARK_ALLOW_BOOTSTRAP");
+-    gboolean env_ok  = (env && g_strcmp0(env, "1") == 0);
+-    gboolean file_ok = g_file_test("/var/lib/fprint/verimark/.allow_bootstrap",
+-                                    G_FILE_TEST_EXISTS);
+-    if (!env_ok && !file_ok) {
+-        fp_dbg("verimark: bootstrap skipped — set "
+-                "VERIMARK_ALLOW_BOOTSTRAP=1 or create "
+-                "/var/lib/fprint/verimark/.allow_bootstrap to opt in");
+-        return NULL;
+-    }
+-
+-    fp_info("verimark: bootstrap ENABLED — running 0x93 DoPairBasic "
+-            "(DESTRUCTIVE)");
++    fp_info("verimark: enroll pairing started (DESTRUCTIVE)");
+ 
+     uint8_t sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE];
+     uint16_t status = 0xffff;
+@@ -320,37 +341,51 @@ verimark_try_bootstrap(FpiDeviceVerimark *self)
+         return NULL;
+     }
+ 
+-    /* Atomic write : tmp + rename. */
++    /* Create the private directory and publish the credential without
++     * following symlinks or replacing an existing pairing. */
+     const gchar *system_dir = "/var/lib/fprint/verimark";
+     if (g_mkdir_with_parents(system_dir, 0700) != 0) {
+         fp_warn("verimark: bootstrap mkdir(%s) failed", system_dir);
+         memset(sub1, 0, sizeof(sub1));
+         return NULL;
+     }
+-    g_autofree gchar *tmp_path  = g_strdup_printf("%s/sub1.bin.tmp", system_dir);
++    g_chmod(system_dir, 0700);
++    g_autofree gchar *tmp_path = g_strdup_printf("%s/.sub1.%u.tmp",
++                                                   system_dir, getpid());
+     g_autofree gchar *final_path = g_strdup_printf("%s/sub1.bin", system_dir);
+-
+-    GError *werr = NULL;
+-    if (!g_file_set_contents(tmp_path, (const gchar *)sub1,
+-                              VERIMARK_BOOTSTRAP_SUB1_SIZE, &werr)) {
+-        fp_warn("verimark: bootstrap write %s failed: %s", tmp_path,
+-                werr ? werr->message : "?");
+-        if (werr) g_error_free(werr);
++    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
++    if (fd < 0) {
++        fp_warn("verimark: bootstrap temporary file creation failed");
+         memset(sub1, 0, sizeof(sub1));
+         return NULL;
+     }
+-    g_chmod(tmp_path, 0600);
+-    if (g_rename(tmp_path, final_path) != 0) {
+-        fp_warn("verimark: bootstrap rename(%s → %s) failed",
+-                tmp_path, final_path);
++    ssize_t written = 0;
++    while (written < VERIMARK_BOOTSTRAP_SUB1_SIZE) {
++        ssize_t n = write(fd, sub1 + written,
++                          VERIMARK_BOOTSTRAP_SUB1_SIZE - written);
++        if (n <= 0) {
++            close(fd);
++            unlink(tmp_path);
++            fp_warn("verimark: bootstrap write failed");
++            memset(sub1, 0, sizeof(sub1));
++            return NULL;
++        }
++        written += n;
++    }
++    gboolean synced = fsync(fd) == 0;
++    gboolean closed = close(fd) == 0;
++    gboolean published = synced && closed && link(tmp_path, final_path) == 0;
++    if (!published) {
++        if (!closed)
++            close(fd);
++        unlink(tmp_path);
++        fp_warn("verimark: bootstrap credential publication failed");
+         memset(sub1, 0, sizeof(sub1));
+         return NULL;
+     }
++    unlink(tmp_path);
+ 
+-    fp_info("verimark: bootstrap SUCCEEDED — sub1 written to %s "
+-            "(1284 B). You can now `rm "
+-            "/var/lib/fprint/verimark/.allow_bootstrap` to lock pairing.",
+-            final_path);
++    fp_info("verimark: enroll pairing succeeded (1284 B)");
+     memset(sub1, 0, sizeof(sub1));
+     return g_strdup(final_path);
+ }
+@@ -397,12 +432,10 @@ static void verimark_open(FpDevice *device)
+      * succeeds so probe-level introspection keeps working. */
+     g_autofree gchar *sub1_path = find_sub1_path(self);
+     if (!sub1_path) {
+-        /* Factory-fresh sensor — try bootstrap (gated by env / marker). */
+-        sub1_path = verimark_try_bootstrap(self);
+-    }
+-    if (!sub1_path) {
++        /* Factory-fresh pairing is initiated only by an explicit enroll. */
++        self->pairing_pending = TRUE;
+         fp_warn("verimark: no sub1 found in /var/lib/fprint/verimark/ ; "
+-                "device opens in cleartext-only mode (no TLS session)");
++                "enroll is required to pair this factory-fresh device");
+         fpi_device_open_complete(device, NULL);
+         return;
+     }
+@@ -2405,6 +2438,48 @@ verimark_run_enroll_ssm(FpDevice *device)
+ static void verimark_enroll(FpDevice *device)
+ {
+     G_DEBUG_HERE();
++
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    if (self->pairing_pending) {
++        g_autofree gchar *sub1_path = verimark_enroll_bootstrap(self);
++        if (sub1_path == NULL) {
++            fpi_device_enroll_complete(
++                device, NULL,
++                g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "enroll pairing failed"));
++            return;
++        }
++
++        VerimarkPairingData pairing;
++        if (!verimark_pairing_load_from_file(sub1_path, &pairing)) {
++            fpi_device_enroll_complete(
++                device, NULL,
++                g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "enroll pairing credential could not be loaded"));
++            return;
++        }
++
++        VerimarkTransportIoCtx io_ctx = {
++            .h = self->transport,
++            .timeout_ms = 3000,
++        };
++        VerimarkTransportIO io;
++        verimark_transport_io_bind(&io, &io_ctx);
++        VerimarkHandshakeResult hr = verimark_handshake_perform(
++            &io, &pairing, NULL, &self->session);
++        verimark_pairing_data_zero(&pairing);
++        if (hr != VERIMARK_HANDSHAKE_OK) {
++            verimark_session_zero(&self->session);
++            fpi_device_enroll_complete(
++                device, NULL,
++                g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll pairing handshake failed"));
++            return;
++        }
++        self->session_active = TRUE;
++        self->pairing_pending = FALSE;
++    }
++
+     /* Phase 10.3.e : delegate to the shared async enroll SSM. */
+     verimark_run_enroll_ssm(device);
+ }
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..67406f1 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -139,6 +139,21 @@ driver_sources = {
+     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
+     'mafpmoc' : files('drivers/mafpmoc/mafpmoc.c'),
+     'secugen' : files('drivers/secugen.c'),
++    'verimark' : files(
++        'drivers/verimark/verimark.c',
++        'drivers/verimark/proto.c',
++        'drivers/verimark/transport.c',
++        'drivers/verimark/crypto.c',
++        'drivers/verimark/tls.c',
++        'drivers/verimark/pairing.c',
++        'drivers/verimark/session.c',
++        'drivers/verimark/handshake.c',
++        'drivers/verimark/storage.c',
++        'drivers/verimark/capture.c',
++        'drivers/verimark/match.c',
++        'drivers/verimark/enroll.c',
++        'drivers/verimark/bootstrap.c',
++    ),
+ }
+ 
+ helper_sources = {
+@@ -149,6 +164,7 @@ helper_sources = {
+     'pixman': files(),
+     'udev': files(),
+     'virtual': files('drivers/virtual-device-listener.c'),
++    'tudor_crypto': files(),
+ }
+ 
+ drivers_sources = []
+@@ -160,6 +176,10 @@ foreach helper : driver_helpers
+     drivers_sources += helper_sources[helper]
+ endforeach
+ 
++if 'verimark' in drivers
++    drivers_cflags += [ '-DVERIMARK_HAVE_LIBGUSB=1' ]
++endif
++
+ 
+ fp_enums = gnome.mkenums_simple('fp-enums',
+     sources: libfprint_public_headers,
+diff --git a/meson.build b/meson.build
+index ab09dc1..f1890f6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -147,6 +147,7 @@ drivers_info = {
+     'focaltech_moc': {},
+     'mafpmoc': {},
+     'secugen': {},
++    'verimark': { 'helper': ['tudor_crypto'] },
+ 
+     # SPI driver (non-optional if SPI is available)
+     'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },

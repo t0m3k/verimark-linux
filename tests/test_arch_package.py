@@ -485,7 +485,7 @@ class PackageSeriesValidationTests(unittest.TestCase):
             )
             checkout = build_directory / "src" / "libfprint"
             base = subprocess.run(
-                ["git", "-C", str(checkout), "rev-parse", "HEAD~32"],
+                ["git", "-C", str(checkout), "rev-parse", "HEAD~33"],
                 capture_output=True,
                 text=True,
                 check=False,

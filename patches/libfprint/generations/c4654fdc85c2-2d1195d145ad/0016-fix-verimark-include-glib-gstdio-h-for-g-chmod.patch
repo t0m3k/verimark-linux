@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 14:03:22 +0200
+Subject: [PATCH 16/33] fix(verimark): include glib/gstdio.h for g_chmod /
+ g_rename
+
+The bootstrap atomic-write path uses g_chmod and g_rename to set
+the sub1 file permissions and atomically replace the target. Both
+live in glib/gstdio.h which wasn't included.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 6b7810a..d0d46d0 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -45,6 +45,7 @@
+ 
+ #include <gusb.h>
+ #include <gio/gio.h>
++#include <glib/gstdio.h>   /* g_chmod, g_rename */
+ #include <string.h>
+ #include <time.h>
+ 
