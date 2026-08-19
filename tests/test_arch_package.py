@@ -485,8 +485,9 @@ class PackageSeriesValidationTests(unittest.TestCase):
                 "test must exercise makepkg's real local-source symlink staging",
             )
             checkout = build_directory / "src" / "libfprint"
+            applied = len(PATCH_SERIES.read_text().split())
             base = subprocess.run(
-                ["git", "-C", str(checkout), "rev-parse", "HEAD~35"],
+                ["git", "-C", str(checkout), "rev-parse", f"HEAD~{applied}"],
                 capture_output=True,
                 text=True,
                 check=False,

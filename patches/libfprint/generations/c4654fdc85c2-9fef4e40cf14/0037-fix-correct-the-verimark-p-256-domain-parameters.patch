@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 19:11:44 +0100
+Subject: [PATCH 37/38] fix: correct the VeriMark P-256 domain parameters
+
+P256_A_LE and P256_P_LE each carried a wrong 32-bit word: bytes 12..16
+held 0xfffffffe and 0xffffffff where a = p - 3 and p both have a zero
+word. Reversing them yielded integers that are not the NIST P-256
+parameters at all.
+
+The bytes only ever reach the persisted BCRYPT params blob (sub1 tag 4)
+and never go on the wire, so no pairing was harmed, but the stored
+credential documented parameters no one could import.
+---
+ libfprint/drivers/verimark/bootstrap.c        |  4 ++--
+ .../drivers/verimark/tests/test_bootstrap.c   | 24 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/bootstrap.c b/libfprint/drivers/verimark/bootstrap.c
+index 873661fd..cc040b7a 100644
+--- a/libfprint/drivers/verimark/bootstrap.c
++++ b/libfprint/drivers/verimark/bootstrap.c
+@@ -59,7 +59,7 @@ static void reverse_bytes(uint8_t *dst, const uint8_t *src, size_t n)
+ 
+ static const uint8_t P256_A_LE[32] = {
+     0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+-    0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+ };
+@@ -94,7 +94,7 @@ static const uint8_t P256_N_LE[32] = {
+ 
+ static const uint8_t P256_P_LE[32] = {
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+ };
+diff --git a/libfprint/drivers/verimark/tests/test_bootstrap.c b/libfprint/drivers/verimark/tests/test_bootstrap.c
+index 159f85a6..a96dd5d5 100644
+--- a/libfprint/drivers/verimark/tests/test_bootstrap.c
++++ b/libfprint/drivers/verimark/tests/test_bootstrap.c
+@@ -408,6 +408,29 @@ TEST(parse_response_reports_short_refusal_status)
+ }
+ 
+ 
++TEST(p256_params_blob_carries_true_nist_a_and_p)
++{
++    /* a = p - 3 and p, little-endian, as the BCRYPT blob stores them. */
++    static const uint8_t expect_a_le[32] = {
++        0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++    };
++    static const uint8_t expect_p_le[32] = {
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++    };
++    uint8_t blob[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_p256_params_blob(blob, sizeof(blob)));
++    ASSERT_MEM_EQ(blob + 12,  expect_a_le, 32);   /* A block */
++    ASSERT_MEM_EQ(blob + 352, expect_p_le, 32);   /* P block */
++    return 0;
++}
++
++
+ int main(void)
+ {
+     int passed = 0, failed = 0;
+@@ -416,6 +439,7 @@ int main(void)
+ 
+     RUN(p256_params_blob_header_and_size);
+     RUN(p256_params_blob_rejects_small_buffer);
++    RUN(p256_params_blob_carries_true_nist_a_and_p);
+     RUN(storage_cert_layout_first_24_bytes);
+     RUN(storage_cert_signature_layout);
+     RUN(storage_cert_y_coordinate_at_offset_72);

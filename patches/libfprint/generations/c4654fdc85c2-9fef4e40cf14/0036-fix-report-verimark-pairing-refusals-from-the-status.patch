@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 19:11:30 +0100
+Subject: [PATCH 36/38] fix: report VeriMark pairing refusals from the status
+ word
+
+An owned sensor answers 0x93 with a bare 2-byte status instead of the
+802-byte pair response. The parser judged the response size before
+reading the status, so a genuine refusal surfaced as
+VERIMARK_BOOTSTRAP_ERR_RESPONSE_SIZE with out_status left at 0xffff.
+
+Read the status word first and treat a short response carrying a
+non-zero status as an explicit refusal. Observed on 047d:00f2: status
+0x4f04 from a sensor that already holds its pairings.
+---
+ libfprint/drivers/verimark/bootstrap.c           | 14 +++++++++++---
+ libfprint/drivers/verimark/bootstrap.h           |  3 +++
+ .../drivers/verimark/tests/test_bootstrap.c      | 16 ++++++++++++++++
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/bootstrap.c b/libfprint/drivers/verimark/bootstrap.c
+index 7b568edc..873661fd 100644
+--- a/libfprint/drivers/verimark/bootstrap.c
++++ b/libfprint/drivers/verimark/bootstrap.c
+@@ -221,15 +221,23 @@ bool verimark_bootstrap_parse_pair_response(
+ {
+     if (!response || !out_status)
+         return false;
+-    if (response_len != VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE)
++    if (response_len < VERIMARK_BOOTSTRAP_PAIR_STATUS_SIZE)
+         return false;
+ 
+     /* Header is u16 BE (Tudor convention) — extract status before
+      * deciding whether to populate `out`. */
+     *out_status = (uint16_t)((response[0] << 8) | response[1]);
+ 
++    /* A refusal comes back as a bare status word with no certificate
++     * payload, so the status must be read before the size is judged.
++     * Only an accepted pairing carries the full response. */
++    if (*out_status != 0x0000)
++        return false;
++    if (response_len != VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE)
++        return false;
++
+     if (!out)
+-        return *out_status == 0x0000;
++        return true;
+ 
+     out->header[0] = response[0];
+     out->header[1] = response[1];
+@@ -412,7 +420,7 @@ verimark_bootstrap_pair(VerimarkUsbHandle *transport,
+         memset(priv_be, 0, sizeof(priv_be));
+         return VERIMARK_BOOTSTRAP_ERR_TRANSPORT;
+     }
+-    if (resp_len != VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE) {
++    if (resp_len < VERIMARK_BOOTSTRAP_PAIR_STATUS_SIZE) {
+         memset(priv_be, 0, sizeof(priv_be));
+         return VERIMARK_BOOTSTRAP_ERR_RESPONSE_SIZE;
+     }
+diff --git a/libfprint/drivers/verimark/bootstrap.h b/libfprint/drivers/verimark/bootstrap.h
+index 3d13c9d6..4a3d5325 100644
+--- a/libfprint/drivers/verimark/bootstrap.h
++++ b/libfprint/drivers/verimark/bootstrap.h
+@@ -33,6 +33,9 @@ extern "C" {
+ #define VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE   400u
+ #define VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE 802u
+ #define VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE   420u
++
++/* A refused 0x93 returns only this status word, not the full response. */
++#define VERIMARK_BOOTSTRAP_PAIR_STATUS_SIZE   2u
+ #define VERIMARK_BOOTSTRAP_SUB1_SIZE          1284u
+ 
+ #define VERIMARK_BOOTSTRAP_P256_COORD_LEN     32u
+diff --git a/libfprint/drivers/verimark/tests/test_bootstrap.c b/libfprint/drivers/verimark/tests/test_bootstrap.c
+index ec7fd50d..159f85a6 100644
+--- a/libfprint/drivers/verimark/tests/test_bootstrap.c
++++ b/libfprint/drivers/verimark/tests/test_bootstrap.c
+@@ -393,6 +393,21 @@ TEST(sub1_rejects_short_buffer)
+ } while (0)
+ 
+ 
++TEST(parse_response_reports_short_refusal_status)
++{
++    /* An owned sensor answers 0x93 with a bare 2-byte status instead of
++     * the 802-byte pair response. The refusal must be reported as a
++     * refusal carrying the real status, not as a size error. */
++    uint8_t refusal[2] = { 0x4f, 0x04 };
++    VerimarkBootstrapPairResponse out;
++    uint16_t status = 0;
++    ASSERT_TRUE(!verimark_bootstrap_parse_pair_response(
++        refusal, sizeof(refusal), &out, &status));
++    ASSERT_EQ(status, 0x4f04);
++    return 0;
++}
++
++
+ int main(void)
+ {
+     int passed = 0, failed = 0;
+@@ -411,6 +426,7 @@ int main(void)
+     RUN(parse_response_splits_into_header_and_certs);
+     RUN(parse_response_propagates_nonzero_status);
+     RUN(parse_response_rejects_wrong_size);
++    RUN(parse_response_reports_short_refusal_status);
+     RUN(sub1_serialization_layout);
+     RUN(sub1_offsets_per_tag);
+     RUN(sub1_rejects_short_buffer);

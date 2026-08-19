@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 08:54:29 +0100
+Subject: [PATCH 31/38] fix: keep standalone Desktop tests warning-clean
+
+---
+ libfprint/drivers/verimark/pairing.c              | 4 ++++
+ libfprint/drivers/verimark/tests/test_handshake.c | 2 +-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/verimark/pairing.c b/libfprint/drivers/verimark/pairing.c
+index a4b63fa2..248c4f93 100644
+--- a/libfprint/drivers/verimark/pairing.c
++++ b/libfprint/drivers/verimark/pairing.c
+@@ -5,6 +5,10 @@
+  * the secret client_priv_be — callers must never log it.
+  */
+ 
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
+ #include "pairing.h"
+ 
+ #include <stdio.h>
+diff --git a/libfprint/drivers/verimark/tests/test_handshake.c b/libfprint/drivers/verimark/tests/test_handshake.c
+index 20fdab02..15eb34e4 100644
+--- a/libfprint/drivers/verimark/tests/test_handshake.c
++++ b/libfprint/drivers/verimark/tests/test_handshake.c
+@@ -111,7 +111,7 @@ TEST(rejects_null_pointers)
+ {
+     VerimarkSession s;
+     VerimarkTransportIO io = { mock_write, mock_read, NULL };
+-    VerimarkPairingData p;
++    VerimarkPairingData p = {0};
+     /* NULL io */
+     ASSERT_EQ(verimark_handshake_perform(NULL, &p, NULL, &s),
+               VERIMARK_HANDSHAKE_ERR_PARAM);

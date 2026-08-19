@@ -1,0 +1,1288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 16:03:11 +0200
+Subject: [PATCH 22/38] =?UTF-8?q?feat(verimark):=20Phase=2010.3.d=20?=
+ =?UTF-8?q?=E2=80=94=20verify/identify=20async=20SSM?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace `verimark_run_capture_match_pipeline` (and its enclosing
+`verimark_verify` / `verimark_identify` vfuncs) with a 32-state
+`fpi_ssm` that drives every Tudor opcode through
+`verimark_session_call_opcode_async` (Phase 10.3.b foundation).
+
+Why : the sync pipeline blocked the libfprint GMainLoop for up to
+30 s × 3 = 90 s during the 0x87 polling cycle, exceeding the 25 s
+DBus reply deadline that fprintd-CLI enforces on VerifyStart and
+freezing Ctrl+C / VerifyStop until the poll returned.
+
+Architecture :
+- Per-opcode states (`VFY_S_PRE_*`, `VFY_S_DRAIN_*`, `VFY_S_CFG_*`,
+  `VFY_S_POLL_*`, `VFY_S_MATCH`, `VFY_S_POST_*`, `VFY_S_RESOLVE_*`).
+- Poll loop = state pair `POLL_READ` / `POLL_WAIT` re-fired every
+  250 ms via `g_timeout_add` until frame_ready, false-detect
+  (RICH only), or the per-attempt 30 s deadline.
+- Inter-attempt sleep 500 ms = `VFY_S_DRAIN_SLEEP` via `g_timeout_add`.
+- 4 shared async callbacks : `vfy_cb_advance` (default, ignores
+  status + payload), `vfy_cb_evread_poll` (parses 0x87 events,
+  decides frame_ready / false_detect / continue),
+  `vfy_cb_match` (status 0x0000 + payload ≥ 16 B = MATCH),
+  `vfy_cb_resolve` (stashes 0xa0 02 storage_handle for the done cb).
+- Verify ↔ identify share one SSM ; `verify_sm_done` dispatches
+  on `fpi_device_get_current_action()` (verify : compare resolved
+  handle vs requested print, downgrade FAIL if mismatch ;
+  identify : look up resolved handle in fprintd's gallery).
+- `GCancellable` from `fpi_device_get_cancellable()` is wired into
+  every async opcode → Ctrl+C / VerifyStop now propagate cleanly
+  via `G_IO_ERROR_CANCELLED`.
+- Defensive timer cleanup in `verify_sm_done` (`g_source_remove`
+  if `pending_timer_id != 0`) — even though the harness shouldn't
+  let stale timers fire on a dead SSM, the asymmetric ownership
+  with `fpi_ssm_set_data` makes the safety net cheap.
+
+The `verify` and `identify` vfuncs become 5-line trampolines
+calling `verimark_run_verify_ssm`. The old sync helpers
+(`verimark_verify_drain_between_attempts`, `verimark_run_capture_match_pipeline`)
+are removed — no remaining in-tree caller.
+
+Builds clean against libfprint 1.94.10 / libgusb 0.4.9 / GLib 2.86
+on NixOS. 11 standalone TDD suites (proto / crypto / tls / pairing /
+session / handshake / storage / capture / match / enroll /
+bootstrap) stay green — the SSM is in verimark.c gated behind
+`VERIMARK_HAVE_LIBGUSB`, invisible to the standalone build.
+
+Runtime validation via `fprintd-verify` / `fprintd-list` /
+`fprintd-identify` against the real sensor pending — risk-graded
+medium-high since the verify pipeline orchestration is large.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/verimark.c | 1146 +++++++++++++++++--------
+ 1 file changed, 778 insertions(+), 368 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 9c9919e0..4d11f36a 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -42,6 +42,7 @@
+ 
+ #define FP_COMPONENT "verimark"
+ #include "fpi-log.h"
++#include "fpi-ssm.h"
+ 
+ #include <gusb.h>
+ #include <gio/gio.h>
+@@ -65,6 +66,14 @@ struct _FpiDeviceVerimark {
+      * through this session. */
+     VerimarkSession session;
+     gboolean session_active;
++
++    /* Phase 10.3.d : async verify/identify state machine. `task_ssm` is
++     * non-NULL while a verify or identify is in flight. `verify_ctx`
++     * carries per-task state (attempt counter, poll deadline, matched
++     * tuid, etc.) — its memory is owned by the SSM via
++     * fpi_ssm_set_data. */
++    FpiSsm  *task_ssm;
++    gpointer verify_ctx;
+ };
+ 
+ G_DEFINE_TYPE(FpiDeviceVerimark, fpi_device_verimark, FP_TYPE_DEVICE)
+@@ -492,6 +501,8 @@ static gboolean verimark_extract_tuid_from_print(FpPrint *print,
+                                                   const uint8_t **tuid_out);
+ static FpPrint *verimark_print_from_tuid(FpDevice *device,
+                                           const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN]);
++static FpPrint *verimark_gallery_find_by_tuid(GPtrArray *gallery,
++                                               const uint8_t needle[VERIMARK_STORAGE_TUID_LEN]);
+ 
+ 
+ /* ---- verify pipeline ----------------------------------------------------
+@@ -668,338 +679,810 @@ verimark_io_bind(FpiDeviceVerimark *self,
+ }
+ 
+ 
+-/**
+- * Run the canonical preamble + per-attempt capture sequence + 0x99
+- * match call, with a polling loop on 0x87 to wait for the frame
+- * ready event. Returns TRUE on a positive verdict (match), FALSE
+- * otherwise. On a definitive failure (no finger / sensor error),
+- * sets `*out_err` and returns FALSE.
++/* ========================================================================
++ * Phase 10.3.d — async verify/identify SSM
++ * ========================================================================
+  *
+- * On positive verdict, the 16-byte class-2 matched_tuid is copied
+- * into `out_matched_tuid` so callers (verify/identify) can resolve
+- * it back to the class-1 storage_handle that libfprint compares
+- * against.
+- */
+-/**
+- * 7-opcode inter-attempt drain (between verify retries). Mirrors
+- * python `_inter_attempt_drain`. Cursors advance by 4 per drain.
++ * Replaces the previous synchronous `verimark_run_capture_match_pipeline`
++ * which blocked the libfprint GMainLoop for up to ~90 s (30 s × 3
++ * attempts) during the 0x87 polling cycle. The DBus client (fprintd-CLI)
++ * has a 25 s reply deadline on `VerifyStart` → any blocking poll past
++ * that triggered "timeout exceeded" client-side. Ctrl+C / VerifyStop
++ * also could not be dispatched until the poll returned.
++ *
++ * Architecture :
++ *   - Each Tudor opcode is one async call via
++ *     `verimark_session_call_opcode_async()` (Phase 10.3.b).
++ *   - The poll loop becomes a state pair (`POLL_READ` / `POLL_WAIT`) that
++ *     re-fires `event_read` every 250 ms via `g_timeout_add` until
++ *     frame_ready, false-detect (RICH only), or the 30 s per-attempt
++ *     deadline.
++ *   - The 500 ms inter-attempt sleep is also a `g_timeout_add`.
++ *   - The 0xa0 02 resolve (matched_tuid → storage_handle) runs as the
++ *     last SSM state on positive match.
++ *   - Verify and identify share one SSM ; `fpi_device_get_current_action()`
++ *     in the done callback dispatches the verdict (verify_report vs
++ *     identify_report, gallery_hit lookup vs requested-print compare).
+  */
++
++#define VERIMARK_VERIFY_DRAIN_SLEEP_MS   500
++/* VERIMARK_VERIFY_POLL_INTERVAL_MS / VERIMARK_VERIFY_TIMEOUT_S /
++ * VERIMARK_VERIFY_MAX_ATTEMPTS — already defined in the legacy sync
++ * block below ; reused here. */
++
++typedef enum {
++    /* --- Preamble (4 ops) --- */
++    VFY_S_PRE_INIT_0X19,
++    VFY_S_PRE_EVCFG_ON,
++    VFY_S_PRE_EVREAD,
++    VFY_S_PRE_EVCFG_RESET,
++
++    /* --- Attempt loop dispatch (sync, no opcode) --- */
++    VFY_S_ATTEMPT_BEGIN,
++
++    /* --- Inter-attempt drain (7 ops + 1 sleep, only on retry) --- */
++    VFY_S_DRAIN_CFG_WARM,
++    VFY_S_DRAIN_EVCFG_ON,
++    VFY_S_DRAIN_EVREAD_A,
++    VFY_S_DRAIN_EVCFG_RESET_A,
++    VFY_S_DRAIN_EVCFG_E2,
++    VFY_S_DRAIN_EVREAD_B,
++    VFY_S_DRAIN_EVCFG_RESET_B,
++    VFY_S_DRAIN_SLEEP,            /* g_timeout 500 ms */
++
++    /* --- Per-attempt setup (3-4 ops) --- */
++    VFY_S_CFG_WARM_OPT,           /* only on retry — sync-dispatched */
++    VFY_S_CFG_RICH,
++    VFY_S_EVCFG_ARM,
++    VFY_S_CAPSTART,
++
++    /* --- Poll loop --- */
++    VFY_S_POLL_READ,
++    VFY_S_POLL_WAIT,              /* g_timeout 250 ms */
++
++    /* --- Per-attempt teardown (3 ops) --- */
++    VFY_S_CFG_SPARSE,
++    VFY_S_EVCFG_RESET,
++    VFY_S_STATUS_POLL,
++
++    /* --- After-poll dispatch (sync) --- */
++    VFY_S_AFTER_POLL,
++
++    /* --- Match (1 op) + dispatch --- */
++    VFY_S_MATCH,
++    VFY_S_AFTER_MATCH,
++    VFY_S_CFG_WARM_NO_MATCH,      /* 0x39 WARM red-LED feedback */
++
++    /* --- Postamble (7 ops, always) --- */
++    VFY_S_POST_CFG_MIXED,
++    VFY_S_POST_EVCFG_ON,
++    VFY_S_POST_EVREAD,
++    VFY_S_POST_EVCFG_RESET_A,
++    VFY_S_POST_EVCFG_E2,
++    VFY_S_POST_CFG_SPARSE,
++    VFY_S_POST_EVCFG_RESET_B,
++
++    /* --- Resolve (1 op, only if matched) + sync dispatch --- */
++    VFY_S_RESOLVE_DISPATCH,
++    VFY_S_RESOLVE_CALL,
++
++    VFY_S_LAST,
++} VerifyState;
++
++
++typedef struct {
++    /* Result fields — populated as the SSM progresses, consumed in
++     * the done callback. */
++    gboolean frame_ready;                                 /* ANY attempt saw a finger */
++    gboolean matched;                                     /* sensor verdict ≥ 16 B */
++    uint8_t  matched_tuid[VERIMARK_STORAGE_TUID_LEN];    /* class-2 ID */
++    uint8_t  resolved_handle[VERIMARK_STORAGE_TUID_LEN]; /* class-1 ID */
++    uint16_t resolve_status;
++    gboolean resolve_ok;
++
++    /* Attempt-loop state. */
++    int      attempt;                  /* 1..VERIMARK_VERIFY_MAX_ATTEMPTS */
++    int      poll_count;               /* total polls this attempt */
++    gint64   poll_deadline_us;         /* g_get_monotonic_time() + 30 s */
++    gboolean frame_ready_this_attempt;
++    gboolean saw_false_detect;         /* RICH mode early-exit trigger */
++
++    /* Pending GLib timer source — non-zero between schedule and fire.
++     * Cleared by the SSM done callback so a late firing can't poke a
++     * dead SSM. */
++    guint    pending_timer_id;
++} VerimarkVerifyCtx;
++
++
++/* ---- 0x86 event-config payload helper ----------------------------------- */
++
+ static void
+-verimark_verify_drain_between_attempts(FpiDeviceVerimark *self,
+-                                        VerimarkTransportIO *io,
+-                                        uint16_t cursor_a, uint16_t cursor_b)
++vfy_build_evcfg_payload(const uint8_t *mask_a /* 16 B or NULL */,
++                        const uint8_t *mask_b /* 16 B or NULL */,
++                        uint32_t       field_21,
++                        uint8_t        out[36])
+ {
+-    uint16_t st = 0;
+-    VerimarkEventReadResult ev = {0};
+-    verimark_capture_config(&self->session, io, VERIMARK_CFG_WARM, &st);
+-    verimark_capture_event_config(&self->session, io,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
+-    verimark_capture_event_read(&self->session, io, cursor_a, 32, &ev, &st);
+-    verimark_capture_event_config(&self->session, io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
+-    verimark_capture_event_config(&self->session, io,
+-                                   VERIMARK_MASK_EVENT_2,
+-                                   VERIMARK_MASK_EVENT_2, 0, &st);
+-    verimark_capture_event_read(&self->session, io, cursor_b, 32, &ev, &st);
+-    verimark_capture_event_config(&self->session, io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
++    memset(out, 0, 36);
++    if (mask_a) memcpy(out + 0,  mask_a, VERIMARK_EVENT_MASK_LEN);
++    if (mask_b) memcpy(out + 16, mask_b, VERIMARK_EVENT_MASK_LEN);
++    out[32] = (uint8_t)(field_21 & 0xff);
++    out[33] = (uint8_t)((field_21 >> 8) & 0xff);
++    out[34] = (uint8_t)((field_21 >> 16) & 0xff);
++    out[35] = (uint8_t)((field_21 >> 24) & 0xff);
++}
++
++
++/* ---- 0x87 event-read payload helper ------------------------------------- */
++
++static void
++vfy_build_evread_payload(uint16_t cursor, uint16_t max_events,
++                          uint8_t out[8])
++{
++    out[0] = (uint8_t)(cursor & 0xff);
++    out[1] = (uint8_t)((cursor >> 8) & 0xff);
++    out[2] = (uint8_t)(max_events & 0xff);
++    out[3] = (uint8_t)((max_events >> 8) & 0xff);
++    out[4] = 0x01;            /* field_05 = 1 */
++    out[5] = 0x00;
++    out[6] = 0x00;
++    out[7] = 0x00;
++}
++
++
++/* ---- 0xa0 02 resolve payload helper ------------------------------------- */
++
++static void
++vfy_build_resolve_payload(const uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN],
++                           uint8_t out[20])
++{
++    memset(out, 0, 20);
++    out[0] = 0x02;            /* class byte = 2 (templates) */
++    memcpy(out + 4, matched_tuid, VERIMARK_STORAGE_TUID_LEN);
++}
++
++
++/* ---- 0x99 match payload (constant) -------------------------------------- */
++
++static const uint8_t VFY_MATCH_PAYLOAD[12] = {
++    0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++
++/* ---- forward decls ----------------------------------------------------- */
++
++static void verify_sm_run_state(FpiSsm *ssm, FpDevice *dev);
++static void verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error);
++static void verify_ctx_free(gpointer data);
++
++
++/* ---- Generic opcode callbacks ------------------------------------------ *
++ *
++ * Every async call_opcode_async finish lands in one of these. The body
++ * pattern is identical : finish → on error mark_failed ; on success
++ * stash any state-specific result, free the payload, advance the SSM.
++ */
++
++/* "Just check OK and advance" — used for ops whose response we ignore. */
++static void
++vfy_cb_advance(GObject *src, GAsyncResult *res, gpointer ud)
++{
++    (void)src;
++    FpiSsm *ssm = (FpiSsm *)ud;
++    uint16_t status = 0;
++    uint8_t *payload = NULL;
++    size_t   payload_len = 0;
++    GError  *err = NULL;
++    if (!verimark_session_call_opcode_finish(res, &status, &payload,
++                                              &payload_len, &err)) {
++        fpi_ssm_mark_failed(ssm, err);
++        return;
++    }
++    g_free(payload);
++    /* We accept any Tudor status — most setup/teardown ops are best-effort
++     * (matches the sync code which ignored status return codes). */
++    (void)status;
++    fpi_ssm_next_state(ssm);
++}
++
++
++/* event_read callback : parses events for frame_ready / false_detect. */
++static void
++vfy_cb_evread_poll(GObject *src, GAsyncResult *res, gpointer ud)
++{
++    (void)src;
++    FpiSsm *ssm = (FpiSsm *)ud;
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    uint16_t status = 0;
++    uint8_t *payload = NULL;
++    size_t   payload_len = 0;
++    GError  *err = NULL;
++    if (!verimark_session_call_opcode_finish(res, &status, &payload,
++                                              &payload_len, &err)) {
++        /* Transport error during a poll : skip this round, try again. */
++        if (err) g_clear_error(&err);
++        ctx->poll_count++;
++        fpi_ssm_jump_to_state(ssm, VFY_S_POLL_WAIT);
++        return;
++    }
++    ctx->poll_count++;
++    gboolean frame_ready = FALSE;
++    gboolean false_detect_this_round = FALSE;
++    gboolean is_retry = (ctx->attempt > 1);
++
++    if (status == 0x0000 && payload && payload_len >= 4) {
++        /* Inline event-read parser (mirrors verimark_capture_event_read). */
++        uint16_t returned = (uint16_t)(payload[0] | (payload[1] << 8));
++        size_t to_decode = returned;
++        if (to_decode > VERIMARK_EVENT_MAX_RETURNED) to_decode = VERIMARK_EVENT_MAX_RETURNED;
++        if (payload_len < 4 + to_decode * 12) {
++            size_t avail = (payload_len > 4) ? (payload_len - 4) / 12 : 0;
++            if (avail < to_decode) to_decode = avail;
++        }
++        for (size_t i = 0; i < to_decode && !frame_ready; i++) {
++            const uint8_t *rec = payload + 4 + i * 12;
++            uint8_t  type = rec[0];
++            uint32_t val0 = (uint32_t)rec[4]
++                          | ((uint32_t)rec[5] << 8)
++                          | ((uint32_t)rec[6] << 16)
++                          | ((uint32_t)rec[7] << 24);
++            uint32_t val1 = (uint32_t)rec[8]
++                          | ((uint32_t)rec[9] << 8)
++                          | ((uint32_t)rec[10] << 16)
++                          | ((uint32_t)rec[11] << 24);
++            gboolean has_fr = (val0 | val1) & VERIMARK_EVENT_FRAME_READY_BIT;
++            gboolean is_warm_frame = (is_retry && type == 0x18 && !has_fr);
++            if (has_fr || is_warm_frame) {
++                frame_ready = TRUE;
++                break;
++            }
++            if (!is_retry && type == 0x18 && !has_fr)
++                false_detect_this_round = TRUE;
++        }
++    }
++    g_free(payload);
++
++    if (frame_ready) {
++        ctx->frame_ready_this_attempt = TRUE;
++        fpi_ssm_jump_to_state(ssm, VFY_S_CFG_SPARSE);
++        return;
++    }
++    if (false_detect_this_round && !is_retry) {
++        ctx->saw_false_detect = TRUE;
++        fpi_ssm_jump_to_state(ssm, VFY_S_CFG_SPARSE);
++        return;
++    }
++    /* No verdict this round → keep polling (until deadline). */
++    fpi_ssm_jump_to_state(ssm, VFY_S_POLL_WAIT);
++}
++
++
++/* 0x99 match callback : 0x0000 + >=16 B payload = MATCH. */
++static void
++vfy_cb_match(GObject *src, GAsyncResult *res, gpointer ud)
++{
++    (void)src;
++    FpiSsm *ssm = (FpiSsm *)ud;
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    uint16_t status = 0;
++    uint8_t *payload = NULL;
++    size_t   payload_len = 0;
++    GError  *err = NULL;
++    if (!verimark_session_call_opcode_finish(res, &status, &payload,
++                                              &payload_len, &err)) {
++        fpi_ssm_mark_failed(ssm, err);
++        return;
++    }
++    if (status == 0x0000 && payload && payload_len >= VERIMARK_STORAGE_TUID_LEN) {
++        ctx->matched = TRUE;
++        memcpy(ctx->matched_tuid, payload, VERIMARK_STORAGE_TUID_LEN);
++        fp_info("verify: positive verdict on attempt %d (%zu bytes)",
++                ctx->attempt, payload_len);
++    } else {
++        fp_dbg("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
++               ctx->attempt, status, payload_len);
++    }
++    g_free(payload);
++    fpi_ssm_next_state(ssm);
++}
++
++
++/* 0xa0 02 resolve callback : stash storage_handle for the done cb. */
++static void
++vfy_cb_resolve(GObject *src, GAsyncResult *res, gpointer ud)
++{
++    (void)src;
++    FpiSsm *ssm = (FpiSsm *)ud;
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    uint16_t status = 0;
++    uint8_t *payload = NULL;
++    size_t   payload_len = 0;
++    GError  *err = NULL;
++    if (!verimark_session_call_opcode_finish(res, &status, &payload,
++                                              &payload_len, &err)) {
++        /* Resolver failure is non-fatal — we just trust the sensor verdict. */
++        if (err) g_clear_error(&err);
++        ctx->resolve_ok = FALSE;
++        fpi_ssm_next_state(ssm);
++        return;
++    }
++    ctx->resolve_status = status;
++    /* Storage_handle is at offset 18 of the 50-byte response payload. */
++    if (status == 0x0000 && payload
++        && payload_len >= 18 + VERIMARK_STORAGE_TUID_LEN) {
++        memcpy(ctx->resolved_handle, payload + 18, VERIMARK_STORAGE_TUID_LEN);
++        ctx->resolve_ok = TRUE;
++    }
++    g_free(payload);
++    fpi_ssm_next_state(ssm);
++}
++
++
++/* ---- Timer callbacks --------------------------------------------------- */
++
++static gboolean
++vfy_timer_drain_sleep_cb(gpointer ud)
++{
++    FpiSsm *ssm = (FpiSsm *)ud;
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    ctx->pending_timer_id = 0;
++    fpi_ssm_next_state(ssm);
++    return G_SOURCE_REMOVE;
+ }
+ 
+ 
+ static gboolean
+-verimark_run_capture_match_pipeline(FpiDeviceVerimark *self,
+-                              gboolean *out_frame_ready,
+-                              gboolean *out_match,
+-                              uint8_t out_matched_tuid[VERIMARK_STORAGE_TUID_LEN],
+-                              GError **out_err)
++vfy_timer_poll_wait_cb(gpointer ud)
+ {
+-    *out_frame_ready = FALSE;
+-    *out_match = FALSE;
+-    if (out_matched_tuid)
+-        memset(out_matched_tuid, 0, VERIMARK_STORAGE_TUID_LEN);
+-    *out_err = NULL;
+-
+-    VerimarkTransportIoCtx io_ctx;
+-    VerimarkTransportIO io;
+-    verimark_io_bind(self, &io_ctx, &io);
+-
+-    uint16_t st = 0;
+-    VerimarkEventReadResult ev = {0};
+-
+-    /* === Preamble (once) === */
+-    if (!verimark_capture_init_session(&self->session, &io, &st)) {
+-        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                               "verify: 0x19 init transport failure");
+-        return FALSE;
++    FpiSsm *ssm = (FpiSsm *)ud;
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    ctx->pending_timer_id = 0;
++    /* Has the per-attempt deadline expired ? */
++    if (g_get_monotonic_time() >= ctx->poll_deadline_us) {
++        fp_dbg("verify: attempt %d poll deadline reached (count=%d)",
++               ctx->attempt, ctx->poll_count);
++        fpi_ssm_jump_to_state(ssm, VFY_S_CFG_SPARSE);
++        return G_SOURCE_REMOVE;
+     }
+-    verimark_capture_event_config(&self->session, &io,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
+-    verimark_capture_event_read(&self->session, &io, 0, 32, &ev, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
++    fpi_ssm_jump_to_state(ssm, VFY_S_POLL_READ);
++    return G_SOURCE_REMOVE;
++}
+ 
+-    /* === Attempt loop ===
+-     * Mirrors python verify main() flow : attempt 1 uses RICH (strict
+-     * pre-filter, high quality required) ; attempts 2..N flip the
+-     * firmware into "WARM mode" by emitting `0x39 WARM` before
+-     * RICH — that loosens the pre-filter so marginal touches get
+-     * accepted, AND any type=0x18 event qualifies as frame_ready
+-     * (not just ones with the 0x1000 bit). Up to 3 attempts total. */
+-    int attempt = 0;
+-    int last_poll_count = 0;
+-    for (attempt = 1; attempt <= VERIMARK_VERIFY_MAX_ATTEMPTS; attempt++) {
+-        gboolean is_retry = (attempt > 1);
+ 
+-        /* Inter-attempt drain (cursor-based, per python). */
+-        if (is_retry) {
+-            uint16_t cursor_a = (uint16_t)(2 + (attempt - 2) * 4);
+-            uint16_t cursor_b = (uint16_t)(cursor_a + 2);
+-            verimark_verify_drain_between_attempts(self, &io,
+-                                                    cursor_a, cursor_b);
+-            g_usleep(500 * 1000);   /* 0.5 s — let user lift finger */
+-        }
++/* ---- State dispatcher -------------------------------------------------- *
++ *
++ * One state = one async opcode (or one timer, or one sync dispatch).
++ * The dispatcher is just a switch ; each case either fires an async
++ * call_opcode_async + provides a callback, or g_timeout_add + provides
++ * a timer cb, or sync-jumps to another state.
++ */
++static void
++verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(dev);
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    uint8_t payload[128];
++    GCancellable *cancel = fpi_device_get_cancellable(dev);
+ 
+-        /* WARM-mode kickoff (only on retries) — loosens on-chip
+-         * pre-filter and primes the matcher's retry path. */
+-        if (is_retry) {
+-            verimark_capture_config(&self->session, &io,
+-                                     VERIMARK_CFG_WARM, &st);
+-        }
+-        verimark_capture_config(&self->session, &io, VERIMARK_CFG_RICH, &st);
+-        verimark_capture_event_config(&self->session, &io,
+-                                       VERIMARK_MASK_FRAME_READY_ARM,
+-                                       VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
++    switch (fpi_ssm_get_cur_state(ssm)) {
++    /* ===== Preamble (4 ops) ============================================= */
++    case VFY_S_PRE_INIT_0X19:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x19, NULL, 0, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_PRE_EVCFG_ON:
++        vfy_build_evcfg_payload(VERIMARK_MASK_EVENTS_1_AND_2,
++                                 VERIMARK_MASK_EVENTS_1_AND_2, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_PRE_EVREAD:
++        vfy_build_evread_payload(0, 32, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x87, payload, 8, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_PRE_EVCFG_RESET:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
+ 
+-        if (attempt == 1) {
++    /* ===== Attempt loop dispatch ======================================== */
++    case VFY_S_ATTEMPT_BEGIN:
++        ctx->frame_ready_this_attempt = FALSE;
++        ctx->saw_false_detect = FALSE;
++        ctx->poll_count = 0;
++        if (ctx->attempt == 1) {
+             fp_info("verify: attempt %d/%d — waiting for finger (timeout %d s)",
+-                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS,
++                    ctx->attempt, VERIMARK_VERIFY_MAX_ATTEMPTS,
+                     VERIMARK_VERIFY_TIMEOUT_S);
++            fpi_ssm_jump_to_state(ssm, VFY_S_CFG_RICH);
+         } else {
+             fp_info("verify: attempt %d/%d — retry in WARM mode "
+                     "(looser pre-filter)",
+-                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
++                    ctx->attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
++            fpi_ssm_jump_to_state(ssm, VFY_S_DRAIN_CFG_WARM);
+         }
++        return;
+ 
+-        if (!verimark_capture_start(&self->session, &io,
+-                                     VERIMARK_CAPSTART_VERIFY, &st)) {
+-            *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                                   "verify: 0x80 capture_start transport failure");
+-            return FALSE;
+-        }
++    /* ===== Drain (7 ops, retry only) — cursors advance per attempt ====== */
++    case VFY_S_DRAIN_CFG_WARM:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_WARM, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVCFG_ON:
++        vfy_build_evcfg_payload(VERIMARK_MASK_EVENTS_1_AND_2,
++                                 VERIMARK_MASK_EVENTS_1_AND_2, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVREAD_A:
++        vfy_build_evread_payload((uint16_t)(2 + (ctx->attempt - 2) * 4),
++                                  32, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x87, payload, 8, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVCFG_RESET_A:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVCFG_E2:
++        vfy_build_evcfg_payload(VERIMARK_MASK_EVENT_2,
++                                 VERIMARK_MASK_EVENT_2, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVREAD_B:
++        vfy_build_evread_payload((uint16_t)(4 + (ctx->attempt - 2) * 4),
++                                  32, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x87, payload, 8, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_EVCFG_RESET_B:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_DRAIN_SLEEP:
++        ctx->pending_timer_id = g_timeout_add(VERIMARK_VERIFY_DRAIN_SLEEP_MS,
++                                               vfy_timer_drain_sleep_cb, ssm);
++        return;
+ 
+-        /* Poll for FRAME_READY (or any type=0x18 in WARM mode).
+-         * Track `saw_false_detect` : a type=0x18 event without the
+-         * 0x1000 bit means the on-chip pre-filter REJECTED the touch.
+-         * In RICH mode no further FRAME_READY will come for this
+-         * attempt — exit the poll loop immediately and trigger retry. */
+-        gint64 deadline_us = g_get_monotonic_time()
+-                           + (gint64)VERIMARK_VERIFY_TIMEOUT_S * G_USEC_PER_SEC;
+-        gboolean frame_ready_this_attempt = FALSE;
+-        gboolean saw_false_detect = FALSE;
+-        int poll_count = 0;
+-        while (g_get_monotonic_time() < deadline_us) {
+-            poll_count++;
+-            VerimarkEventReadResult r = {0};
+-            uint16_t poll_st = 0;
+-            if (!verimark_capture_event_read(&self->session, &io,
+-                                              0, 32, &r, &poll_st)) {
+-                g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+-                continue;
+-            }
+-            for (size_t i = 0; i < r.returned_count && !frame_ready_this_attempt; i++) {
+-                const VerimarkSensorEvent *e = &r.events[i];
+-                gboolean has_fr_bit =
+-                    (e->val0 | e->val1) & VERIMARK_EVENT_FRAME_READY_BIT;
+-                gboolean is_warm_frame = (is_retry && e->type == 0x18
+-                                          && !has_fr_bit);
+-                if (has_fr_bit || is_warm_frame) {
+-                    frame_ready_this_attempt = TRUE;
+-                    break;
+-                }
+-                if (!is_retry && e->type == 0x18 && !has_fr_bit)
+-                    saw_false_detect = TRUE;
+-            }
+-            if (frame_ready_this_attempt)
+-                break;
+-            /* Early exit on RICH-mode false-detect — no FRAME_READY
+-             * will fire for this attempt, save the timeout wait. */
+-            if (saw_false_detect && !is_retry)
+-                break;
+-            g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
++    /* ===== Per-attempt setup =========================================== */
++    case VFY_S_CFG_WARM_OPT:
++        /* Only on retry — sync dispatch on attempt==1 skips this. */
++        if (ctx->attempt == 1) {
++            fpi_ssm_jump_to_state(ssm, VFY_S_CFG_RICH);
++            return;
+         }
+-        last_poll_count = poll_count;
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_WARM, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_CFG_RICH:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_RICH, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_EVCFG_ARM:
++        vfy_build_evcfg_payload(VERIMARK_MASK_FRAME_READY_ARM,
++                                 VERIMARK_MASK_FRAME_READY_ARM, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_CAPSTART:
++        ctx->poll_deadline_us = g_get_monotonic_time()
++                              + (gint64)VERIMARK_VERIFY_TIMEOUT_S
++                                * G_USEC_PER_SEC;
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x80, VERIMARK_CAPSTART_VERIFY,
++            VERIMARK_CAPTURE_START_PAYLOAD_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++
++    /* ===== Poll loop =================================================== */
++    case VFY_S_POLL_READ:
++        vfy_build_evread_payload(0, 32, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x87, payload, 8, cancel, vfy_cb_evread_poll, ssm);
++        return;
++    case VFY_S_POLL_WAIT:
++        ctx->pending_timer_id = g_timeout_add(VERIMARK_VERIFY_POLL_INTERVAL_MS,
++                                               vfy_timer_poll_wait_cb, ssm);
++        return;
++
++    /* ===== Per-attempt teardown ======================================== */
++    case VFY_S_CFG_SPARSE:
+         fp_dbg("verify: attempt %d poll done — frame_ready=%d polls=%d "
+                "false_detect=%d",
+-               attempt, frame_ready_this_attempt, poll_count,
+-               saw_false_detect);
++               ctx->attempt, ctx->frame_ready_this_attempt, ctx->poll_count,
++               ctx->saw_false_detect);
++        if (ctx->frame_ready_this_attempt) ctx->frame_ready = TRUE;
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_SPARSE, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_EVCFG_RESET:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_STATUS_POLL:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x81, NULL, 0, cancel, vfy_cb_advance, ssm);
++        return;
+ 
+-        /* Close the capture window for this attempt. */
+-        verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
+-        verimark_capture_event_config(&self->session, &io,
+-                                       NULL, NULL, /*field_21=*/4, &st);
+-        verimark_capture_status_poll(&self->session, &io, &st, &st);
++    /* ===== After-poll dispatch ========================================= */
++    case VFY_S_AFTER_POLL:
++        if (ctx->frame_ready_this_attempt) {
++            fpi_ssm_jump_to_state(ssm, VFY_S_MATCH);
++            return;
++        }
++        /* No finger → next attempt or end. */
++        ctx->attempt++;
++        if (ctx->attempt > VERIMARK_VERIFY_MAX_ATTEMPTS) {
++            fpi_ssm_jump_to_state(ssm, VFY_S_POST_CFG_MIXED);
++        } else {
++            fpi_ssm_jump_to_state(ssm, VFY_S_ATTEMPT_BEGIN);
++        }
++        return;
+ 
+-        if (frame_ready_this_attempt && !*out_frame_ready)
+-            *out_frame_ready = TRUE;
++    /* ===== Match + dispatch ============================================ */
++    case VFY_S_MATCH:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x99, VFY_MATCH_PAYLOAD, sizeof(VFY_MATCH_PAYLOAD),
++            cancel, vfy_cb_match, ssm);
++        return;
++    case VFY_S_AFTER_MATCH:
++        if (ctx->matched) {
++            fpi_ssm_jump_to_state(ssm, VFY_S_POST_CFG_MIXED);
++        } else {
++            fpi_ssm_jump_to_state(ssm, VFY_S_CFG_WARM_NO_MATCH);
++        }
++        return;
++    case VFY_S_CFG_WARM_NO_MATCH:
++        /* WARM trigger for the firmware's brief red-LED feedback. After
++         * this op the SSM either retries (more attempts) or proceeds to
++         * postamble. The advance callback lands in next state, where
++         * we re-dispatch like AFTER_POLL. */
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_WARM, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
+ 
+-        if (!frame_ready_this_attempt) {
+-            /* Either timeout or false-detect early exit — try again. */
+-            if (attempt < VERIMARK_VERIFY_MAX_ATTEMPTS) {
+-                fp_dbg("verify: no frame_ready on attempt %d, retrying",
+-                       attempt);
+-                continue;
++    /* ===== Postamble (7 ops, always) =================================== */
++    case VFY_S_POST_CFG_MIXED:
++        /* If we got here via CFG_WARM_NO_MATCH, advance the attempt
++         * counter first — otherwise we'd loop infinitely. */
++        if (!ctx->matched && !ctx->frame_ready_this_attempt) {
++            /* fall-through case : we already advanced in AFTER_POLL */
++        } else if (!ctx->matched) {
++            ctx->attempt++;
++            if (ctx->attempt <= VERIMARK_VERIFY_MAX_ATTEMPTS) {
++                ctx->frame_ready_this_attempt = FALSE;
++                fpi_ssm_jump_to_state(ssm, VFY_S_ATTEMPT_BEGIN);
++                return;
+             }
+-            break;
+         }
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_MIXED, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_EVCFG_ON:
++        vfy_build_evcfg_payload(VERIMARK_MASK_EVENTS_1_AND_2,
++                                 VERIMARK_MASK_EVENTS_1_AND_2, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_EVREAD:
++        vfy_build_evread_payload(2, 32, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x87, payload, 8, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_EVCFG_RESET_A:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_EVCFG_E2:
++        vfy_build_evcfg_payload(VERIMARK_MASK_EVENT_2,
++                                 VERIMARK_MASK_EVENT_2, 0, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_CFG_SPARSE:
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x39, VERIMARK_CFG_SPARSE, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++            cancel, vfy_cb_advance, ssm);
++        return;
++    case VFY_S_POST_EVCFG_RESET_B:
++        vfy_build_evcfg_payload(NULL, NULL, 4, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0x86, payload, 36, cancel, vfy_cb_advance, ssm);
++        return;
+ 
+-        /* Touch was accepted → run 0x99 match. */
+-        VerimarkMatchVerdict v = {0};
+-        uint16_t v_st = 0;
+-        if (!verimark_match_simple(&self->session, &io, &v, &v_st)) {
+-            *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                                   "verify: 0x99 match transport failure");
+-            return FALSE;
+-        }
+-        if (v_st == 0x0000 && v.len >= 16) {
+-            fp_info("verify: positive verdict on attempt %d (%zu bytes)",
+-                    attempt, v.len);
+-            *out_match = TRUE;
+-            if (out_matched_tuid)
+-                memcpy(out_matched_tuid, v.bytes,
+-                       VERIMARK_STORAGE_TUID_LEN);
+-            break;   /* MATCH — done */
++    /* ===== Resolve dispatch + call ===================================== */
++    case VFY_S_RESOLVE_DISPATCH:
++        if (!ctx->matched) {
++            fpi_ssm_mark_completed(ssm);
++            return;
+         }
++        fpi_ssm_next_state(ssm);
++        return;
++    case VFY_S_RESOLVE_CALL:
++        vfy_build_resolve_payload(ctx->matched_tuid, payload);
++        verimark_session_call_opcode_async(&self->session, self->transport,
++            3000, 0xa0, payload, 20, cancel, vfy_cb_resolve, ssm);
++        return;
+ 
+-        fp_dbg("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
+-               attempt, v_st, v.len);
+-        /* WARM trigger after a no-match for the firmware's brief
+-         * red-LED feedback (cf. phase9-led-red-finding.md). */
+-        verimark_capture_config(&self->session, &io, VERIMARK_CFG_WARM, &st);
+-        /* Don't break — try again on next iteration. */
++    case VFY_S_LAST:
++        fpi_ssm_mark_completed(ssm);
++        return;
+     }
+-
+-    /* === Postamble (always — even on success / failure) === */
+-    verimark_capture_config(&self->session, &io, VERIMARK_CFG_MIXED, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2,
+-                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
+-    verimark_capture_event_read(&self->session, &io, 2, 32, &ev, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   VERIMARK_MASK_EVENT_2,
+-                                   VERIMARK_MASK_EVENT_2, 0, &st);
+-    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
+-
+-    if (!*out_frame_ready) {
+-        *out_err = g_error_new(FP_DEVICE_RETRY,
+-                               FP_DEVICE_RETRY_TOO_SHORT,
+-                               "verify: no finger detected after %d attempts "
+-                               "(last poll count %d)",
+-                               VERIMARK_VERIFY_MAX_ATTEMPTS, last_poll_count);
+-        return FALSE;
+-    }
+-    return *out_match;
++    /* Unknown state — should never happen ; fail loud. */
++    fpi_ssm_mark_failed(ssm,
++        g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "verify SSM: unknown state %d", fpi_ssm_get_cur_state(ssm)));
+ }
+ 
+ 
++/* ---- Verdict reporting (verify vs identify dispatch) -------------------- */
++
++static void
++verify_sm_done(FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(dev);
++    VerimarkVerifyCtx *ctx = fpi_ssm_get_data(ssm);
++    FpiDeviceAction action = fpi_device_get_current_action(dev);
++
++    /* Drop any pending timer source — defensive, in case the SSM failed
++     * while a timer was scheduled. */
++    if (ctx && ctx->pending_timer_id != 0) {
++        g_source_remove(ctx->pending_timer_id);
++        ctx->pending_timer_id = 0;
++    }
++
++    if (error) {
++        fp_info("verify: SSM failed (%s)", error->message ? error->message : "?");
++        if (action == FPI_DEVICE_ACTION_VERIFY)
++            fpi_device_verify_complete(dev, error);
++        else
++            fpi_device_identify_complete(dev, error);
++        self->task_ssm = NULL;
++        self->verify_ctx = NULL;
++        return;
++    }
++
++    gboolean reported_match = ctx && ctx->matched && ctx->frame_ready;
++
++    /* For verify : if the requested print differs from the resolved
++     * storage_handle, downgrade the verdict to FAIL. */
++    if (reported_match && action == FPI_DEVICE_ACTION_VERIFY && ctx->resolve_ok
++        && ctx->resolve_status == 0x0000) {
++        FpPrint *requested = NULL;
++        fpi_device_get_verify_data(dev, &requested);
++        g_autoptr(GVariant) requested_tid_var = NULL;
++        const uint8_t *requested_tuid = NULL;
++        if (requested
++            && verimark_extract_tuid_from_print(requested,
++                                                 &requested_tid_var,
++                                                 &requested_tuid)) {
++            if (memcmp(ctx->resolved_handle, requested_tuid,
++                       VERIMARK_STORAGE_TUID_LEN) != 0) {
++                fp_dbg("verify: sensor matched a different print → downgrading");
++                reported_match = FALSE;
++            } else {
++                fp_dbg("verify: matched the requested print "
++                       "(storage_handle confirmed)");
++            }
++        }
++    }
++
++    if (action == FPI_DEVICE_ACTION_VERIFY) {
++        if (reported_match) {
++            fp_info("verify: MATCH_SUCCESS");
++            fpi_device_verify_report(dev, FPI_MATCH_SUCCESS, NULL, NULL);
++            fpi_device_verify_complete(dev, NULL);
++        } else if (ctx && ctx->frame_ready) {
++            fp_info("verify: MATCH_FAIL (finger seen, no enrollment matched)");
++            fpi_device_verify_report(dev, FPI_MATCH_FAIL, NULL, NULL);
++            fpi_device_verify_complete(dev, NULL);
++        } else {
++            fp_info("verify: MATCH_ERROR (no finger after %d attempts)",
++                    VERIMARK_VERIFY_MAX_ATTEMPTS);
++            GError *retry = g_error_new(FP_DEVICE_RETRY,
++                                        FP_DEVICE_RETRY_TOO_SHORT,
++                                        "verify: no finger detected after %d attempts",
++                                        VERIMARK_VERIFY_MAX_ATTEMPTS);
++            fpi_device_verify_report(dev, FPI_MATCH_ERROR, NULL,
++                                     g_steal_pointer(&retry));
++            fpi_device_verify_complete(dev, NULL);
++        }
++    } else { /* IDENTIFY */
++        FpPrint *gallery_hit = NULL;
++        if (reported_match && ctx->resolve_ok
++            && ctx->resolve_status == 0x0000) {
++            GPtrArray *gallery = NULL;
++            fpi_device_get_identify_data(dev, &gallery);
++            gallery_hit = verimark_gallery_find_by_tuid(gallery,
++                                                        ctx->resolved_handle);
++        }
++        if (gallery_hit) {
++            fpi_device_identify_report(dev, gallery_hit, NULL, NULL);
++            fpi_device_identify_complete(dev, NULL);
++        } else if (ctx && ctx->frame_ready) {
++            /* Finger seen, no gallery hit (or resolver failed). */
++            fpi_device_identify_report(dev, NULL, NULL, NULL);
++            fpi_device_identify_complete(dev, NULL);
++        } else {
++            GError *retry = g_error_new(FP_DEVICE_RETRY,
++                                        FP_DEVICE_RETRY_TOO_SHORT,
++                                        "identify: no finger detected after %d attempts",
++                                        VERIMARK_VERIFY_MAX_ATTEMPTS);
++            fpi_device_identify_report(dev, NULL, NULL,
++                                       g_steal_pointer(&retry));
++            fpi_device_identify_complete(dev, NULL);
++        }
++    }
++
++    self->task_ssm = NULL;
++    self->verify_ctx = NULL;
++}
++
++
++/* ---- ctx free (called by fpi_ssm on completion) ------------------------ */
++
++static void
++verify_ctx_free(gpointer data)
++{
++    VerimarkVerifyCtx *ctx = data;
++    if (ctx == NULL) return;
++    if (ctx->pending_timer_id != 0) {
++        g_source_remove(ctx->pending_timer_id);
++        ctx->pending_timer_id = 0;
++    }
++    g_free(ctx);
++}
++
++
++/* ---- SSM entry (shared by verify and identify vfuncs) ------------------ */
++
++static void
++verimark_run_verify_ssm(FpDevice *device)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++
++    if (!self->session_active) {
++        GError *err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                                  "verify: TLS session not active");
++        if (fpi_device_get_current_action(device) == FPI_DEVICE_ACTION_VERIFY)
++            fpi_device_verify_complete(device, err);
++        else
++            fpi_device_identify_complete(device, err);
++        return;
++    }
++
++    VerimarkVerifyCtx *ctx = g_new0(VerimarkVerifyCtx, 1);
++    ctx->attempt = 1;
++
++    self->task_ssm = fpi_ssm_new(device, verify_sm_run_state, VFY_S_LAST);
++    fpi_ssm_set_data(self->task_ssm, ctx, verify_ctx_free);
++    self->verify_ctx = ctx;
++    fpi_ssm_start(self->task_ssm, verify_sm_done);
++}
++
++
++
+ static void verimark_verify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+-    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+-    /* Plain pointer — fpi_device_verify_complete consumes (steals) the
+-     * GError. Using g_autoptr here triggers a use-after-free in fprintd
+-     * which crashes on the dangling error->message pointer. */
+-    GError *error = NULL;
+-
+-    if (!self->session_active) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+-                            "verify: TLS session not active");
+-        fpi_device_verify_complete(device, error);
+-        return;
+-    }
+-
+-    gboolean frame_ready = FALSE, matched = FALSE;
+-    uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
+-    GError *pipeline_err = NULL;
+-    verimark_run_capture_match_pipeline(self, &frame_ready, &matched,
+-                                  matched_tuid, &pipeline_err);
+-
+-    /* If the sensor said positive verdict, resolve the matched_tuid
+-     * (class-2) to the storage_handle (class-1) and compare against
+-     * the FpPrint libfprint asked us to verify. With multiple
+-     * enrollments this is the only way to know it's THIS finger and
+-     * not just any enrolled finger. With a single enrollment both
+-     * branches collapse to MATCH. */
+-    if (matched) {
+-        VerimarkTransportIoCtx io_ctx;
+-        VerimarkTransportIO io;
+-        verimark_io_bind(self, &io_ctx, &io);
+-
+-        uint8_t resolved_handle[VERIMARK_STORAGE_TUID_LEN] = {0};
+-        uint16_t resolve_st = 0;
+-        gboolean resolved = verimark_storage_resolve_template_to_handle(
+-            &self->session, &io, matched_tuid,
+-            resolved_handle, &resolve_st);
+-
+-        FpPrint *requested = NULL;
+-        fpi_device_get_verify_data(device, &requested);
+-        g_autoptr(GVariant) requested_tid_var = NULL;
+-        const uint8_t *requested_tuid = NULL;
+-        if (resolved && resolve_st == 0x0000 && requested
+-            && verimark_extract_tuid_from_print(requested,
+-                                                 &requested_tid_var,
+-                                                 &requested_tuid)) {
+-            if (memcmp(resolved_handle, requested_tuid,
+-                       VERIMARK_STORAGE_TUID_LEN) != 0) {
+-                /* Sensor matched ANOTHER enrollment, not the one
+-                 * libfprint asked us to verify → downgrade to FAIL. */
+-                fp_dbg("verify: sensor matched a different print "
+-                       "(resolved storage_handle ≠ requested tuid)");
+-                matched = FALSE;
+-            } else {
+-                fp_dbg("verify: matched the requested print "
+-                       "(storage_handle confirmed)");
+-            }
+-        } else {
+-            fp_dbg("verify: resolver unavailable (resolved=%d status=0x%04x) "
+-                   "→ trusting sensor verdict", resolved, resolve_st);
+-        }
+-    }
+-
+-    if (matched) {
+-        fp_info("verify: MATCH_SUCCESS");
+-        fpi_device_verify_report(device, FPI_MATCH_SUCCESS, NULL, NULL);
+-        fpi_device_verify_complete(device, NULL);
+-    } else if (frame_ready) {
+-        /* Finger was seen but no enrollment matched → libfprint
+-         * "fail" verdict, not an error. */
+-        fp_info("verify: MATCH_FAIL (finger seen, no enrollment matched)");
+-        if (pipeline_err) g_clear_error(&pipeline_err);
+-        fpi_device_verify_report(device, FPI_MATCH_FAIL, NULL, NULL);
+-        fpi_device_verify_complete(device, NULL);
+-    } else if (pipeline_err && pipeline_err->domain == FP_DEVICE_RETRY) {
+-        /* Retry-class error (timeout / no finger) goes through report,
+-         * not complete — libfprint rejects retry errors at the
+-         * complete entrypoint (cf. goodixmoc fp_verify_ssm_done). */
+-        fp_info("verify: MATCH_ERROR (retry: %s)",
+-                pipeline_err->message ? pipeline_err->message : "(no msg)");
+-        fpi_device_verify_report(device, FPI_MATCH_ERROR, NULL,
+-                                 g_steal_pointer(&pipeline_err));
+-        fpi_device_verify_complete(device, NULL);
+-    } else {
+-        /* Genuine hard error (transport / protocol) — surface via
+-         * complete with no prior report. */
+-        if (!pipeline_err)
+-            pipeline_err = g_error_new(FP_DEVICE_ERROR,
+-                                       FP_DEVICE_ERROR_GENERAL,
+-                                       "verify: unknown failure");
+-        fpi_device_verify_complete(device, pipeline_err);
+-    }
++    /* Phase 10.3.d : delegate to the shared async SSM. The SSM checks
++     * `session_active`, builds its own ctx, runs through preamble /
++     * attempts / postamble / resolve via async opcodes, and calls
++     * `fpi_device_verify_complete` in its done callback. */
++    verimark_run_verify_ssm(device);
+ }
+ 
+ 
+@@ -1529,82 +2012,9 @@ verimark_gallery_find_by_tuid(GPtrArray *gallery,
+ static void verimark_identify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+-    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+-    /* Plain pointer — see note in verimark_verify() above. */
+-    GError *error = NULL;
+-
+-    if (!self->session_active) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+-                            "identify: TLS session not active");
+-        fpi_device_identify_complete(device, error);
+-        return;
+-    }
+-
+-    gboolean frame_ready = FALSE, matched = FALSE;
+-    uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
+-    GError *pipeline_err = NULL;
+-    verimark_run_capture_match_pipeline(self, &frame_ready, &matched,
+-                                  matched_tuid, &pipeline_err);
+-
+-    if (matched) {
+-        /* Resolve matched_tuid (class-2) → storage_handle (class-1),
+-         * then look that handle up in the gallery fprintd handed us. */
+-        VerimarkTransportIoCtx io_ctx;
+-        VerimarkTransportIO io;
+-        verimark_io_bind(self, &io_ctx, &io);
+-
+-        uint8_t resolved_handle[VERIMARK_STORAGE_TUID_LEN] = {0};
+-        uint16_t resolve_st = 0;
+-        FpPrint *gallery_hit = NULL;
+-
+-        if (verimark_storage_resolve_template_to_handle(
+-                &self->session, &io, matched_tuid,
+-                resolved_handle, &resolve_st)
+-            && resolve_st == 0x0000)
+-        {
+-            GPtrArray *gallery = NULL;
+-            fpi_device_get_identify_data(device, &gallery);
+-            gallery_hit = verimark_gallery_find_by_tuid(gallery,
+-                                                        resolved_handle);
+-            if (gallery_hit) {
+-                fp_dbg("identify: gallery hit (storage_handle="
+-                       "%02x%02x%02x%02x…)",
+-                       resolved_handle[0], resolved_handle[1],
+-                       resolved_handle[2], resolved_handle[3]);
+-            } else {
+-                fp_dbg("identify: resolved storage_handle not in gallery "
+-                       "(sensor matched an enrollment unknown to fprintd)");
+-            }
+-        } else {
+-            fp_dbg("identify: matched_tuid → storage_handle resolution "
+-                   "failed (status 0x%04x)", resolve_st);
+-        }
+-
+-        if (gallery_hit) {
+-            fpi_device_identify_report(device, gallery_hit, NULL, NULL);
+-            fpi_device_identify_complete(device, NULL);
+-        } else {
+-            /* Sensor matched something, but it's not in the gallery
+-             * (or the resolver failed). Report no-match. */
+-            fpi_device_identify_report(device, NULL, NULL, NULL);
+-            fpi_device_identify_complete(device, NULL);
+-        }
+-    } else if (frame_ready) {
+-        /* Finger seen, no enrollment matched. */
+-        if (pipeline_err) g_clear_error(&pipeline_err);
+-        fpi_device_identify_report(device, NULL, NULL, NULL);
+-        fpi_device_identify_complete(device, NULL);
+-    } else if (pipeline_err && pipeline_err->domain == FP_DEVICE_RETRY) {
+-        fpi_device_identify_report(device, NULL, NULL,
+-                                   g_steal_pointer(&pipeline_err));
+-        fpi_device_identify_complete(device, NULL);
+-    } else {
+-        if (!pipeline_err)
+-            pipeline_err = g_error_new(FP_DEVICE_ERROR,
+-                                       FP_DEVICE_ERROR_GENERAL,
+-                                       "identify: unknown failure");
+-        fpi_device_identify_complete(device, pipeline_err);
+-    }
++    /* Phase 10.3.d : same async SSM as verify ; the done callback
++     * dispatches based on `fpi_device_get_current_action()`. */
++    verimark_run_verify_ssm(device);
+ }
+ 
+ 

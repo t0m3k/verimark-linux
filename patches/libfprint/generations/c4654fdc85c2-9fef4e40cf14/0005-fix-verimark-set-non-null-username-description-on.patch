@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 11:32:02 +0200
+Subject: [PATCH 05/38] fix(verimark): set non-NULL username/description on
+ list() prints
+
+fprintd's `delete_enrolled_fingers` (called at the start of
+`fprint_device_enroll_start` to clean stale prints) iterates the FpPrint
+array our `list()` returns and logs metadata of each via g_log. With
+NULL `fp_print_get_username` / `fp_print_get_description`, the format
+string `"%s"` lands on a NULL pointer and strlen segfaults inside g_log.
+
+Mirror the standard FpDevice convention: every FpPrint we emit carries
+explicit non-NULL strings, even if they're synthetic ("verimark" /
+"Kensington VeriMark DT (device-side enrollment)"). fprintd overrides
+these from its user-cache when it matches the print back to an enrolled
+finger.
+
+Confirmed runtime: `fprintd-enroll` previously crashed in
+`delete_enrolled_fingers + 0x1731d` before our enroll vfunc was even
+called; the user only saw "EnrollStart failed: Remote peer disconnected".
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 63368be4..ac3cab20 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1388,6 +1388,14 @@ verimark_print_from_tuid(FpDevice *device,
+     fpi_print_set_type(print, FPI_PRINT_RAW);
+     fpi_print_set_device_stored(print, TRUE);
+     g_object_set(print, "fpi-data", data, NULL);
++    /* fprintd logs print metadata during enroll cleanup
++     * (`delete_enrolled_fingers`) and crashes if username / description
++     * are NULL — g_log "%s" on NULL faults in strlen. Set explicit
++     * non-NULL placeholders. The real username/finger get attached by
++     * fprintd from its user-cache when matching against this print. */
++    fp_print_set_username(print, "verimark");
++    fp_print_set_description(print, "Kensington VeriMark DT (device-side enrollment)");
++    fp_print_set_finger(print, FP_FINGER_UNKNOWN);
+ 
+     return print;
+ }

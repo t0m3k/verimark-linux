@@ -2,6 +2,13 @@
 
 Date: 2026-08-19
 
+> **Status: the ownership model below is contradicted by hardware evidence.**
+> The reader holds more than one host pairing at a time and partitions
+> templates per host, so "one active host owner" does not describe this
+> device, and `0x93` refusals report capacity rather than ownership. See
+> `docs/hardware/verimark-ownership-transfer-2026-08-19.md` before acting on
+> this spec.
+
 ## Objective
 
 Make Linux use the Kensington VeriMark Desktop as a single-owner device after

@@ -199,7 +199,7 @@ class PatchSeriesTests(unittest.TestCase):
             authors,
             [SCELLES_AUTHOR] * 24
             + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
-            + [CLEANUP_AUTHOR] * 9,
+            + [CLEANUP_AUTHOR] * 12,
         )
 
     def test_active_patches_exclude_prohibited_provenance_residue(self):
@@ -226,6 +226,27 @@ class PatchSeriesTests(unittest.TestCase):
         for marker in ("0x8054", "+usb:v047Dp8054*"):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker.lower(), patch_text.lower())
+
+    def test_driver_transfers_error_ownership_to_completion_calls(self):
+        """A GError handed to a (transfer full) completion function must not
+        also be owned by a g_autoptr, or libfprint's deferred idle return
+        reads memory the autoptr already freed."""
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            source = (
+                checkout / "libfprint" / "drivers" / "verimark" / "verimark.c"
+            ).read_text()
+
+        bare_error = re.compile(r"_complete\([^;]*?(?<![&\w])error\s*\)", re.S)
+        offenders = []
+        for match in re.finditer(r"g_autoptr\(GError\)\s+error", source):
+            end = source.find("\n}\n", match.end())
+            body = source[match.end():end if end != -1 else len(source)]
+            offenders.extend(call.group(0).split("\n")[-1].strip()
+                             for call in bare_error.finditer(body))
+
+        self.assertEqual(offenders, [])
 
     def test_verimark_disables_generic_temperature_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,7 +309,7 @@ class PatchSeriesTests(unittest.TestCase):
                 authors,
                 [SCELLES_AUTHOR] * 24
                 + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
-                + [CLEANUP_AUTHOR] * 9,
+                + [CLEANUP_AUTHOR] * 12,
             )
 
     def test_materialized_driver_has_only_implemented_features_for_desktop_id(self):
