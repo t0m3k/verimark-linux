@@ -1,7 +1,7 @@
 pkgbase = libfprint-verimark
 	pkgdesc = Library for fingerprint readers with experimental Kensington VeriMark support
 	pkgver = 1.94.100.r1.gc4654fd
-	pkgrel = 4
+	pkgrel = 5
 	url = https://fprint.freedesktop.org/
 	arch = x86_64
 	groups = fprint
