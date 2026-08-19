@@ -357,17 +357,18 @@ class GeneratedMetadataTests(unittest.TestCase):
 
         for patch_source in patch_sources:
             with self.subTest(patch_source=patch_source):
-                relative_source = (
-                    "../../patches/libfprint/series"
-                    if patch_source == "series"
-                    else f"../../patches/libfprint/current/{patch_source}"
-                )
-                source = f"{patch_source}::{relative_source}"
-                self.assertIn(source, self.info["source"])
-                patch_index = self.info["source"].index(source)
+                self.assertIn(patch_source, self.info["source"])
+                patch_index = self.info["source"].index(patch_source)
                 self.assertRegex(
                     self.info["b2sums"][patch_index], r"^[0-9a-f]{128}$"
                 )
+
+    def test_pkgbuild_local_sources_are_present_next_to_pkgbuild(self):
+        package_sources = self.info["source"][1:]
+        for source in package_sources:
+            with self.subTest(source=source):
+                filename = source.split("::", 1)[0]
+                self.assertTrue((PACKAGE_BUILD.parent / filename).is_file())
 
     def test_package_plan_produces_one_replacement_archive(self):
         package_paths = run_checked(self, "makepkg", "--packagelist").splitlines()
