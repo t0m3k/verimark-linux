@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 11:23:15 +0200
+Subject: [PATCH 04/32] fix(verimark): close_notify on close + GError ownership
+ cleanup
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two production-path bugs surfaced by fprintd integration on Linux:
+
+1. close() never sent the TLS close_notify Alert, so the sensor held
+   the previous session's state. The NEXT handshake then failed with
+   gnutls error -6 ("decryption has failed"), and open() silently
+   downgraded to "cleartext-only mode" (session_active = FALSE) — at
+   which point verify / identify / enroll all return errors → fprintd
+   crash (see #2). Add a best-effort `verimark_session_send_close_notify`
+   call before tearing down the USB interface.
+
+2. The vfuncs used `g_autoptr(GError) error = NULL` then passed `error`
+   to fpi_device_{probe,open,close,verify,identify}_complete, which
+   steals the reference. The autoptr destructor then freed the already-
+   freed GError. fprintd's vfunc-completion callback dereferenced the
+   dangling `error->message` via g_log → strlen → SEGV. Switch all five
+   vfuncs to a plain `GError *` so the steal-then-autoptr-free race
+   goes away.
+
+The autoptr bug was masked in the success paths (error stays NULL) but
+killed fprintd on every session-not-active / TLS-handshake-failed
+error path. Together with #1, the fprintd-side crash was reproducible
+on the second consecutive operation (e.g. `fprintd-enroll` followed by
+`fprintd-verify`).
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 36 +++++++++++++++++++++++----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 497e07f..63368be 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -140,7 +140,8 @@ static void verimark_probe(FpDevice *device)
+      */
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     GUsbDevice *usb = fpi_device_get_usb_device(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — probe_complete steals the GError reference. */
++    GError *error = NULL;
+ 
+     if (!g_usb_device_open(usb, &error)) {
+         fpi_device_probe_complete(device, NULL, NULL, error);
+@@ -261,7 +262,8 @@ static void verimark_open(FpDevice *device)
+     G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     GUsbDevice *usb = fpi_device_get_usb_device(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — open_complete steals the GError reference. */
++    GError *error = NULL;
+ 
+     if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
+         fpi_device_open_complete(device, error);
+@@ -321,12 +323,32 @@ static void verimark_open(FpDevice *device)
+ }
+ 
+ 
++/* Forward declarations needed by verimark_close (which calls io_bind +
++ * send_close_notify) — full definitions live further down. */
++static void verimark_io_bind(FpiDeviceVerimark *self,
++                              VerimarkTransportIoCtx *io_ctx,
++                              VerimarkTransportIO *io);
++
++
+ static void verimark_close(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     GUsbDevice *usb = fpi_device_get_usb_device(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — close_complete steals the GError reference. */
++    GError *error = NULL;
++
++    /* Send the TLS close_notify Alert before tearing down — without it
++     * the sensor holds the session state and the NEXT handshake fails
++     * (observed runtime: gnutls returns -6 on the follow-up open()).
++     * Best-effort : failures here just mean the next open() will trigger
++     * the Python-style "stale TLS state recovery" path. */
++    if (self->session_active && self->transport) {
++        VerimarkTransportIoCtx io_ctx;
++        VerimarkTransportIO io;
++        verimark_io_bind(self, &io_ctx, &io);
++        verimark_session_send_close_notify(&self->session, &io);
++    }
+ 
+     /* Zero out the TLS session keys before releasing the handle. */
+     verimark_session_zero(&self->session);
+@@ -710,7 +732,10 @@ static void verimark_verify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — fpi_device_verify_complete consumes (steals) the
++     * GError. Using g_autoptr here triggers a use-after-free in fprintd
++     * which crashes on the dangling error->message pointer. */
++    GError *error = NULL;
+ 
+     if (!self->session_active) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+@@ -1259,7 +1284,8 @@ static void verimark_identify(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — see note in verimark_verify() above. */
++    GError *error = NULL;
+ 
+     if (!self->session_active) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,

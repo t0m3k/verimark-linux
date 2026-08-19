@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 15:14:33 +0200
+Subject: [PATCH 19/32] =?UTF-8?q?feat(verimark):=20Phase=2010.3.b=20?=
+ =?UTF-8?q?=E2=80=94=20session.call=5Fopcode=20async?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Non-blocking equivalent of verimark_session_call_opcode. Chains
+encrypt → verimark_transceive_async → decrypt → parse-status in a
+GTask, fires the caller's callback from the GMainLoop once the whole
+round-trip is complete.
+
+Owns all its buffers (heap-allocated, freed with the GTask) :
+  - req_record    : encrypted TLS record built in _async
+  - resp_record   : raw response from the IN transfer
+  - plaintext     : decrypted bytes (status + payload)
+
+_finish() returns FALSE on any failure (with *error populated), or
+TRUE + populates *status_out / *payload_out (g_free'd by caller) /
+*payload_len_out. Same status/payload convention as the sync
+_call_opcode (status u16 BE stripped, payload starts at offset 2).
+
+The async path skips the VerimarkTransportIO vtable abstraction —
+that indirection only serves the standalone loopback mock, which
+can't be exercised under a GMainLoop anyway. The new API takes a
+VerimarkUsbHandle directly.
+
+Gated by VERIMARK_HAVE_LIBGUSB so the standalone test build (which
+exercises the sync path via the loopback mock) stays unchanged.
+
+No vfunc uses this yet — Phase 10.3.c (handshake SSM) will be the
+first consumer. The sync verimark_session_call_opcode remains the
+canonical path for all vfuncs in the meantime.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/session.c | 200 +++++++++++++++++++++++++++
+ libfprint/drivers/verimark/session.h |  54 ++++++++
+ 2 files changed, 254 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/session.c b/libfprint/drivers/verimark/session.c
+index b0ca44d..6d237a7 100644
+--- a/libfprint/drivers/verimark/session.c
++++ b/libfprint/drivers/verimark/session.c
+@@ -291,3 +291,203 @@ size_t verimark_session_decrypt_appdata(VerimarkSession *s,
+     s->server_seq++;
+     return plain_len;
+ }
++
++
++/* === Phase 10.3.b — async call_opcode (libgusb-only) ================== */
++
++#ifdef VERIMARK_HAVE_LIBGUSB
++
++#include "transport.h"
++
++/* Per-call context — lives on the heap, freed when the GTask is
++ * finalized. Owns the request record buffer, the response record
++ * buffer, and the decrypted payload buffer that gets returned to the
++ * caller via _finish. */
++typedef struct {
++    VerimarkSession *s;
++    VerimarkUsbHandle *transport;
++    unsigned timeout_ms;
++
++    /* Pre-encrypted request record (encrypted in `_async`, sent by
++     * verimark_transceive_async). */
++    uint8_t  *req_record;
++    size_t    req_record_len;
++
++    /* Raw response record from the IN transfer (decrypted in the
++     * callback). */
++    uint8_t  *resp_record;
++    size_t    resp_record_cap;
++    size_t    resp_record_len;
++
++    /* Decrypted plaintext buffer — returned to the caller via
++     * _finish(). The first 2 bytes are the status u16 BE ; payload
++     * follows. */
++    uint8_t  *plaintext;
++    size_t    plaintext_cap;
++    size_t    plaintext_len;
++
++    /* Parsed result. */
++    uint16_t  status;
++} SessionAsyncCtx;
++
++
++static void
++session_async_ctx_free(gpointer data)
++{
++    SessionAsyncCtx *ctx = data;
++    g_free(ctx->req_record);
++    g_free(ctx->resp_record);
++    /* `plaintext` ownership transferred to the caller via _finish ;
++     * if the GTask is finalized BEFORE the caller calls _finish (e.g.
++     * cancellation), we still own it and must free it. The boolean
++     * `plaintext_returned` tracks transfer of ownership ; encoded as
++     * NULL after _finish takes it. */
++    g_free(ctx->plaintext);
++    g_free(ctx);
++}
++
++
++static void
++session_transceive_done(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    (void)obj;
++    GTask *task = G_TASK(ud);
++    SessionAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    size_t resp_len = 0;
++
++    VerimarkResult tr = verimark_transceive_finish(res, &resp_len, &err);
++    if (tr != VERIMARK_OK) {
++        if (err == NULL)
++            err = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED,
++                              "session_async: transceive failed");
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    ctx->resp_record_len = resp_len;
++
++    /* Decrypt into ctx->plaintext. */
++    size_t plain_len = verimark_session_decrypt_appdata(
++        ctx->s,
++        ctx->resp_record, ctx->resp_record_len,
++        ctx->plaintext, ctx->plaintext_cap);
++    if (plain_len == 0 || plain_len < 2) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "session_async: decrypt failed "
++                                "(record_len=%zu)", ctx->resp_record_len);
++        g_object_unref(task);
++        return;
++    }
++
++    ctx->plaintext_len = plain_len;
++    ctx->status = (uint16_t)((ctx->plaintext[0] << 8) | ctx->plaintext[1]);
++
++    g_task_return_boolean(task, TRUE);
++    g_object_unref(task);
++}
++
++
++void
++verimark_session_call_opcode_async(
++    VerimarkSession *s,
++    VerimarkUsbHandle *transport,
++    unsigned timeout_ms,
++    uint8_t opcode,
++    const uint8_t *payload, size_t payload_len,
++    GCancellable *cancellable,
++    GAsyncReadyCallback callback,
++    gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_session_call_opcode_async);
++
++    if (s == NULL || transport == NULL) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "session_async: NULL session or transport");
++        g_object_unref(task);
++        return;
++    }
++
++    SessionAsyncCtx *ctx = g_new0(SessionAsyncCtx, 1);
++    ctx->s = s;
++    ctx->transport = transport;
++    ctx->timeout_ms = timeout_ms;
++    /* Worst-case request record : 5 hdr + 8 nonce + payload + 16 tag + opcode.
++     * Plus alignment padding (8 B). Up to ~4 KB max for any Tudor opcode. */
++    ctx->req_record = g_malloc0(2048);
++    /* Response buffer : 4 KB (single chunk cap of verimark_transceive_async). */
++    ctx->resp_record_cap = 4096;
++    ctx->resp_record = g_malloc0(ctx->resp_record_cap);
++    /* Plaintext : same cap. */
++    ctx->plaintext_cap = 4096;
++    ctx->plaintext = g_malloc0(ctx->plaintext_cap);
++    g_task_set_task_data(task, ctx, session_async_ctx_free);
++
++    /* Encrypt the appdata into the request record. */
++    ctx->req_record_len = verimark_session_encrypt_appdata(
++        s, opcode, payload, payload_len,
++        /* nonce_explicit = auto from seq */ NULL,
++        ctx->req_record, 2048);
++    if (ctx->req_record_len == 0) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "session_async: encrypt_appdata failed "
++                                "(opcode 0x%02x, payload_len %zu)",
++                                opcode, payload_len);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Fire the async USB transceive (write + read chained). */
++    verimark_transceive_async(transport,
++                              ctx->req_record, ctx->req_record_len,
++                              ctx->resp_record, ctx->resp_record_cap,
++                              timeout_ms,
++                              cancellable,
++                              session_transceive_done, task);
++}
++
++
++gboolean
++verimark_session_call_opcode_finish(
++    GAsyncResult *res,
++    uint16_t *status_out,
++    uint8_t **payload_out,
++    size_t *payload_len_out,
++    GError **error)
++{
++    g_return_val_if_fail(G_IS_TASK(res), FALSE);
++    GTask *task = G_TASK(res);
++    if (!g_task_propagate_boolean(task, error))
++        return FALSE;
++
++    SessionAsyncCtx *ctx = g_task_get_task_data(task);
++    if (ctx == NULL || ctx->plaintext == NULL)
++        return FALSE;
++
++    if (status_out)
++        *status_out = ctx->status;
++
++    /* Transfer ownership of the payload bytes (= plaintext[2..]) to the
++     * caller. We do a fresh copy here so the GTask data destructor can
++     * still free ctx->plaintext uniformly. Cheaper alternative would be
++     * to move the pointer, but the consistency win wins. */
++    if (payload_out) {
++        size_t pl = (ctx->plaintext_len >= 2)
++                      ? (ctx->plaintext_len - 2) : 0;
++        if (pl > 0) {
++            *payload_out = g_memdup2(ctx->plaintext + 2, pl);
++        } else {
++            *payload_out = NULL;
++        }
++        if (payload_len_out)
++            *payload_len_out = pl;
++    } else if (payload_len_out) {
++        *payload_len_out = (ctx->plaintext_len >= 2)
++                             ? (ctx->plaintext_len - 2) : 0;
++    }
++
++    return TRUE;
++}
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
+diff --git a/libfprint/drivers/verimark/session.h b/libfprint/drivers/verimark/session.h
+index d77e88c..5bf634b 100644
+--- a/libfprint/drivers/verimark/session.h
++++ b/libfprint/drivers/verimark/session.h
+@@ -163,6 +163,60 @@ size_t verimark_session_decrypt_appdata(VerimarkSession *s,
+                                          uint8_t *out, size_t out_size);
+ 
+ 
++/* --- Async call_opcode (Phase 10.3.b, libgusb-only) --------------------
++ *
++ * Non-blocking equivalent of verimark_session_call_opcode. Chains
++ * (encrypt → verimark_transceive_async → decrypt → parse status) inside
++ * a GTask, fires `callback` from the GMainLoop once the whole round-trip
++ * is complete (success OR failure OR cancellation).
++ *
++ * The caller does NOT need to keep `payload` alive after the function
++ * returns — the encrypted record is copied into a heap buffer owned by
++ * the GTask. The decrypted response payload is also heap-allocated and
++ * returned to the caller via _finish(); the caller frees it with
++ * g_free.
++ *
++ * `timeout_ms` applies to BOTH the OUT and the IN transfers (each).
++ * `cancellable` may be NULL.
++ *
++ * No vtable abstraction here : the async path skips the
++ * VerimarkTransportIO indirection (only used by the standalone loopback
++ * mock, which can't be exercised under a GMainLoop anyway).
++ */
++#ifdef VERIMARK_HAVE_LIBGUSB
++#include <gio/gio.h>
++
++typedef struct VerimarkUsbHandle VerimarkUsbHandle;
++
++void verimark_session_call_opcode_async(
++    VerimarkSession *s,
++    VerimarkUsbHandle *transport,
++    unsigned timeout_ms,
++    uint8_t opcode,
++    const uint8_t *payload, size_t payload_len,
++    GCancellable *cancellable,
++    GAsyncReadyCallback callback,
++    gpointer user_data);
++
++/**
++ * On success: `*status_out` carries the Tudor status u16, `*payload_out`
++ * is set to a freshly-allocated buffer (caller must g_free), and
++ * `*payload_len_out` is its length. The payload buffer EXCLUDES the
++ * leading status u16 — same convention as the sync `_call_opcode`.
++ *
++ * Returns TRUE on success, FALSE on failure (with `*error` populated
++ * if non-NULL).
++ */
++gboolean verimark_session_call_opcode_finish(
++    GAsyncResult *res,
++    uint16_t *status_out,
++    uint8_t **payload_out,
++    size_t *payload_len_out,
++    GError **error);
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
++
++
+ #ifdef __cplusplus
+ }
+ #endif

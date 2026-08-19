@@ -1,0 +1,4961 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Fri, 5 Jun 2026 23:02:02 +0200
+Subject: [PATCH 01/31] feat(verimark): add Kensington VeriMark DT driver
+ (047d:00f2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Match-on-Chip biometric driver for the Synaptics Tudor sensor that
+ships in the Kensington VeriMark Desktop (USB ID 047d:00f2).
+
+The driver implements probe / open / close end-to-end :
+
+  - probe()  emits the cleartext `0x01 get_device_info` opcode and
+             surfaces the serial.
+  - open()   claims MI_01, runs the init sequence, loads the per-
+             sensor pairing data (sub1) from `~/.config/verimark/
+             sub1-<serial>.bin`, and performs the synchronous TLS-PSK
+             handshake. On success a `VerimarkSession` is stored on
+             the FpiDeviceVerimark instance ; every subsequent
+             AppData opcode is wrapped through it.
+  - close()  zeros the session and releases MI_01.
+  - list()   parses the storage partition table via the cleartext
+             `0x3E get_storage_info` opcode. Template enumeration
+             through the TLS session is the next milestone.
+  - verify / enroll / identify / delete   stubs that return
+                                          NOT_SUPPORTED ; the
+                                          underlying C wrappers for
+                                          0x99 / 0x96 / 0xa3 already
+                                          exist in match.c /
+                                          capture.c / storage.c.
+
+The wire protocol is reverse-engineered statically from
+synaWudfBioUsb132.dll and validated end-to-end against the
+hardware by an upstream Python proof-of-concept ; see the
+companion repository at
+https://github.com/s-celles/verimark-dt-linux for the captures,
+test vectors and yaml-formatted opcode reference.
+
+Cryptographic backend : GnuTLS for HMAC / AES-GCM / ECDSA, nettle
+for the secp256r1 scalar-multiplication (GnuTLS's
+`privkey_import_ecc_raw` refuses NULL x/y, so the public key is
+synthesised from the scalar with `ecc_point_mul_g`). hogweed is
+nettle's ECC sub-library ; gmp is a transitive of nettle for
+arbitrary-precision integers. A new ``tudor_crypto`` driver
+helper carries the four deps so other Synaptics Tudor drivers
+can reuse them.
+
+Build wiring :
+
+  meson.build                                 → add 'verimark' to
+                                                default_drivers + a
+                                                'verimark' :
+                                                ['tudor_crypto']
+                                                entry in
+                                                driver_helper_mapping
+                                                + an `elif i ==
+                                                'tudor_crypto'` branch
+                                                that resolves
+                                                gnutls / nettle /
+                                                hogweed / gmp.
+  libfprint/meson.build                       → register the 11 .c
+                                                files in
+                                                driver_sources and
+                                                add an empty
+                                                ``tudor_crypto``
+                                                entry in
+                                                helper_sources.
+                                                Append
+                                                ``-DVERIMARK_HAVE_
+                                                LIBGUSB=1`` to
+                                                drivers_cflags when
+                                                verimark is in the
+                                                build (gates the
+                                                libgusb backend of
+                                                transport.c).
+
+Caveats documented in the source and to surface in the upstream
+MR description (none are blockers for shipping a Linux-only
+driver) :
+
+  - the sensor is TOFU-locked to its bootstrapping host ; a
+    Linux-bootstrapped sensor cannot be used from Windows without
+    the bootstrap key. No host-side unpair / factory-reset opcode
+    exists (refuted statically + with WinDbg) ; the MR ships a
+    Linux-only driver.
+  - `delete()` returns success on the wire but the firmware-side
+    class-2 (template binary) counter does not always decrement
+    by one ; the libfprint contract (the print is gone from the
+    user's perspective) is honoured.
+  - The sensor's match-on-chip protection prevents reading the
+    template binaries from the host ; this is by design and not
+    a libfprint integration blocker.
+---
+ libfprint/drivers/verimark/capture.c   | 234 ++++++++++++
+ libfprint/drivers/verimark/capture.h   | 166 +++++++++
+ libfprint/drivers/verimark/crypto.c    | 399 ++++++++++++++++++++
+ libfprint/drivers/verimark/crypto.h    | 146 ++++++++
+ libfprint/drivers/verimark/handshake.c | 440 +++++++++++++++++++++++
+ libfprint/drivers/verimark/handshake.h | 115 ++++++
+ libfprint/drivers/verimark/match.c     | 160 +++++++++
+ libfprint/drivers/verimark/match.h     | 132 +++++++
+ libfprint/drivers/verimark/pairing.c   | 139 +++++++
+ libfprint/drivers/verimark/pairing.h   |  83 +++++
+ libfprint/drivers/verimark/proto.c     | 212 +++++++++++
+ libfprint/drivers/verimark/proto.h     | 229 ++++++++++++
+ libfprint/drivers/verimark/session.c   | 293 +++++++++++++++
+ libfprint/drivers/verimark/session.h   | 170 +++++++++
+ libfprint/drivers/verimark/storage.c   | 191 ++++++++++
+ libfprint/drivers/verimark/storage.h   | 149 ++++++++
+ libfprint/drivers/verimark/tls.c       | 236 ++++++++++++
+ libfprint/drivers/verimark/tls.h       | 166 +++++++++
+ libfprint/drivers/verimark/transport.c | 336 +++++++++++++++++
+ libfprint/drivers/verimark/transport.h | 191 ++++++++++
+ libfprint/drivers/verimark/verimark.c  | 479 +++++++++++++++++++++++++
+ libfprint/drivers/verimark/verimark.h  |  22 ++
+ 22 files changed, 4688 insertions(+)
+ create mode 100644 libfprint/drivers/verimark/capture.c
+ create mode 100644 libfprint/drivers/verimark/capture.h
+ create mode 100644 libfprint/drivers/verimark/crypto.c
+ create mode 100644 libfprint/drivers/verimark/crypto.h
+ create mode 100644 libfprint/drivers/verimark/handshake.c
+ create mode 100644 libfprint/drivers/verimark/handshake.h
+ create mode 100644 libfprint/drivers/verimark/match.c
+ create mode 100644 libfprint/drivers/verimark/match.h
+ create mode 100644 libfprint/drivers/verimark/pairing.c
+ create mode 100644 libfprint/drivers/verimark/pairing.h
+ create mode 100644 libfprint/drivers/verimark/proto.c
+ create mode 100644 libfprint/drivers/verimark/proto.h
+ create mode 100644 libfprint/drivers/verimark/session.c
+ create mode 100644 libfprint/drivers/verimark/session.h
+ create mode 100644 libfprint/drivers/verimark/storage.c
+ create mode 100644 libfprint/drivers/verimark/storage.h
+ create mode 100644 libfprint/drivers/verimark/tls.c
+ create mode 100644 libfprint/drivers/verimark/tls.h
+ create mode 100644 libfprint/drivers/verimark/transport.c
+ create mode 100644 libfprint/drivers/verimark/transport.h
+ create mode 100644 libfprint/drivers/verimark/verimark.c
+ create mode 100644 libfprint/drivers/verimark/verimark.h
+
+diff --git a/libfprint/drivers/verimark/capture.c b/libfprint/drivers/verimark/capture.c
+new file mode 100644
+index 0000000..236f98c
+--- /dev/null
++++ b/libfprint/drivers/verimark/capture.c
+@@ -0,0 +1,234 @@
++/*
++ * capture.c — Tudor capture-pipeline opcode wrappers implementation.
++ *
++ * Each wrapper builds the request payload, calls
++ * `verimark_session_call_opcode()`, and parses the response per
++ * docs/opcodes/0x{39,80,81,82}.yaml.
++ */
++
++#include "capture.h"
++
++#include <string.h>
++
++#include "handshake.h"   /* for VerimarkTransportIO definition */
++
++
++static inline uint16_t read_le16(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x39 — capture_config
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_config(VerimarkSession *s,
++                             struct VerimarkTransportIO *io,
++                             const uint8_t params[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN],
++                             uint16_t *status_out)
++{
++    if (!s || !io || !params || !status_out)
++        return false;
++
++    /* Response carries no payload — just the 2-byte status. */
++    uint8_t resp_buf[8];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x39,
++        params, VERIMARK_CAPTURE_CONFIG_PARAMS_LEN,
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x82 [02 07] — get dimensions
++ * ------------------------------------------------------------------------- */
++
++/* Payload for `0x82 sub=[02 07]` : 8 bytes : 00*6 02 07.
++ * Ghidra FUN_180060960 lines 48201-48202 : buffer[7]=2, buffer[8]=7
++ * → payload[6]=2, payload[7]=7.
++ */
++static const uint8_t DIMS_REQ_PAYLOAD[8] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x07,
++};
++
++/* Response layout : 9 × u16 LE starting at offset 12 of the payload
++ * (= offset 14 of the response-complete buffer that includes the
++ * status u16 BE in front, per Ghidra FUN_180060960 line 48207-48224).
++ * Runtime payload is 32 bytes ; we need at least 12 + 9*2 = 30 to
++ * read the dimensions. */
++#define DIMS_RESP_FIELDS_OFFSET 12u
++#define DIMS_RESP_MIN_LEN       (DIMS_RESP_FIELDS_OFFSET + 9u * 2u)  /* 30 */
++
++bool verimark_capture_get_dimensions(VerimarkSession *s,
++                                     struct VerimarkTransportIO *io,
++                                     VerimarkCaptureDimensions *out,
++                                     uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    uint8_t resp_buf[64];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x82,
++        DIMS_REQ_PAYLOAD, sizeof(DIMS_REQ_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;
++    if (payload_len < DIMS_RESP_MIN_LEN || !payload)
++        return false;
++
++    const uint8_t *p = payload + DIMS_RESP_FIELDS_OFFSET;
++    out->width       = read_le16(p +  0);
++    out->height      = read_le16(p +  2);
++    out->pixel_depth = read_le16(p +  4);
++    out->field3      = read_le16(p +  6);
++    out->field4      = read_le16(p +  8);
++    out->field5      = read_le16(p + 10);
++    out->field6      = read_le16(p + 12);
++    out->field7      = read_le16(p + 14);
++    out->field8      = read_le16(p + 16);
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x80 — get_frame (start acquisition)
++ * ------------------------------------------------------------------------- */
++
++/* 16-byte zero payload for the "simple" capture mode (param_3 == 0).
++ * The 24-byte variant (param_3 == 3) is not exposed here ; can be
++ * added when the use-case appears. */
++static const uint8_t GET_FRAME_REQ_PAYLOAD[16] = {0};
++
++bool verimark_capture_get_frame(VerimarkSession *s,
++                                struct VerimarkTransportIO *io,
++                                uint16_t *status_out)
++{
++    if (!s || !io || !status_out)
++        return false;
++
++    uint8_t resp_buf[8];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x80,
++        GET_FRAME_REQ_PAYLOAD, sizeof(GET_FRAME_REQ_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x81 — status_poll
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_status_poll(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint16_t *poll_status_out,
++                                  uint16_t *status_out)
++{
++    if (!s || !io || !poll_status_out || !status_out)
++        return false;
++
++    /* Empty payload — opcode 0x81 alone. */
++    uint8_t resp_buf[8];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x81,
++        NULL, 0,
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    *poll_status_out = 0;
++
++    if (!ok)
++        return false;
++    /* The Tudor framing yields status = u16 BE first, then payload.
++     * For 0x81 the response is sometimes JUST the 2 status bytes
++     * (no payload), in which case the poll value IS the status. The
++     * sensor may also include 0-2 bytes of additional payload (LE
++     * variant of the status). We accept both : if payload_len >= 2,
++     * read the LE u16 ; otherwise, mirror status (which is BE u16). */
++    if (payload_len >= 2) {
++        *poll_status_out = read_le16(payload);
++    } else {
++        *poll_status_out = status;
++    }
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x82 [02 02] — read frame data
++ * ------------------------------------------------------------------------- */
++
++static const uint8_t FRAME_DATA_REQ_PAYLOAD[8] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02,
++};
++
++bool verimark_capture_get_frame_data(VerimarkSession *s,
++                                     struct VerimarkTransportIO *io,
++                                     uint8_t *out_buf,
++                                     size_t out_size,
++                                     size_t *out_image_size,
++                                     uint16_t *status_out)
++{
++    if (!s || !io || !out_buf || !out_image_size || !status_out)
++        return false;
++
++    /* Response buffer must accommodate ~16 KB image + small overhead.
++     * We allocate on the stack ; the libfprint driver will use heap. */
++    static uint8_t resp_buf[16 * 1024 + 256];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    *out_image_size = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x82,
++        FRAME_DATA_REQ_PAYLOAD, sizeof(FRAME_DATA_REQ_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;
++    if (payload_len > out_size)
++        return false;  /* caller buffer too small */
++    if (payload && payload_len)
++        memcpy(out_buf, payload, payload_len);
++    *out_image_size = payload_len;
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/capture.h b/libfprint/drivers/verimark/capture.h
+new file mode 100644
+index 0000000..e4747f3
+--- /dev/null
++++ b/libfprint/drivers/verimark/capture.h
+@@ -0,0 +1,166 @@
++/*
++ * capture.h — Tudor capture-pipeline opcode wrappers (0x39/0x80/0x81/0x82).
++ *
++ * The Synaptics sensor uses a 4-opcode sequence to acquire a
++ * fingerprint image :
++ *   1. 0x39 capture_config    — set acquisition parameters
++ *   2. 0x82 [02 07] get_dims  — fetch sensor frame dimensions (once)
++ *   3. 0x80 get_frame         — start the acquisition (retry on 0xdd)
++ *   4. 0x81 status_poll       — block until frame is ready
++ *   5. 0x82 [02 02] read_data — fetch the captured pixel buffer
++ *
++ * This module exposes one wrapper per opcode. A higher-level
++ * orchestrator that drives the full state machine (with retry on
++ * 0xdd and timeout on "waiting for finger") will live in the
++ * libfprint integration layer (`verimark.c` fpi_ssm) — out of
++ * scope for this module.
++ *
++ * See:
++ *   - docs/opcodes/0x39.yaml (capture_config — 124-byte payload)
++ *   - docs/opcodes/0x80.yaml (get_frame    — 16/24-byte payload)
++ *   - docs/opcodes/0x81.yaml (status_poll  — empty payload)
++ *   - docs/opcodes/0x82.yaml (dims/data    — 8-byte payload, 2 sub-cmds)
++ *   - docs/phase9-capture-pipeline.md      (runtime canonical sequence)
++ */
++
++#ifndef VERIMARK_CAPTURE_H
++#define VERIMARK_CAPTURE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "session.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++struct VerimarkTransportIO;
++
++
++/* ---------------------------------------------------------------------------
++ * 0x39 — capture_config
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_CAPTURE_CONFIG_PARAMS_LEN 124
++
++/**
++ * Send opcode `0x39` with 124 bytes of capture parameters.
++ *
++ * Runtime confirms a payload of 124 zero bytes is accepted by the
++ * sensor (status 0x0000). The exact semantics of the 124 bytes
++ * (6 records of 20 bytes + 4-byte header per Ghidra FUN_1800624c0)
++ * is not yet fully decoded ; for normal operation, pass zeros.
++ */
++bool verimark_capture_config(VerimarkSession *s,
++                             struct VerimarkTransportIO *io,
++                             const uint8_t params[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN],
++                             uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x82 [02 07] — get sensor frame dimensions
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Frame dimensions returned by `0x82 [sub=02 07]`. Decoded from the
++ * 9 × u16 LE fields starting at offset 12 of the response payload.
++ *
++ * Runtime values for the reference VeriMark DT sensor :
++ *   width = 104, height = 104, pixel_depth = 16-bit suspected.
++ * Other fields' semantics remain TBD.
++ */
++typedef struct {
++    uint16_t width;
++    uint16_t height;
++    uint16_t pixel_depth;
++    uint16_t field3;
++    uint16_t field4;
++    uint16_t field5;
++    uint16_t field6;
++    uint16_t field7;
++    uint16_t field8;
++} VerimarkCaptureDimensions;
++
++/**
++ * Send `0x82` with sub-cmd `[02 07]` (8-byte payload `00*6 02 07`)
++ * and parse the 32-byte response. Typically called once at session
++ * initialization to learn the sensor's geometry.
++ */
++bool verimark_capture_get_dimensions(VerimarkSession *s,
++                                     struct VerimarkTransportIO *io,
++                                     VerimarkCaptureDimensions *out,
++                                     uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x80 — get_frame (start acquisition)
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send opcode `0x80` with a 16-byte zero payload to start a frame
++ * acquisition (the "simple" mode = `param_3 == 0`, no extended
++ * options).
++ *
++ * The sensor may reply with status `0xdd` ("frame not ready"), in
++ * which case the caller should poll `0x81` then retry `0x80`. This
++ * helper does NOT do the retry loop ; the caller (fpi_ssm) owns
++ * that policy.
++ */
++bool verimark_capture_get_frame(VerimarkSession *s,
++                                struct VerimarkTransportIO *io,
++                                uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x81 — status_poll
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send opcode `0x81` (no payload, 1 byte total on the wire) and
++ * parse the 2-byte response status (u16 LE).
++ *
++ * `*poll_status_out` carries the raw u16 returned by the sensor.
++ * Known values (Phase 9 step 4.4) :
++ *   - 0x0000  → frame ready (capture completed)
++ *   - 0xcc05  → idle / no frame ready (waiting for finger)
++ *   - 0xdd    → frame not ready yet (retry)
++ *
++ * `*status_out` is the Tudor protocol status (always 0x0000 on
++ * transport success, regardless of poll value).
++ */
++bool verimark_capture_status_poll(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint16_t *poll_status_out,
++                                  uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x82 [02 02] — read frame data
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send `0x82` with sub-cmd `[02 02]` (8-byte payload `00*6 02 02`)
++ * and copy the response payload into `out_buf`. The response can be
++ * up to ~16 KB (`0x3f0e` per Ghidra) when a capture is active ;
++ * shorter (8 bytes of zeros observed) when idle.
++ *
++ * `*out_image_size` is set to the number of bytes actually written
++ * to `out_buf`. If the response is larger than `out_size`, returns
++ * false (callers should allocate at least 16 KB to be safe).
++ */
++bool verimark_capture_get_frame_data(VerimarkSession *s,
++                                     struct VerimarkTransportIO *io,
++                                     uint8_t *out_buf,
++                                     size_t out_size,
++                                     size_t *out_image_size,
++                                     uint16_t *status_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_CAPTURE_H */
+diff --git a/libfprint/drivers/verimark/crypto.c b/libfprint/drivers/verimark/crypto.c
+new file mode 100644
+index 0000000..6e73432
+--- /dev/null
++++ b/libfprint/drivers/verimark/crypto.c
+@@ -0,0 +1,399 @@
++/*
++ * crypto.c — TLS 1.2 primitives via GnuTLS.
++ *
++ * Implements `crypto.h` using GnuTLS 3.6+ public APIs only.
++ * Each primitive is cross-validated against the Python reference via
++ * `tests/test_crypto.c` (vectors in `tests/test_vectors.h`).
++ *
++ * Memory : every function is stack-only (no caller-visible allocations).
++ * Some GnuTLS handles use the slab allocator (transient) and are freed
++ * before return.
++ *
++ * Style note : we explicitly check buffer sizes to avoid implicit truncation,
++ * even when GnuTLS would do it for us. The whole layer is unit-testable
++ * standalone.
++ */
++
++#include "crypto.h"
++
++#include <string.h>
++
++#include <gnutls/gnutls.h>
++#include <gnutls/abstract.h>
++#include <gnutls/crypto.h>
++
++#include <nettle/ecc-curve.h>
++#include <nettle/ecdsa.h>
++#include <gmp.h>
++
++
++/* Compute (x_be, y_be) = k_be * G on secp256r1 using nettle. GnuTLS
++ * `gnutls_privkey_import_ecc_raw` requires both private scalar AND public
++ * coordinates ; this helper synthesizes them from just the scalar.
++ *
++ * Exposed publicly via verimark_ecc_p256_derive_pubkey() — the handshake
++ * orchestrator uses the same primitive to build CKE from an ephemeral
++ * scalar. */
++VerimarkCryptoResult
++verimark_ecc_p256_derive_pubkey(const uint8_t k_be[32],
++                                uint8_t x_be[32],
++                                uint8_t y_be[32])
++{
++    const struct ecc_curve *curve = nettle_get_secp_256r1();
++    struct ecc_scalar k;
++    struct ecc_point  pub;
++    mpz_t k_mpz, x_mpz, y_mpz;
++
++    ecc_scalar_init(&k, curve);
++    ecc_point_init(&pub, curve);
++    mpz_init(k_mpz);
++    mpz_init(x_mpz);
++    mpz_init(y_mpz);
++
++    VerimarkCryptoResult rc = VERIMARK_CRYPTO_OK;
++
++    mpz_import(k_mpz, 32, 1 /* msb-first */, 1, 0 /* native endian */, 0, k_be);
++    if (ecc_scalar_set(&k, k_mpz) == 0) {
++        rc = VERIMARK_CRYPTO_ERR_PARAM;
++        goto out;
++    }
++
++    ecc_point_mul_g(&pub, &k);
++    ecc_point_get(&pub, x_mpz, y_mpz);
++
++    /* Export 32-byte big-endian, zero-padded. */
++    size_t x_count = 0, y_count = 0;
++    memset(x_be, 0, 32);
++    memset(y_be, 0, 32);
++    {
++        uint8_t tmp[32];
++        size_t bytes = (mpz_sizeinbase(x_mpz, 2) + 7) / 8;
++        if (bytes > 32) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++        mpz_export(tmp, &x_count, 1, 1, 0, 0, x_mpz);
++        memcpy(x_be + (32 - x_count), tmp, x_count);
++    }
++    {
++        uint8_t tmp[32];
++        size_t bytes = (mpz_sizeinbase(y_mpz, 2) + 7) / 8;
++        if (bytes > 32) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++        mpz_export(tmp, &y_count, 1, 1, 0, 0, y_mpz);
++        memcpy(y_be + (32 - y_count), tmp, y_count);
++    }
++
++out:
++    mpz_clear(y_mpz);
++    mpz_clear(x_mpz);
++    mpz_clear(k_mpz);
++    ecc_point_clear(&pub);
++    ecc_scalar_clear(&k);
++    return rc;
++}
++
++
++/* ---- TLS 1.2 PRF with HMAC-SHA-384 -----------------------------------------
++ *
++ * Implements RFC 5246 §5 :
++ *   P_SHA384(secret, seed) = HMAC(secret, A(1)||seed) || HMAC(secret, A(2)||seed) || ...
++ *   A(0) = seed
++ *   A(i) = HMAC(secret, A(i-1))
++ *
++ * PRF(secret, label, seed) = P_SHA384(secret, label || seed).
++ *
++ * We compute one HMAC block at a time (48 octets for SHA-384) and stop
++ * once `out_len` octets have been produced.
++ */
++VerimarkCryptoResult
++verimark_prf_sha384(const uint8_t *secret, size_t secret_len,
++                    const uint8_t *label,  size_t label_len,
++                    const uint8_t *seed,   size_t seed_len,
++                    uint8_t *out, size_t out_len)
++{
++    if (!secret || !label || !seed || !out)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++
++    /* label_plus_seed = label || seed (used both as A(0) and as suffix) */
++    /* Allocate on stack — typical sizes are ~80 octets total. */
++    uint8_t lps[256];
++    if (label_len + seed_len > sizeof(lps))
++        return VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL;
++    memcpy(lps, label, label_len);
++    memcpy(lps + label_len, seed, seed_len);
++    size_t lps_len = label_len + seed_len;
++
++    /* A(1) = HMAC(secret, A(0)) = HMAC(secret, label||seed) */
++    uint8_t a[48];  /* SHA-384 = 48 octets */
++    int ret = gnutls_hmac_fast(GNUTLS_MAC_SHA384,
++                                secret, secret_len,
++                                lps, lps_len, a);
++    if (ret < 0)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++    /* Inputs to HMAC for each block : A(i) || (label||seed) */
++    uint8_t block_in[48 + 256];
++    if (48 + lps_len > sizeof(block_in))
++        return VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL;
++
++    size_t written = 0;
++    while (written < out_len) {
++        memcpy(block_in, a, 48);
++        memcpy(block_in + 48, lps, lps_len);
++
++        uint8_t block[48];
++        ret = gnutls_hmac_fast(GNUTLS_MAC_SHA384,
++                               secret, secret_len,
++                               block_in, 48 + lps_len, block);
++        if (ret < 0)
++            return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++        size_t take = (out_len - written < 48) ? (out_len - written) : 48;
++        memcpy(out + written, block, take);
++        written += take;
++
++        if (written < out_len) {
++            /* A(i+1) = HMAC(secret, A(i)) */
++            ret = gnutls_hmac_fast(GNUTLS_MAC_SHA384,
++                                   secret, secret_len,
++                                   a, 48, a);
++            if (ret < 0)
++                return VERIMARK_CRYPTO_ERR_GNUTLS;
++        }
++    }
++    return VERIMARK_CRYPTO_OK;
++}
++
++
++/* ---- AES-256-GCM encrypt --------------------------------------------------- */
++
++VerimarkCryptoResult
++verimark_aes256_gcm_encrypt(const uint8_t key[32],
++                            const uint8_t nonce[12],
++                            const uint8_t *aad, size_t aad_len,
++                            const uint8_t *plaintext, size_t plaintext_len,
++                            uint8_t *out, size_t out_size)
++{
++    if (!key || !nonce || !aad || !out)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++    if (out_size < plaintext_len + 16)
++        return VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL;
++
++    gnutls_aead_cipher_hd_t hd = NULL;
++    gnutls_datum_t kd = { (uint8_t *)key, 32 };
++    int ret = gnutls_aead_cipher_init(&hd, GNUTLS_CIPHER_AES_256_GCM, &kd);
++    if (ret < 0)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++    size_t out_len = out_size;
++    ret = gnutls_aead_cipher_encrypt(hd,
++                                      nonce, 12,
++                                      aad, aad_len,
++                                      16,                 /* tag size */
++                                      plaintext, plaintext_len,
++                                      out, &out_len);
++    gnutls_aead_cipher_deinit(hd);
++    if (ret < 0)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++    if (out_len != plaintext_len + 16)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++    return VERIMARK_CRYPTO_OK;
++}
++
++
++VerimarkCryptoResult
++verimark_aes256_gcm_decrypt(const uint8_t key[32],
++                            const uint8_t nonce[12],
++                            const uint8_t *aad, size_t aad_len,
++                            const uint8_t *ct_and_tag, size_t ct_and_tag_len,
++                            uint8_t *out, size_t out_size)
++{
++    if (!key || !nonce || !aad || !ct_and_tag || !out)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++    if (ct_and_tag_len < 16)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++    size_t plaintext_len = ct_and_tag_len - 16;
++    if (out_size < plaintext_len)
++        return VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL;
++
++    gnutls_aead_cipher_hd_t hd = NULL;
++    gnutls_datum_t kd = { (uint8_t *)key, 32 };
++    int ret = gnutls_aead_cipher_init(&hd, GNUTLS_CIPHER_AES_256_GCM, &kd);
++    if (ret < 0)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++    size_t out_len = out_size;
++    ret = gnutls_aead_cipher_decrypt(hd,
++                                      nonce, 12,
++                                      aad, aad_len,
++                                      16,                 /* tag size */
++                                      ct_and_tag, ct_and_tag_len,
++                                      out, &out_len);
++    gnutls_aead_cipher_deinit(hd);
++    if (ret == GNUTLS_E_DECRYPTION_FAILED)
++        return VERIMARK_CRYPTO_ERR_VERIFY_FAILED;
++    if (ret < 0)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++    if (out_len != plaintext_len)
++        return VERIMARK_CRYPTO_ERR_GNUTLS;
++    return VERIMARK_CRYPTO_OK;
++}
++
++
++/* ---- ECDH P-256 ------------------------------------------------------------ */
++
++VerimarkCryptoResult
++verimark_ecdh_p256(const uint8_t priv_be[32],
++                   const uint8_t peer_pub_uncompressed[65],
++                   uint8_t shared_x_be[32])
++{
++    if (!priv_be || !peer_pub_uncompressed || !shared_x_be)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++    if (peer_pub_uncompressed[0] != 0x04)
++        return VERIMARK_CRYPTO_ERR_PARAM;   /* must be uncompressed */
++
++    VerimarkCryptoResult rc = VERIMARK_CRYPTO_OK;
++
++    gnutls_privkey_t priv = NULL;
++    gnutls_pubkey_t  peer = NULL;
++    int ret = gnutls_privkey_init(&priv);
++    if (ret < 0) return VERIMARK_CRYPTO_ERR_GNUTLS;
++    ret = gnutls_pubkey_init(&peer);
++    if (ret < 0) { gnutls_privkey_deinit(priv); return VERIMARK_CRYPTO_ERR_GNUTLS; }
++
++    /* Import own private key. GnuTLS expects (curve, x, y, k) where x/y is the
++     * pubkey coordinates. We need to derive x, y from k first OR pass NULL and
++     * let GnuTLS compute. The 3.8 API needs all 4 datums.
++     *
++     * Workaround : recompute (x, y) by importing as gnutls_pubkey_import_ecc_raw
++     * doesn't help (we want priv, not pub). The simplest is to use the
++     * `_pubkey_compute_shared_secret` style — but that doesn't exist.
++     *
++     * Cleanest path : use gnutls_privkey_import_ecc_raw with NULL x/y. Test
++     * empirically — if NULL is rejected, fall back to deriving via a temp
++     * full key roundtrip.
++     */
++    uint8_t pub_x[32], pub_y[32];
++    rc = verimark_ecc_p256_derive_pubkey(priv_be, pub_x, pub_y);
++    if (rc != VERIMARK_CRYPTO_OK) goto out;
++
++    gnutls_datum_t k_datum = { (uint8_t *)priv_be, 32 };
++    gnutls_datum_t x_datum = { pub_x, 32 };
++    gnutls_datum_t y_datum = { pub_y, 32 };
++    ret = gnutls_privkey_import_ecc_raw(priv, GNUTLS_ECC_CURVE_SECP256R1,
++                                         &x_datum, &y_datum, &k_datum);
++    if (ret < 0) {
++        rc = VERIMARK_CRYPTO_ERR_GNUTLS;
++        goto out;
++    }
++
++    /* Peer pubkey from uncompressed `04 || X || Y` */
++    gnutls_datum_t peer_x = { (uint8_t *)peer_pub_uncompressed + 1, 32 };
++    gnutls_datum_t peer_y = { (uint8_t *)peer_pub_uncompressed + 33, 32 };
++    ret = gnutls_pubkey_import_ecc_raw(peer, GNUTLS_ECC_CURVE_SECP256R1,
++                                        &peer_x, &peer_y);
++    if (ret < 0) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++
++    /* Derive shared secret. The output is the X coordinate of (priv * peer_pub). */
++    gnutls_datum_t shared = { NULL, 0 };
++    ret = gnutls_privkey_derive_secret(priv, peer, NULL, &shared, 0);
++    if (ret < 0) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++    if (shared.size != 32) {
++        gnutls_free(shared.data);
++        rc = VERIMARK_CRYPTO_ERR_GNUTLS;
++        goto out;
++    }
++    memcpy(shared_x_be, shared.data, 32);
++    gnutls_free(shared.data);
++
++out:
++    if (peer) gnutls_pubkey_deinit(peer);
++    if (priv) gnutls_privkey_deinit(priv);
++    return rc;
++}
++
++
++/* ---- ECDSA P-256 / SHA-256 — verify --------------------------------------- */
++
++VerimarkCryptoResult
++verimark_ecdsa_p256_sha256_verify(const uint8_t pub_uncompressed[65],
++                                  const uint8_t *message, size_t message_len,
++                                  const uint8_t *sig_der, size_t sig_der_len)
++{
++    if (!pub_uncompressed || !message || !sig_der)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++    if (pub_uncompressed[0] != 0x04)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++
++    VerimarkCryptoResult rc = VERIMARK_CRYPTO_OK;
++    gnutls_pubkey_t pub = NULL;
++    int ret = gnutls_pubkey_init(&pub);
++    if (ret < 0) return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++    gnutls_datum_t x = { (uint8_t *)pub_uncompressed + 1, 32 };
++    gnutls_datum_t y = { (uint8_t *)pub_uncompressed + 33, 32 };
++    ret = gnutls_pubkey_import_ecc_raw(pub, GNUTLS_ECC_CURVE_SECP256R1, &x, &y);
++    if (ret < 0) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++
++    gnutls_datum_t msg = { (uint8_t *)message, message_len };
++    gnutls_datum_t sig = { (uint8_t *)sig_der, sig_der_len };
++    ret = gnutls_pubkey_verify_data2(pub, GNUTLS_SIGN_ECDSA_SHA256, 0,
++                                      &msg, &sig);
++    if (ret == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
++        rc = VERIMARK_CRYPTO_ERR_VERIFY_FAILED;
++        goto out;
++    }
++    if (ret < 0) {
++        rc = VERIMARK_CRYPTO_ERR_GNUTLS;
++        goto out;
++    }
++
++out:
++    if (pub) gnutls_pubkey_deinit(pub);
++    return rc;
++}
++
++
++/* ---- ECDSA P-256 / SHA-256 — sign ----------------------------------------- */
++
++VerimarkCryptoResult
++verimark_ecdsa_p256_sha256_sign(const uint8_t priv_be[32],
++                                const uint8_t *message, size_t message_len,
++                                uint8_t *sig_der, size_t sig_der_size,
++                                size_t *sig_der_len)
++{
++    if (!priv_be || !message || !sig_der || !sig_der_len)
++        return VERIMARK_CRYPTO_ERR_PARAM;
++
++    VerimarkCryptoResult rc = VERIMARK_CRYPTO_OK;
++    gnutls_privkey_t priv = NULL;
++    int ret = gnutls_privkey_init(&priv);
++    if (ret < 0) return VERIMARK_CRYPTO_ERR_GNUTLS;
++
++    uint8_t pub_x[32], pub_y[32];
++    rc = verimark_ecc_p256_derive_pubkey(priv_be, pub_x, pub_y);
++    if (rc != VERIMARK_CRYPTO_OK) goto out;
++
++    gnutls_datum_t k_datum = { (uint8_t *)priv_be, 32 };
++    gnutls_datum_t x_datum = { pub_x, 32 };
++    gnutls_datum_t y_datum = { pub_y, 32 };
++    ret = gnutls_privkey_import_ecc_raw(priv, GNUTLS_ECC_CURVE_SECP256R1,
++                                         &x_datum, &y_datum, &k_datum);
++    if (ret < 0) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++
++    gnutls_datum_t msg = { (uint8_t *)message, message_len };
++    gnutls_datum_t sig = { NULL, 0 };
++    ret = gnutls_privkey_sign_data2(priv, GNUTLS_SIGN_ECDSA_SHA256, 0,
++                                     &msg, &sig);
++    if (ret < 0) { rc = VERIMARK_CRYPTO_ERR_GNUTLS; goto out; }
++
++    if (sig.size > sig_der_size) {
++        gnutls_free(sig.data);
++        rc = VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL;
++        goto out;
++    }
++    memcpy(sig_der, sig.data, sig.size);
++    *sig_der_len = sig.size;
++    gnutls_free(sig.data);
++
++out:
++    if (priv) gnutls_privkey_deinit(priv);
++    return rc;
++}
+diff --git a/libfprint/drivers/verimark/crypto.h b/libfprint/drivers/verimark/crypto.h
+new file mode 100644
+index 0000000..2395702
+--- /dev/null
++++ b/libfprint/drivers/verimark/crypto.h
+@@ -0,0 +1,146 @@
++/*
++ * crypto.h — TLS 1.2 primitives for the VeriMark/Synaptics driver.
++ *
++ * Implements (via GnuTLS) the exact cryptographic primitives reverse-
++ * engineered from synaWudfBioUsb132.dll during Phase 5 :
++ *
++ *   - TLS 1.2 PRF with HMAC-SHA-384 (used for master_secret, key_block,
++ *     verify_data).
++ *   - AES-256-GCM AEAD (TLS 1.2 record layer encrypt/decrypt).
++ *   - ECDH on NIST P-256 / secp256r1 (premaster derivation).
++ *   - ECDSA-P256 / SHA-256 sign and verify (CertVerify message).
++ *
++ * Synaptics quirks already encoded by the caller :
++ *   - master_secret seed = client_random || server_random (= RFC)
++ *   - key_block     seed = client_random || server_random (≠ RFC, see
++ *     docs/phase5-tls-psk-linux.md § "KDF Synaptics identifiée")
++ *   - verify_data transcript hash = SHA-256, NOT SHA-384 of the cipher.
++ *   - CertVerify signature       = SHA-256 ECDSA.
++ *
++ * These are validated against the reference Python implementation
++ * (`tools/tls_psk.py` + `tools/verimark_synaptics_handshake.py`) via
++ * cross-language test vectors in `tests/test_vectors.h`.
++ *
++ * Style : opaque returns, no GError dependency (kept layer-clean so the
++ * lib can be unit-tested standalone). Errors return a non-zero result.
++ */
++
++#ifndef VERIMARK_CRYPTO_H
++#define VERIMARK_CRYPTO_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++typedef enum {
++    VERIMARK_CRYPTO_OK = 0,
++    VERIMARK_CRYPTO_ERR_PARAM = -1,        /* bad pointer / size mismatch */
++    VERIMARK_CRYPTO_ERR_GNUTLS = -2,       /* GnuTLS call failed */
++    VERIMARK_CRYPTO_ERR_BUFFER_TOO_SMALL = -3,
++    VERIMARK_CRYPTO_ERR_VERIFY_FAILED = -4, /* ECDSA verify or GCM tag */
++} VerimarkCryptoResult;
++
++
++/* ------- TLS 1.2 PRF with HMAC-SHA-384 -------------------------------------
++ *
++ * out = P_SHA384(secret, label || seed), truncated to out_len bytes.
++ *
++ * Caller must allocate `out_len` bytes in `out`.
++ */
++VerimarkCryptoResult
++verimark_prf_sha384(const uint8_t *secret, size_t secret_len,
++                    const uint8_t *label,  size_t label_len,
++                    const uint8_t *seed,   size_t seed_len,
++                    uint8_t *out, size_t out_len);
++
++
++/* ------- AES-256-GCM AEAD (TLS 1.2 record layer) ---------------------------
++ *
++ * Both encrypt() and decrypt() expect a 12-byte nonce composed as
++ * `fixed_iv (4 octets) || nonce_explicit (8 octets)` and a 13-byte AAD
++ * `seq_num:u64 BE || content_type:u8 || version:u16 BE || plaintext_len:u16 BE`.
++ *
++ * `out` for encrypt receives `ciphertext || tag` (plaintext_len + 16 octets).
++ * `out` for decrypt receives the plaintext (in_len - 16 octets).
++ */
++VerimarkCryptoResult
++verimark_aes256_gcm_encrypt(const uint8_t key[32],
++                            const uint8_t nonce[12],
++                            const uint8_t *aad, size_t aad_len,
++                            const uint8_t *plaintext, size_t plaintext_len,
++                            uint8_t *out, size_t out_size);
++
++VerimarkCryptoResult
++verimark_aes256_gcm_decrypt(const uint8_t key[32],
++                            const uint8_t nonce[12],
++                            const uint8_t *aad, size_t aad_len,
++                            const uint8_t *ct_and_tag, size_t ct_and_tag_len,
++                            uint8_t *out, size_t out_size);
++
++
++/* ------- ECDH P-256 utility : derive pubkey from private scalar ----------
++ *
++ * Computes (pub_x_be, pub_y_be) = k * G on secp256r1 where G is the curve
++ * generator. Used by the handshake orchestrator to build the CKE message
++ * from a freshly generated ephemeral scalar.
++ */
++VerimarkCryptoResult
++verimark_ecc_p256_derive_pubkey(const uint8_t priv_be[32],
++                                uint8_t pub_x_be[32],
++                                uint8_t pub_y_be[32]);
++
++
++/* ------- ECDH P-256 (secp256r1) --------------------------------------------
++ *
++ * Inputs :
++ *   - priv_be (32 octets) : own private scalar in big-endian.
++ *   - peer_pub_uncompressed (65 octets) : `04 || X || Y`, both big-endian.
++ *
++ * Output :
++ *   - shared_x_be (32 octets) : X coordinate of the shared point, big-endian.
++ *     This is the "premaster_secret" in TLS terminology.
++ */
++VerimarkCryptoResult
++verimark_ecdh_p256(const uint8_t priv_be[32],
++                   const uint8_t peer_pub_uncompressed[65],
++                   uint8_t shared_x_be[32]);
++
++
++/* ------- ECDSA P-256 / SHA-256 signature verify ----------------------------
++ *
++ * `pub_uncompressed` : 65 octets `04 || X || Y` (big-endian).
++ * `sig_der` : DER-encoded ECDSA signature (typically 70..72 octets).
++ *
++ * Returns VERIMARK_CRYPTO_OK if the signature is valid for the message
++ * under the given pubkey, VERIMARK_CRYPTO_ERR_VERIFY_FAILED otherwise.
++ */
++VerimarkCryptoResult
++verimark_ecdsa_p256_sha256_verify(const uint8_t pub_uncompressed[65],
++                                  const uint8_t *message, size_t message_len,
++                                  const uint8_t *sig_der, size_t sig_der_len);
++
++
++/* ------- ECDSA P-256 / SHA-256 signature sign ------------------------------
++ *
++ * Produces a DER-encoded ECDSA signature over `message` using `priv_be`.
++ * The DER output length varies (70..72 octets typically) ; the actual
++ * length is written to `*sig_der_len`.
++ *
++ * Caller must provide at least 80 bytes in `sig_der` to be safe.
++ */
++VerimarkCryptoResult
++verimark_ecdsa_p256_sha256_sign(const uint8_t priv_be[32],
++                                const uint8_t *message, size_t message_len,
++                                uint8_t *sig_der, size_t sig_der_size,
++                                size_t *sig_der_len);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_CRYPTO_H */
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+new file mode 100644
+index 0000000..b7bdaee
+--- /dev/null
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -0,0 +1,440 @@
++/*
++ * handshake.c — TLS 1.2 Synaptics handshake orchestrator.
++ *
++ * Composes pairing + crypto + tls + session. Blocking I/O via the
++ * caller-provided VerimarkTransportIO vtable.
++ */
++
++#define _GNU_SOURCE   /* for getrandom on Linux */
++
++#include "handshake.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#if defined(__linux__)
++#include <sys/random.h>
++#endif
++
++#include <gnutls/crypto.h>
++
++#include "crypto.h"
++#include "tls.h"
++
++
++/* ---- Internal helpers --------------------------------------------------- */
++
++static bool get_random(uint8_t *out, size_t len)
++{
++#if defined(__linux__)
++    /* Try getrandom() first ; fall back to /dev/urandom if not available. */
++    ssize_t r = getrandom(out, len, 0);
++    if (r == (ssize_t)len) return true;
++#endif
++    FILE *f = fopen("/dev/urandom", "rb");
++    if (!f) return false;
++    size_t r2 = fread(out, 1, len, f);
++    fclose(f);
++    return r2 == len;
++}
++
++
++static inline VerimarkHandshakeResult fail(VerimarkSession *s,
++                                            VerimarkHandshakeResult err)
++{
++    if (s) verimark_session_zero(s);
++    return err;
++}
++
++
++/* Holds buffers used by perform(); kept off the stack to avoid huge stack frames. */
++typedef struct {
++    uint8_t ch_record[80];
++    uint8_t sh_record[256];           /* ServerHello typically ~66 octets */
++    size_t  sh_record_len;
++    uint8_t cert_body[408];
++    uint8_t cke_body[65];
++    uint8_t cv_body[80];              /* sig is 70..72 octets */
++    size_t  cv_body_len;
++    uint8_t cert_hs[412];             /* cert_body + 4 hdr */
++    uint8_t cke_hs[69];               /* cke_body + 4 hdr */
++    uint8_t cv_hs[84];                /* cv_body + 4 hdr */
++    uint8_t flight_record[800];       /* Cert+CKE+CV record */
++    uint8_t ccs_record[16];
++    uint8_t fin_plain[16];            /* Finished plaintext = HS hdr + verify_data */
++    uint8_t fin_record[64];
++    uint8_t flight[1024];             /* concatenated flight to send */
++    uint8_t server_response[256];     /* Server CCS + Server Finished */
++    size_t  server_response_len;
++    /* Crypto outputs */
++    uint8_t premaster[32];
++    uint8_t master_secret[48];
++    uint8_t key_block[72];
++    uint8_t verify_data[12];
++    uint8_t sig_der[80];
++    size_t  sig_der_len;
++    /* Transcript buffer (large, ~700 octets max) */
++    uint8_t transcript[2048];
++    size_t  transcript_len;
++} HandshakeBufs;
++
++
++VerimarkHandshakeResult
++verimark_handshake_perform(VerimarkTransportIO *io,
++                            const VerimarkPairingData *pairing,
++                            const VerimarkHandshakeReproducibleParams *repro_or_null,
++                            VerimarkSession *session_out)
++{
++    if (!io || !io->write || !io->read || !pairing || !session_out)
++        return VERIMARK_HANDSHAKE_ERR_PARAM;
++
++    verimark_session_zero(session_out);
++
++    HandshakeBufs *b = (HandshakeBufs *)calloc(1, sizeof(HandshakeBufs));
++    if (!b) return VERIMARK_HANDSHAKE_ERR_CRYPTO;
++
++    VerimarkHandshakeResult result = VERIMARK_HANDSHAKE_OK;
++    uint8_t client_random[32];
++    uint8_t eph_priv_be[32];
++    uint8_t server_random[32];
++    uint16_t cipher = 0;
++
++    /* ---- 1. Randoms (or reproducible) ---- */
++    if (repro_or_null) {
++        memcpy(client_random, repro_or_null->client_random, 32);
++        memcpy(eph_priv_be, repro_or_null->eph_priv_be, 32);
++    } else {
++        if (!get_random(client_random, 32) || !get_random(eph_priv_be, 32)) {
++            result = VERIMARK_HANDSHAKE_ERR_CRYPTO;
++            goto out;
++        }
++    }
++
++    /* ---- 2. ClientHello ---- */
++    size_t ch_n = verimark_tls_build_client_hello(client_random,
++                                                   b->ch_record, sizeof(b->ch_record));
++    if (ch_n == 0) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++    if (!io->write(io->ctx, b->ch_record, ch_n, /*is_handshake*/ true)) {
++        result = VERIMARK_HANDSHAKE_ERR_WRITE;
++        goto out;
++    }
++    if (!io->read(io->ctx, b->sh_record, sizeof(b->sh_record), &b->sh_record_len)) {
++        result = VERIMARK_HANDSHAKE_ERR_READ;
++        goto out;
++    }
++
++    /* ---- 3. Parse ServerHello ---- */
++    {
++        uint8_t ct = 0;
++        uint16_t ver = 0;
++        const uint8_t *body = NULL;
++        size_t body_len = 0;
++        if (!verimark_tls_parse_record(b->sh_record, b->sh_record_len,
++                                        &ct, &ver, &body, &body_len)) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++            goto out;
++        }
++        if (ct == VERIMARK_CT_ALERT) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_ALERT;
++            goto out;
++        }
++        if (ct != VERIMARK_CT_HANDSHAKE || body_len < 4 + 38 ||
++            body[0] != VERIMARK_HS_SERVER_HELLO) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++            goto out;
++        }
++        /* skip 4-byte HS header */
++        const uint8_t *hs_body = body + 4;
++        size_t hs_body_len = body_len - 4;
++        if (!verimark_tls_parse_server_hello(hs_body, hs_body_len,
++                                              server_random, &cipher)) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_HELLO;
++            goto out;
++        }
++        /* Only accept the Synaptics-supported cipher 0xc02e for now. */
++        if (cipher != 0xc02e) {
++            result = VERIMARK_HANDSHAKE_ERR_CIPHER;
++            goto out;
++        }
++    }
++
++    /* ---- 4. Build Cert + CKE + CV ---- */
++    if (verimark_tls_build_certificate_body(pairing->client_cert,
++                                             b->cert_body, sizeof(b->cert_body)) != 408) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    size_t cert_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CERTIFICATE,
++                                                         b->cert_body, 408,
++                                                         b->cert_hs, sizeof(b->cert_hs));
++    if (cert_hs_n != 412) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* Derive eph_pub from eph_priv via crypto layer : we don't have a direct
++     * helper, but verimark_ecdh_p256 implicitly does the scalar multiplication.
++     * Instead we use a small trick : compute the ECDH between eph_priv and the
++     * generator G... no, simpler : ask the crypto layer to sign with the priv,
++     * which forces the pubkey to be derived as a side effect. But we need the
++     * pubkey bytes here.
++     *
++     * Easier : use the same derive_pubkey helper that the crypto layer uses
++     * internally — but it's static. So we duplicate the call here via nettle.
++     *
++     * Cleanest : extract derive_pubkey_from_scalar() to the crypto header
++     * later. For now, abuse ECDH to derive the pubkey : eph_pub = eph_priv * G
++     * which we can get via a hack — call ECDH with the secp256r1 generator.
++     *
++     * Actually the cleanest is to add a small helper in crypto.
++     * For Phase 7.3.a, we add the call directly via nettle below.
++     */
++    {
++        uint8_t pub_x[32], pub_y[32];
++        if (verimark_ecc_p256_derive_pubkey(eph_priv_be, pub_x, pub_y)
++              != VERIMARK_CRYPTO_OK) {
++            result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++        }
++        uint8_t eph_pub_uncompressed[65];
++        eph_pub_uncompressed[0] = 0x04;
++        memcpy(eph_pub_uncompressed + 1, pub_x, 32);
++        memcpy(eph_pub_uncompressed + 33, pub_y, 32);
++        if (verimark_tls_build_cke_body(eph_pub_uncompressed, b->cke_body,
++                                         sizeof(b->cke_body)) != 65) {
++            result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++        }
++    }
++    size_t cke_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CLIENT_KEY_EXCHANGE,
++                                                        b->cke_body, 65,
++                                                        b->cke_hs, sizeof(b->cke_hs));
++    if (cke_hs_n != 69) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* Transcript before CertVerify = ch_body || sh_body || cert_hs || cke_hs. */
++    b->transcript_len = 0;
++    /* ch_body : everything after the 5-byte record header (75 octets). */
++    memcpy(b->transcript + b->transcript_len, b->ch_record + 5, ch_n - 5);
++    b->transcript_len += ch_n - 5;
++    /* sh_body : likewise. */
++    memcpy(b->transcript + b->transcript_len, b->sh_record + 5, b->sh_record_len - 5);
++    b->transcript_len += b->sh_record_len - 5;
++    memcpy(b->transcript + b->transcript_len, b->cert_hs, cert_hs_n);
++    b->transcript_len += cert_hs_n;
++    memcpy(b->transcript + b->transcript_len, b->cke_hs, cke_hs_n);
++    b->transcript_len += cke_hs_n;
++
++    /* Sign transcript with ECDSA P-256 / SHA-256 (Synaptics quirk). */
++    if (verimark_ecdsa_p256_sha256_sign(pairing->client_priv_be,
++                                         b->transcript, b->transcript_len,
++                                         b->sig_der, sizeof(b->sig_der),
++                                         &b->sig_der_len) != VERIMARK_CRYPTO_OK) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    if (verimark_tls_build_cv_body(b->sig_der, b->sig_der_len,
++                                    b->cv_body, sizeof(b->cv_body)) != b->sig_der_len) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    b->cv_body_len = b->sig_der_len;
++    size_t cv_hs_n = verimark_tls_encode_handshake_msg(VERIMARK_HS_CERTIFICATE_VERIFY,
++                                                       b->cv_body, b->cv_body_len,
++                                                       b->cv_hs, sizeof(b->cv_hs));
++    if (cv_hs_n == 0) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* ---- 5. Premaster + MS + KB (Synaptics CR||SR for both) ---- */
++    if (verimark_ecdh_p256(eph_priv_be, pairing->server_pub_uncompressed,
++                            b->premaster) != VERIMARK_CRYPTO_OK) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    uint8_t seed[64];
++    memcpy(seed, client_random, 32);
++    memcpy(seed + 32, server_random, 32);
++    if (verimark_prf_sha384(b->premaster, 32,
++                             (const uint8_t *)"master secret", 13,
++                             seed, 64,
++                             b->master_secret, 48) != VERIMARK_CRYPTO_OK) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    /* SYNAPTICS QUIRK : key_block seed = CR||SR (RFC = SR||CR). */
++    if (verimark_prf_sha384(b->master_secret, 48,
++                             (const uint8_t *)"key expansion", 13,
++                             seed, 64,
++                             b->key_block, 72) != VERIMARK_CRYPTO_OK) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    if (!verimark_session_init_from_key_block(session_out, b->key_block)) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++
++    /* ---- 6. Build Finished + flight ---- */
++    /* Transcript through CV (Synaptics quirk : verify_data hash = SHA-256). */
++    memcpy(b->transcript + b->transcript_len, b->cv_hs, cv_hs_n);
++    b->transcript_len += cv_hs_n;
++    /* SYNAPTICS QUIRK : verify_data transcript hash = SHA-256 (not SHA-384
++     * of the cipher), PRF = SHA-384. Cf. docs/phase5-tls-psk-linux.md. */
++    {
++        uint8_t h[32];
++        if (gnutls_hash_fast(GNUTLS_DIG_SHA256,
++                             b->transcript, b->transcript_len, h) < 0) {
++            result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++        }
++        if (verimark_prf_sha384(b->master_secret, 48,
++                                 (const uint8_t *)"client finished", 15,
++                                 h, 32,
++                                 b->verify_data, 12) != VERIMARK_CRYPTO_OK) {
++            result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++        }
++    }
++    size_t fin_plain_n = verimark_tls_build_finished_body(b->verify_data, 12,
++                                                          b->fin_plain,
++                                                          sizeof(b->fin_plain));
++    if (fin_plain_n != 16) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* Encrypt Finished with client_write_key, seq=0, ct=HANDSHAKE. */
++    uint8_t fin_nonce_explicit[8];
++    if (!get_random(fin_nonce_explicit, 8)) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    uint8_t fin_full_nonce[12];
++    memcpy(fin_full_nonce, session_out->client_write_iv, 4);
++    memcpy(fin_full_nonce + 4, fin_nonce_explicit, 8);
++    uint8_t fin_aad[13];
++    verimark_tls_build_aad_gcm(0, VERIMARK_CT_HANDSHAKE,
++                                VERIMARK_TLS_VERSION, (uint16_t)fin_plain_n,
++                                fin_aad, sizeof(fin_aad));
++    uint8_t fin_ct_tag[32];
++    if (verimark_aes256_gcm_encrypt(session_out->client_write_key, fin_full_nonce,
++                                     fin_aad, 13,
++                                     b->fin_plain, fin_plain_n,
++                                     fin_ct_tag, sizeof(fin_ct_tag)) != VERIMARK_CRYPTO_OK) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    /* Wrap Finished as record. */
++    uint8_t fin_body[8 + 32];
++    memcpy(fin_body, fin_nonce_explicit, 8);
++    memcpy(fin_body + 8, fin_ct_tag, fin_plain_n + 16);
++    size_t fin_record_n = verimark_tls_encode_record(VERIMARK_CT_HANDSHAKE,
++                                                     fin_body, 8 + fin_plain_n + 16,
++                                                     b->fin_record,
++                                                     sizeof(b->fin_record));
++    if (fin_record_n == 0) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* Cert+CKE+CV in one HS record. */
++    uint8_t hs_stream[1024];
++    size_t hs_stream_n = 0;
++    memcpy(hs_stream + hs_stream_n, b->cert_hs, cert_hs_n); hs_stream_n += cert_hs_n;
++    memcpy(hs_stream + hs_stream_n, b->cke_hs, cke_hs_n);   hs_stream_n += cke_hs_n;
++    memcpy(hs_stream + hs_stream_n, b->cv_hs, cv_hs_n);     hs_stream_n += cv_hs_n;
++    size_t flight_record_n = verimark_tls_encode_record(VERIMARK_CT_HANDSHAKE,
++                                                        hs_stream, hs_stream_n,
++                                                        b->flight_record,
++                                                        sizeof(b->flight_record));
++    if (flight_record_n == 0) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* CCS record. */
++    size_t ccs_record_n = verimark_tls_encode_record(VERIMARK_CT_CCS,
++                                                     (const uint8_t *)"\x01", 1,
++                                                     b->ccs_record,
++                                                     sizeof(b->ccs_record));
++    if (ccs_record_n != 6) { result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out; }
++
++    /* Concatenate flight + CCS + Finished. */
++    size_t flight_total = 0;
++    if (flight_record_n + ccs_record_n + fin_record_n > sizeof(b->flight)) {
++        result = VERIMARK_HANDSHAKE_ERR_CRYPTO; goto out;
++    }
++    memcpy(b->flight + flight_total, b->flight_record, flight_record_n);
++    flight_total += flight_record_n;
++    memcpy(b->flight + flight_total, b->ccs_record, ccs_record_n);
++    flight_total += ccs_record_n;
++    memcpy(b->flight + flight_total, b->fin_record, fin_record_n);
++    flight_total += fin_record_n;
++
++    /* ---- 7. Send flight, receive server response ---- */
++    if (!io->write(io->ctx, b->flight, flight_total, /*is_handshake*/ true)) {
++        result = VERIMARK_HANDSHAKE_ERR_WRITE; goto out;
++    }
++    if (!io->read(io->ctx, b->server_response, sizeof(b->server_response),
++                   &b->server_response_len)) {
++        result = VERIMARK_HANDSHAKE_ERR_READ; goto out;
++    }
++
++    /* ---- 8. Parse Server CCS + Server Finished ---- */
++    {
++        if (b->server_response_len < 6 || b->server_response[0] != VERIMARK_CT_CCS) {
++            /* Maybe an Alert ? */
++            if (b->server_response_len >= 5 && b->server_response[0] == VERIMARK_CT_ALERT) {
++                result = VERIMARK_HANDSHAKE_ERR_SERVER_ALERT;
++            } else {
++                result = VERIMARK_HANDSHAKE_ERR_SERVER_CCS;
++            }
++            goto out;
++        }
++        /* Server CCS record is 6 octets : 14 03 03 00 01 01. Skip. */
++        size_t off = 6;
++        if (b->server_response_len < off + 5) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_FIN; goto out;
++        }
++        uint8_t ct = 0;
++        uint16_t ver = 0;
++        const uint8_t *body = NULL;
++        size_t body_len = 0;
++        if (!verimark_tls_parse_record(b->server_response + off,
++                                        b->server_response_len - off,
++                                        &ct, &ver, &body, &body_len)) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_FIN; goto out;
++        }
++        if (ct != VERIMARK_CT_HANDSHAKE || body_len < 8 + 16) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_FIN; goto out;
++        }
++        /* Decrypt with server_write_*, seq=0, ct=HANDSHAKE. */
++        const uint8_t *sf_nonce = body;
++        const uint8_t *sf_ct = body + 8;
++        size_t sf_ct_len = body_len - 8;
++        uint8_t sf_full_nonce[12];
++        memcpy(sf_full_nonce, session_out->server_write_iv, 4);
++        memcpy(sf_full_nonce + 4, sf_nonce, 8);
++        uint8_t sf_aad[13];
++        verimark_tls_build_aad_gcm(0, VERIMARK_CT_HANDSHAKE,
++                                    VERIMARK_TLS_VERSION, (uint16_t)(sf_ct_len - 16),
++                                    sf_aad, sizeof(sf_aad));
++        uint8_t sf_plain[32];
++        if (verimark_aes256_gcm_decrypt(session_out->server_write_key, sf_full_nonce,
++                                         sf_aad, 13,
++                                         sf_ct, sf_ct_len,
++                                         sf_plain, sizeof(sf_plain)) != VERIMARK_CRYPTO_OK) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_FIN; goto out;
++        }
++        /* Server Finished plaintext = [type 0x14][len:3][verify_data]. */
++        if (sf_ct_len - 16 < 4 || sf_plain[0] != VERIMARK_HS_FINISHED) {
++            result = VERIMARK_HANDSHAKE_ERR_SERVER_FIN; goto out;
++        }
++        /* Note : we do NOT validate the server verify_data against our PRF
++         * compute, because the Synaptics server-side transcript or label may
++         * differ from RFC standard (see docs/phase5-tls-psk-linux.md). The
++         * successful GCM decrypt is itself strong evidence the session is
++         * established (the server used the right MS + key_block). */
++
++        /* Server's GCM seq starts at 0 ; advance to 1 for the next decrypt. */
++        session_out->server_seq = 1;
++    }
++
++    /* Client's GCM seq is 0 was used for Finished ; advance to 1. */
++    session_out->client_seq = 1;
++    result = VERIMARK_HANDSHAKE_OK;
++
++out:
++    /* Wipe sensitive intermediates. */
++    {
++        volatile uint8_t *p = (volatile uint8_t *)b;
++        for (size_t i = 0; i < sizeof(*b); i++) p[i] = 0;
++    }
++    /* Also wipe local random buffers. */
++    {
++        volatile uint8_t *p1 = (volatile uint8_t *)client_random;
++        volatile uint8_t *p2 = (volatile uint8_t *)eph_priv_be;
++        volatile uint8_t *p3 = (volatile uint8_t *)server_random;
++        for (size_t i = 0; i < 32; i++) { p1[i] = 0; p2[i] = 0; p3[i] = 0; }
++    }
++    free(b);
++    if (result != VERIMARK_HANDSHAKE_OK) {
++        verimark_session_zero(session_out);
++    }
++    return result;
++}
+diff --git a/libfprint/drivers/verimark/handshake.h b/libfprint/drivers/verimark/handshake.h
+new file mode 100644
+index 0000000..7c0edfa
+--- /dev/null
++++ b/libfprint/drivers/verimark/handshake.h
+@@ -0,0 +1,115 @@
++/*
++ * handshake.h — TLS 1.2 Synaptics handshake orchestrator.
++ *
++ * Composes pairing + crypto + tls + session to perform the full client
++ * handshake against the VeriMark/Synaptics sensor. After
++ * `verimark_handshake_perform()` returns OK, the caller owns a ready-
++ * to-use `VerimarkSession` for AppData encrypt/decrypt.
++ *
++ * Sequence (validated runtime, see docs/phase5-tls-psk-linux.md) :
++ *   1. Send ClientHello (with handshake transport prefix `44 00 00 00`).
++ *   2. Receive ServerHello, parse server_random + cipher.
++ *   3. Build Certificate + ClientKeyExchange + CertificateVerify, sign.
++ *   4. Compute ECDH premaster, derive MS + key_block (Synaptics CR||SR).
++ *   5. Build Finished, encrypt (AES-GCM seq=0 client).
++ *   6. Send Cert+CKE+CV record, CCS, encrypted Finished (single write).
++ *   7. Receive Server CCS + Server Finished, decrypt and **validate**
++ *      `verify_data` (RFC 5246 §7.4.9).
++ *   8. Return session.
++ *
++ * Transport abstraction : the function takes a `VerimarkTransportIO`
++ * vtable so it can run against a real USB device or a scripted mock
++ * (tests). The `is_handshake` flag tells the transport to prepend the
++ * `44 00 00 00` prefix during the handshake phase and to omit it for
++ * AppData (post-session).
++ *
++ * Synchronous / blocking : meant to be wrapped in a `fpi_ssm` later, or
++ * called from a worker thread. No GLib dependency.
++ */
++
++#ifndef VERIMARK_HANDSHAKE_H
++#define VERIMARK_HANDSHAKE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "pairing.h"
++#include "session.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/**
++ * Transport vtable. The orchestrator calls `write()` then `read()` for
++ * each round-trip. `ctx` is opaque user data passed back to both
++ * functions.
++ *
++ * `is_handshake` is true for records that need the Synaptics transport
++ * prefix `44 00 00 00` (during the handshake phase) and false for plain
++ * record passthrough (e.g. AppData replies, post-handshake).
++ *
++ * Both functions return true on success, false on transport error.
++ */
++typedef struct VerimarkTransportIO VerimarkTransportIO;
++struct VerimarkTransportIO {
++    bool (*write)(void *ctx, const uint8_t *data, size_t len,
++                  bool is_handshake);
++    bool (*read)(void *ctx, uint8_t *buf, size_t buf_size,
++                 size_t *out_len);
++    void *ctx;
++};
++
++
++typedef enum {
++    VERIMARK_HANDSHAKE_OK                 = 0,
++    VERIMARK_HANDSHAKE_ERR_PARAM          = -1,
++    VERIMARK_HANDSHAKE_ERR_WRITE          = -2,
++    VERIMARK_HANDSHAKE_ERR_READ           = -3,
++    VERIMARK_HANDSHAKE_ERR_SERVER_HELLO   = -4,  /* parse failed or not a HS */
++    VERIMARK_HANDSHAKE_ERR_CIPHER         = -5,  /* unexpected cipher */
++    VERIMARK_HANDSHAKE_ERR_SERVER_ALERT   = -6,  /* server sent Alert */
++    VERIMARK_HANDSHAKE_ERR_CRYPTO         = -7,  /* sign/ecdh/prf/gcm failed */
++    VERIMARK_HANDSHAKE_ERR_SERVER_CCS     = -8,
++    VERIMARK_HANDSHAKE_ERR_SERVER_FIN     = -9,  /* decrypt or parse failed */
++} VerimarkHandshakeResult;
++
++
++/**
++ * Optional override of random values for reproducible tests. If non-NULL
++ * is passed as `params`, the orchestrator uses the contained values
++ * instead of system randomness. In production code, pass NULL — the
++ * orchestrator will use system entropy (via `getrandom()` if available,
++ * else /dev/urandom).
++ */
++typedef struct {
++    uint8_t client_random[32];     /* used as-is for ClientHello.random */
++    uint8_t eph_priv_be[32];       /* used as-is for ECDH ephemeral key */
++} VerimarkHandshakeReproducibleParams;
++
++
++/**
++ * Perform the full TLS handshake against the sensor.
++ *
++ * On success returns 0 and `*session_out` is initialized with the
++ * derived AES-GCM keys + zero sequence counters.
++ *
++ * On failure returns a negative enum value ; `*session_out` is zeroed.
++ *
++ * If `repro_or_null` is non-NULL, the contained random values are used
++ * for reproducible test runs. Otherwise system entropy is queried.
++ */
++VerimarkHandshakeResult
++verimark_handshake_perform(VerimarkTransportIO *io,
++                            const VerimarkPairingData *pairing,
++                            const VerimarkHandshakeReproducibleParams *repro_or_null,
++                            VerimarkSession *session_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_HANDSHAKE_H */
+diff --git a/libfprint/drivers/verimark/match.c b/libfprint/drivers/verimark/match.c
+new file mode 100644
+index 0000000..1335c50
+--- /dev/null
++++ b/libfprint/drivers/verimark/match.c
+@@ -0,0 +1,160 @@
++/*
++ * match.c — Match-on-Chip wrapper implementation for opcode 0x99.
++ */
++
++/* getentropy(3) requires _DEFAULT_SOURCE under -std=c11. Must be
++ * defined BEFORE any system header is pulled in. */
++#define _DEFAULT_SOURCE 1
++
++#include "match.h"
++
++#include <string.h>
++#include <unistd.h>     /* for getentropy() */
++
++#include "handshake.h"   /* for VerimarkTransportIO definition */
++
++
++/* ---------------------------------------------------------------------------
++ * Helpers
++ * ------------------------------------------------------------------------- */
++
++static inline void write_le32(uint8_t out[4], uint32_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++    out[2] = (uint8_t)((v >> 16) & 0xff);
++    out[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++static inline uint32_t read_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0]
++         | ((uint32_t)p[1] << 8)
++         | ((uint32_t)p[2] << 16)
++         | ((uint32_t)p[3] << 24);
++}
++
++
++/* ---------------------------------------------------------------------------
++ * Nonce generation
++ * ------------------------------------------------------------------------- */
++
++bool verimark_match_generate_nonce(uint8_t out_nonce[VERIMARK_MATCH_NONCE_LEN])
++{
++    if (!out_nonce)
++        return false;
++    /* getentropy(3) : never blocks once the kernel RNG is seeded, max
++     * 256 bytes per call (we only ask for 16, well within the limit). */
++    return getentropy(out_nonce, VERIMARK_MATCH_NONCE_LEN) == 0;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x99 — misIdentifyMatchCmd
++ * ------------------------------------------------------------------------- */
++
++/* Max image observed in pcaps : ~16 KB. The payload also carries
++ * 4-12 bytes of tags + up to 8 tuids of 16 bytes + 16-byte nonce.
++ * Allow generous overhead. */
++#define MATCH_MAX_PAYLOAD (16u * 1024u + 8u * VERIMARK_MATCH_TUID_LEN + 32u)
++
++/* Response qm struct layout (per Ghidra FUN_18007d0a0 line 58781 :
++ * "if (iVar4 == 0x24) { copy 36 bytes }" — so the qm struct is the
++ * FIRST 36 bytes of the response payload after the status u16 BE
++ * already stripped by session_call_opcode). */
++#define QM_STRUCT_LEN 36u
++
++bool verimark_match_request(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t *image, size_t image_size,
++                            const uint8_t (*tuids)[VERIMARK_MATCH_TUID_LEN],
++                            size_t tuid_count,
++                            const uint8_t nonce[VERIMARK_MATCH_NONCE_LEN],
++                            VerimarkMatchResult *out,
++                            uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out || !nonce)
++        return false;
++    if (image_size > 0 && !image)
++        return false;
++    if (tuid_count > 0 && !tuids)
++        return false;
++
++    /* Compute the total payload size. */
++    size_t total = 4;  /* tag(1) header */
++    if (tuid_count > 0) {
++        total += 4 + tuid_count * VERIMARK_MATCH_TUID_LEN;  /* tag(tuids_size) + tuids */
++        total += 4;                                          /* tag(image_size) */
++    } else {
++        total += 4;                                          /* tag(image_size) only */
++    }
++    total += image_size;
++    total += VERIMARK_MATCH_NONCE_LEN;
++
++    if (total > MATCH_MAX_PAYLOAD)
++        return false;
++
++    static uint8_t payload[MATCH_MAX_PAYLOAD];
++    size_t off = 0;
++
++    /* tag(1) u32 LE = 01 00 00 00 (per Ghidra : FUN_1800a3ee0 is
++     * identity, so the wire format is the raw u32). */
++    write_le32(payload + off, 1);
++    off += 4;
++
++    if (tuid_count > 0) {
++        /* tag(tuids_size) */
++        write_le32(payload + off, (uint32_t)(tuid_count * VERIMARK_MATCH_TUID_LEN));
++        off += 4;
++        /* tuids */
++        memcpy(payload + off, tuids, tuid_count * VERIMARK_MATCH_TUID_LEN);
++        off += tuid_count * VERIMARK_MATCH_TUID_LEN;
++        /* tag(image_size) */
++        write_le32(payload + off, (uint32_t)image_size);
++        off += 4;
++    } else {
++        /* tag(image_size) */
++        write_le32(payload + off, (uint32_t)image_size);
++        off += 4;
++    }
++
++    /* image data */
++    if (image_size > 0) {
++        memcpy(payload + off, image, image_size);
++        off += image_size;
++    }
++
++    /* secureBio nonce */
++    memcpy(payload + off, nonce, VERIMARK_MATCH_NONCE_LEN);
++    off += VERIMARK_MATCH_NONCE_LEN;
++
++    /* Send via the normal session API. */
++    /* Response buffer must hold at least 36 bytes of qm struct. */
++    static uint8_t resp_buf[256];
++    uint16_t status = 0;
++    const uint8_t *resp_payload = NULL;
++    size_t resp_payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x99,
++        payload, off,
++        resp_buf, sizeof(resp_buf),
++        &status, &resp_payload, &resp_payload_len);
++    *status_out = status;
++    memset(out, 0, sizeof(*out));
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;  /* sensor reported an error (e.g. 0x3104 no capture) */
++    if (resp_payload_len < QM_STRUCT_LEN || !resp_payload)
++        return false;
++
++    out->match_score     = read_le32(resp_payload + 0);
++    out->match_index     = read_le32(resp_payload + 4);
++    out->match_strength  = read_le32(resp_payload + 8);
++    out->template_update = resp_payload[12];
++    memcpy(out->reserved, resp_payload + 13, 23);
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/match.h b/libfprint/drivers/verimark/match.h
+new file mode 100644
+index 0000000..4b9d05f
+--- /dev/null
++++ b/libfprint/drivers/verimark/match.h
+@@ -0,0 +1,132 @@
++/*
++ * match.h — Match-on-Chip wrapper for opcode 0x99 (misIdentifyMatchCmd).
++ *
++ * The Synaptics VeriMark DT is a Match-on-Chip sensor : the
++ * biometric comparison happens inside the sensor's firmware, not on
++ * the host. This module exposes the `0x99` opcode that drives that
++ * MoC pipeline.
++ *
++ * Layout per Ghidra (FUN_18007d0a0:58655-58858) and runtime
++ * validation (Phase 9 step 4.3+, docs/opcodes/0x99.yaml) :
++ *
++ *   request payload =
++ *     [tag(1)         : u32 LE = 01 00 00 00]
++ *     [tag(tuids_size): u32 LE = count*16]          (if tuid_count > 0)
++ *     [tuids          : count*16 bytes]              (if tuid_count > 0)
++ *     [tag(image_size): u32 LE]
++ *     [image data]
++ *     [secure_bio_nonce : 16 bytes]
++ *
++ *   response = 36 bytes qm struct :
++ *     [matchScore : u32 LE]
++ *     [matchIndex : u32 LE]
++ *     [matchStrength : u32 LE]
++ *     [templateUpdate : u8]
++ *     [reserved : 23 bytes]   (semantics TBD)
++ *
++ * Key insight from the Ghidra deep-dive : the secureBio nonce is
++ * generated LOCALLY by the host (vtable [+0x50] sub-cmd 8 is a
++ * local function inside the DLL, not a wire opcode). So the Linux
++ * driver can produce its own nonce via `getentropy(16)`.
++ */
++
++#ifndef VERIMARK_MATCH_H
++#define VERIMARK_MATCH_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "session.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++struct VerimarkTransportIO;
++
++
++/* ---------------------------------------------------------------------------
++ * Nonce generation (local — no wire opcode)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_MATCH_NONCE_LEN 16
++
++/**
++ * Generate a 16-byte cryptographically-random secureBio nonce.
++ *
++ * The sensor uses this nonce as part of the match command's payload.
++ * Per Ghidra (FUN_18007adb0:57891 → vtable [+0x50] sub-cmd 8), this
++ * nonce is generated *locally* by the Windows driver — no wire
++ * opcode is exchanged with the sensor to obtain it. So the Linux
++ * driver simply produces its own.
++ *
++ * Uses `getentropy(3)` (POSIX 2013) which is available on Linux 3.17+
++ * (glibc 2.25+) and never blocks on the kernel RNG once seeded.
++ *
++ * Returns true on success ; false if entropy could not be sourced
++ * (extremely unlikely in normal operation).
++ */
++bool verimark_match_generate_nonce(uint8_t out_nonce[VERIMARK_MATCH_NONCE_LEN]);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x99 — misIdentifyMatchCmd
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_MATCH_TUID_LEN     16
++
++/**
++ * Match verdict returned by the sensor in a 36-byte qm struct.
++ *
++ * Field naming matches the Windows DLL's internal log format
++ * (`"matchScore = %d, matchIndex = %d, matchStrength = %d,
++ * templateUpdate = %d"`).
++ */
++typedef struct {
++    uint32_t match_score;
++    uint32_t match_index;
++    uint32_t match_strength;
++    uint8_t  template_update;
++    uint8_t  reserved[23];
++} VerimarkMatchResult;
++
++/**
++ * Send opcode `0x99` MATCH and parse the 36-byte qm struct response.
++ *
++ * Parameters :
++ *   `image` / `image_size` : the fingerprint image (typically ~16 KB
++ *                            from `verimark_capture_get_frame_data()`)
++ *   `tuids` / `tuid_count` : array of 16-byte tuids of enrollments
++ *                            to match against. May be NULL/0 (the
++ *                            sensor will then probably do an open-set
++ *                            identify, behavior TBD)
++ *   `nonce` : 16 random bytes from `verimark_match_generate_nonce()`
++ *   `out` : the parsed match verdict
++ *
++ * Returns true on transport+crypto success. `*status_out` carries
++ * the Tudor protocol status (0x0000 on a valid match cycle, even if
++ * `match_score < threshold` → "no match"). Sensor-level errors are
++ * reported via `*status_out` (e.g. `0x3104` was observed when no
++ * capture is currently active in the session).
++ *
++ * Caller's responsibility : interpret `match_score` vs a threshold
++ * (typically read once at session init from authCtx+0x2c, ~0x40 on
++ * the reference sensor) to decide match / no-match.
++ */
++bool verimark_match_request(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t *image, size_t image_size,
++                            const uint8_t (*tuids)[VERIMARK_MATCH_TUID_LEN],
++                            size_t tuid_count,
++                            const uint8_t nonce[VERIMARK_MATCH_NONCE_LEN],
++                            VerimarkMatchResult *out,
++                            uint16_t *status_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_MATCH_H */
+diff --git a/libfprint/drivers/verimark/pairing.c b/libfprint/drivers/verimark/pairing.c
+new file mode 100644
+index 0000000..e465272
+--- /dev/null
++++ b/libfprint/drivers/verimark/pairing.c
+@@ -0,0 +1,139 @@
++/*
++ * pairing.c — Sub1 TLV pairing data loader.
++ *
++ * Pure C, no crypto dependency. The struct VerimarkPairingData contains
++ * the secret client_priv_be — callers must never log it.
++ */
++
++#include "pairing.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++
++/* TLV record header : 6 octets [tag:u16 LE][len:u16 LE][2 reserved]. */
++#define TLV_HEADER_SIZE 6
++
++
++static inline uint16_t read_le16(const uint8_t *p) {
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++
++static inline void reverse_bytes(uint8_t *dst, const uint8_t *src, size_t n) {
++    for (size_t i = 0; i < n; i++)
++        dst[i] = src[n - 1 - i];
++}
++
++
++void verimark_pairing_data_zero(VerimarkPairingData *data) {
++    if (!data) return;
++    /* Use volatile pointer to defeat compiler dead-store elimination. */
++    volatile uint8_t *p = (volatile uint8_t *)data;
++    for (size_t i = 0; i < sizeof(*data); i++)
++        p[i] = 0;
++}
++
++
++bool verimark_pairing_parse_blob(const uint8_t *blob, size_t blob_len,
++                                  VerimarkPairingData *out)
++{
++    if (!blob || !out || blob_len < TLV_HEADER_SIZE)
++        return false;
++
++    /* Track which canonical tags we've seen. */
++    bool got_tag1 = false, got_tag2 = false, got_tag3 = false;
++
++    size_t off = 0;
++    while (off + TLV_HEADER_SIZE <= blob_len) {
++        uint16_t tag = read_le16(blob + off);
++        uint16_t len = read_le16(blob + off + 2);
++        /* off+2..off+4 = length, off+4..off+6 = 2 reserved/pad octets */
++
++        /* Tag 0 + len 0 = sentinel/end-of-table for some Synaptics dumps. */
++        if (tag == 0 && len == 0) {
++            off += TLV_HEADER_SIZE;
++            continue;
++        }
++
++        if ((size_t)len > blob_len - off - TLV_HEADER_SIZE)
++            return false;  /* truncated value */
++
++        const uint8_t *value = blob + off + TLV_HEADER_SIZE;
++        switch (tag) {
++            case 1:
++                if (len != 400) return false;
++                memcpy(out->client_cert, value, 400);
++                got_tag1 = true;
++                break;
++            case 2:
++                if (len != 32) return false;
++                /* sub1 stores priv in little-endian, normalize to BE for crypto. */
++                reverse_bytes(out->client_priv_be, value, 32);
++                got_tag2 = true;
++                break;
++            case 3: {
++                if (len != 400) return false;
++                /* Server pubkey : X at offset 0x04, Y at offset 0x48, in LE.
++                 * Reconstruct uncompressed `04 || X_BE || Y_BE`. */
++                out->server_pub_uncompressed[0] = 0x04;
++                reverse_bytes(out->server_pub_uncompressed + 1, value + 0x04, 32);
++                reverse_bytes(out->server_pub_uncompressed + 33, value + 0x48, 32);
++                got_tag3 = true;
++                break;
++            }
++            case 4:
++                /* P-256 curve params blob, ignored at this layer. */
++                break;
++            default:
++                /* Unknown tag : tolerate and skip. */
++                break;
++        }
++        off += TLV_HEADER_SIZE + len;
++    }
++
++    return got_tag1 && got_tag2 && got_tag3;
++}
++
++
++bool verimark_pairing_load_from_file(const char *path,
++                                      VerimarkPairingData *out)
++{
++    if (!path || !out) return false;
++
++    FILE *fp = fopen(path, "rb");
++    if (!fp) return false;
++
++    /* Get file size. */
++    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return false; }
++    long sz = ftell(fp);
++    if (sz < 0 || sz > (1L << 20)) {   /* sane upper bound 1 MiB */
++        fclose(fp);
++        return false;
++    }
++    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return false; }
++
++    uint8_t *blob = (uint8_t *)malloc((size_t)sz);
++    if (!blob) { fclose(fp); return false; }
++
++    size_t n = fread(blob, 1, (size_t)sz, fp);
++    fclose(fp);
++    if (n != (size_t)sz) {
++        /* Zero before free in case partial read contained secrets. */
++        volatile uint8_t *p = (volatile uint8_t *)blob;
++        for (size_t i = 0; i < n; i++) p[i] = 0;
++        free(blob);
++        return false;
++    }
++
++    bool ok = verimark_pairing_parse_blob(blob, (size_t)sz, out);
++
++    /* Wipe the heap copy. */
++    volatile uint8_t *p = (volatile uint8_t *)blob;
++    for (size_t i = 0; i < (size_t)sz; i++) p[i] = 0;
++    free(blob);
++
++    return ok;
++}
+diff --git a/libfprint/drivers/verimark/pairing.h b/libfprint/drivers/verimark/pairing.h
+new file mode 100644
+index 0000000..26a9132
+--- /dev/null
++++ b/libfprint/drivers/verimark/pairing.h
+@@ -0,0 +1,83 @@
++/*
++ * pairing.h — Sub1 TLV pairing data loader for the VeriMark driver.
++ *
++ * The Windows Synaptics driver stores per-device pairing data in a registry
++ * blob (`PairingData/sub1`) containing :
++ *   tag 0 : (marker, empty)
++ *   tag 1 : 400 octets — client certificate (custom Synaptics format).
++ *   tag 2 :  32 octets — client ECDSA P-256 private scalar (LITTLE-ENDIAN).
++ *   tag 3 : 400 octets — server certificate (X@0x04, Y@0x48 in LE).
++ *   tag 4 : 420 octets — NIST P-256 BCRYPT_ECC_PARAMETER (not used here).
++ *
++ * TLV record header layout : `[tag:u16 LE][length:u16 LE][2 reserved][value]`.
++ *
++ * Until we reverse the Synaptics pairing process (separate phase), the
++ * Linux driver imports a sub1 blob extracted from the user.s existing device
++ * install (ipw2200 / Realtek pattern). The loader parses the blob and
++ * normalizes the keys to big-endian for the GnuTLS-based crypto layer.
++ *
++ * **Security** : `VerimarkPairingData::client_priv_be` is a SECRET. Never
++ * log it or any derivative (master_secret, key_block, etc.) in plaintext.
++ * The struct should be zeroed (`memset(0)`) before being freed/scoped out.
++ */
++
++#ifndef VERIMARK_PAIRING_H
++#define VERIMARK_PAIRING_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++typedef struct {
++    uint8_t client_cert[400];               /* tag 1 */
++    uint8_t client_priv_be[32];             /* tag 2, normalized to BE */
++    uint8_t server_pub_uncompressed[65];    /* tag 3 reconstructed: 04||X||Y BE */
++} VerimarkPairingData;
++
++
++/**
++ * Parse a sub1 TLV blob from memory.
++ *
++ * On success returns true and fills `*out`. The function expects tags 1,
++ * 2, and 3 to be present and to have the canonical sizes (400/32/400).
++ * Tag 4 is optional and skipped.
++ *
++ * On failure returns false ; `*out` may be partially written and MUST be
++ * zeroed before reuse (it may contain partial secret material).
++ */
++bool verimark_pairing_parse_blob(const uint8_t *blob, size_t blob_len,
++                                  VerimarkPairingData *out);
++
++
++/**
++ * Read a sub1 blob from `path` and parse it.
++ *
++ * The file must be readable by the calling process. Returns true on
++ * success, false on I/O error or parse error (caller can inspect errno
++ * for the I/O case).
++ *
++ * On success `*out` contains the parsed data ; the caller is responsible
++ * for zeroing it after use.
++ */
++bool verimark_pairing_load_from_file(const char *path,
++                                      VerimarkPairingData *out);
++
++
++/**
++ * Zero-fill a VerimarkPairingData. Use this instead of plain memset to
++ * make intent explicit ; it could later be hardened against compiler
++ * elimination if needed.
++ */
++void verimark_pairing_data_zero(VerimarkPairingData *data);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_PAIRING_H */
+diff --git a/libfprint/drivers/verimark/proto.c b/libfprint/drivers/verimark/proto.c
+new file mode 100644
+index 0000000..a72abad
+--- /dev/null
++++ b/libfprint/drivers/verimark/proto.c
+@@ -0,0 +1,212 @@
++/*
++ * proto.c — Tudor protocol layer for the Kensington VeriMark DT.
++ *
++ * Pure C, no external dependency (other than stdlib). Encodes/parses Tudor
++ * application frames (`[opcode][payload]` / `[status:u16 BE][payload]`).
++ * See proto.h for the API.
++ */
++
++#include "proto.h"
++
++#include <string.h>
++
++
++/* Magic constant for wValue computation (see palWinUsbBulkWriteEp0InEp0Out,
++ * FUN_1800478e0 in the synaWudfBioUsb132.dll pseudo-C). */
++#define VERIMARK_MAGIC_WRITE  0x80004007u
++
++
++uint16_t verimark_compute_wvalue_write(size_t original_length)
++{
++    /* wValue = original_length & magic_write & 7 = original_length & 7
++     * (since magic_write & 7 == 7). */
++    return (uint16_t)(original_length & VERIMARK_MAGIC_WRITE & 7u);
++}
++
++
++size_t verimark_align_up(size_t len)
++{
++    size_t rem = len & (VERIMARK_ALIGNMENT - 1);  /* len % 8 */
++    if (rem == 0)
++        return len;
++    return len + (VERIMARK_ALIGNMENT - rem);
++}
++
++
++size_t verimark_encode_request(uint8_t opcode,
++                               const uint8_t *payload,
++                               size_t payload_len,
++                               uint8_t *out_buf,
++                               size_t out_buf_size)
++{
++    size_t needed = 1 + payload_len;
++    if (out_buf == NULL || out_buf_size < needed)
++        return 0;
++    out_buf[0] = opcode;
++    if (payload_len > 0 && payload != NULL) {
++        memcpy(out_buf + 1, payload, payload_len);
++    }
++    return needed;
++}
++
++
++bool verimark_parse_response(const uint8_t *wire,
++                             size_t wire_len,
++                             uint16_t *status,
++                             const uint8_t **payload,
++                             size_t *payload_len)
++{
++    if (wire == NULL || wire_len < 2)
++        return false;
++    if (status) {
++        *status = (uint16_t)((wire[0] << 8) | wire[1]);
++    }
++    if (payload) {
++        *payload = wire + 2;
++    }
++    if (payload_len) {
++        *payload_len = wire_len - 2;
++    }
++    return true;
++}
++
++
++size_t verimark_encode_get_device_info(uint8_t *out_buf, size_t out_buf_size)
++{
++    return verimark_encode_request(VERIMARK_OP_GET_DEVICE_INFO,
++                                   NULL, 0, out_buf, out_buf_size);
++}
++
++
++static uint32_t be32(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
++         | ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
++}
++
++static uint16_t be16(const uint8_t *p)
++{
++    return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++
++bool verimark_parse_device_info(const uint8_t *payload,
++                                size_t payload_len,
++                                VerimarkDeviceInfo *out)
++{
++    if (payload == NULL || out == NULL || payload_len < 36)
++        return false;
++    out->version_word = be32(payload + 0x00);
++    out->build_word   = be32(payload + 0x04);
++    out->b_08 = payload[0x08];
++    out->b_09 = payload[0x09];
++    out->b_0a = payload[0x0A];
++    out->b_0b = payload[0x0B];
++    out->b_0c = payload[0x0C];
++    out->b_0d = payload[0x0D];
++    out->b_0e = payload[0x0E];
++    out->b_0f = payload[0x0F];
++    memcpy(out->serial, payload + 0x10, 6);
++    out->b_16 = payload[0x16];
++    out->b_17 = payload[0x17];
++    out->field_20 = be16(payload + 0x20);
++    out->b_23 = payload[0x23];
++    return true;
++}
++
++
++void verimark_format_serial(const VerimarkDeviceInfo *info, char buf[13])
++{
++    static const char hex[] = "0123456789abcdef";
++    for (int i = 0; i < 6; i++) {
++        uint8_t b = info->serial[i];
++        buf[2 * i]     = hex[(b >> 4) & 0xF];
++        buf[2 * i + 1] = hex[b & 0xF];
++    }
++    buf[12] = '\0';
++}
++
++
++/* ---- Storage info (opcode 0x3E) -------------------------------------------
++ *
++ * The on-wire layout was reverse-engineered from FUN_180062a80 in
++ * synaWudfBioUsb132.dll (see docs/opcodes/0x3e.yaml for the original notes,
++ * corrected here against captured runtime data):
++ *
++ *   payload+0x00 .. +0x0b : 6 × u16 LE      (header — semantics TBD)
++ *   payload+0x0c          : u16 LE          (entry_count)
++ *   payload+0x0e          : entry_count × 12 B (entries)
++ *
++ * Each entry is `[type:u8][b_1:u8][u16 LE][u32 LE][u32 LE]`.
++ */
++
++static uint16_t le16(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static uint32_t le32(const uint8_t *p)
++{
++    return ((uint32_t)p[0])
++         | ((uint32_t)p[1] << 8)
++         | ((uint32_t)p[2] << 16)
++         | ((uint32_t)p[3] << 24);
++}
++
++
++size_t verimark_encode_get_storage_info(uint8_t *out_buf, size_t out_buf_size)
++{
++    return verimark_encode_request(VERIMARK_OP_GET_STORAGE_INFO,
++                                   NULL, 0, out_buf, out_buf_size);
++}
++
++
++bool verimark_parse_storage_info(const uint8_t *payload,
++                                 size_t payload_len,
++                                 VerimarkStorageInfo *out)
++{
++    if (payload == NULL || out == NULL ||
++        payload_len < VERIMARK_STORAGE_HEADER_SIZE)
++        return false;
++
++    /* Header: 6 × u16 LE */
++    for (int i = 0; i < 6; i++) {
++        out->header[i] = le16(payload + 2 * i);
++    }
++    /* Declared entry count */
++    uint16_t declared = le16(payload + 0x0c);
++
++    /* Cap at array size and at what physically fits in the buffer. */
++    size_t entries_bytes = payload_len - VERIMARK_STORAGE_HEADER_SIZE;
++    size_t fits = entries_bytes / VERIMARK_STORAGE_ENTRY_SIZE;
++    size_t count = declared;
++    if (count > VERIMARK_STORAGE_MAX_ENTRIES)
++        count = VERIMARK_STORAGE_MAX_ENTRIES;
++    if (count > fits)
++        count = fits;
++    out->entry_count = (uint16_t)count;
++
++    const uint8_t *p = payload + VERIMARK_STORAGE_HEADER_SIZE;
++    for (size_t i = 0; i < count; i++) {
++        out->entries[i].type    = p[0];
++        out->entries[i].b_1     = p[1];
++        out->entries[i].field_2 = le16(p + 2);
++        out->entries[i].field_4 = le32(p + 4);
++        out->entries[i].field_8 = le32(p + 8);
++        p += VERIMARK_STORAGE_ENTRY_SIZE;
++    }
++    return true;
++}
++
++
++const VerimarkStorageEntry *
++verimark_storage_find_host_partition(const VerimarkStorageInfo *info)
++{
++    if (info == NULL)
++        return NULL;
++    for (uint16_t i = 0; i < info->entry_count; i++) {
++        if (info->entries[i].type == VERIMARK_STORAGE_ENTRY_HOST)
++            return &info->entries[i];
++    }
++    return NULL;
++}
+diff --git a/libfprint/drivers/verimark/proto.h b/libfprint/drivers/verimark/proto.h
+new file mode 100644
+index 0000000..934f329
+--- /dev/null
++++ b/libfprint/drivers/verimark/proto.h
+@@ -0,0 +1,229 @@
++/*
++ * proto.h — Tudor protocol layer (Kensington VeriMark DT, 047d:00f2)
++ *
++ * Encodes / parses Tudor application frames:
++ *   request  = [opcode:u8][payload...]
++ *   response = [status:u16 BE][payload...]
++ *
++ * See ../../docs/opcodes/README.md and ../../docs/protocol.md for the
++ * full reverse-engineered transport stack (in French — this driver targets
++ * upstream libfprint integration, hence English code; project docs remain
++ * in French).
++ *
++ * This layer is **pure C with no external dependency** (other than stdlib)
++ * so it can be tested standalone and is portable to any USB backend.
++ */
++
++#ifndef VERIMARK_PROTO_H
++#define VERIMARK_PROTO_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ---- USB IDs ---- */
++
++#define VERIMARK_VID       0x047D
++#define VERIMARK_PID       0x00F2
++#define VERIMARK_MI_BIO    1     /* Interface MI_01 (biometric, vendor 0xff) */
++
++/* ---- Vendor control transfer codes (see docs/protocol.md) ---- */
++
++#define VERIMARK_REQ_TLS_STATUS  0x14  /* IN, 1-2 bytes, TLS session status */
++#define VERIMARK_REQ_CTRL_15     0x15  /* OUT, 0 bytes, control (IOCTL 0x68) */
++#define VERIMARK_REQ_WRITE       0x16  /* OUT, transceive write */
++#define VERIMARK_REQ_READ        0x17  /* IN, transceive read */
++#define VERIMARK_REQ_CTRL_19     0x19  /* OUT, init (wValue=1) or others */
++#define VERIMARK_REQ_READ_1A     0x1A  /* IN, 1 byte, post-init state */
++#define VERIMARK_REQ_CTRL_1B     0x1B  /* OUT, 0 bytes, control */
++
++#define VERIMARK_CHUNK_SIZE  4096
++#define VERIMARK_ALIGNMENT   8     /* bMaxPacketSize0 (Full-Speed) */
++
++/* ---- Known Tudor opcodes (subset usable in cleartext) ---- */
++/* Full opcode dictionary in docs/opcodes/. */
++
++#define VERIMARK_OP_GET_DEVICE_INFO     0x01
++#define VERIMARK_OP_GET_START_INFO      0x19
++#define VERIMARK_OP_GET_STORAGE_INFO    0x3E
++#define VERIMARK_OP_HOST_PARTITION_READ 0x40
++#define VERIMARK_OP_HOST_PARTITION_WRITE 0x41
++#define VERIMARK_OP_SET_IDLE_TIMEOUT    0x57
++#define VERIMARK_OP_CAPTURE_START       0x80
++#define VERIMARK_OP_CAPTURE_STOP        0x81
++#define VERIMARK_OP_GET_FRAME_DIMENSIONS 0x82
++#define VERIMARK_OP_EVENT_CONFIG        0x86
++#define VERIMARK_OP_EVENT_READ          0x87
++#define VERIMARK_OP_IOTA_READ           0x8E
++#define VERIMARK_OP_DO_PAIR             0x93
++#define VERIMARK_OP_SECURE_BIO_CONNECT  0xA6
++
++/* ---- Application status codes (response u16 BE) ----
++ *
++ * Decoded from the translation table FUN_180065270 in
++ * synaWudfBioUsb132.dll pseudo-C (see docs/phase5-tls-psk-linux.md).
++ */
++#define VERIMARK_STATUS_OK           0x0000
++#define VERIMARK_STATUS_UNKNOWN_OP   0x0104  /* opcode not recognized */
++#define VERIMARK_STATUS_BAD_STATE    0x0404  /* e.g. capture not started */
++/* Other codes documented in docs/phase5-tls-psk-linux.md. */
++
++/* ---- Helpers ---- */
++
++/**
++ * Compute wValue for a write 0x16 according to the Synaptics formula in
++ * `palWinUsbBulkWriteEp0InEp0Out` (FUN_1800478e0 of the pseudo-C):
++ *   wValue = original_length & magic_write & 7   where magic_write = 0x80004007
++ *          = length & 7
++ *
++ * The low 3 bits of the ORIGINAL length (before 8-byte alignment padding)
++ * are encoded in wValue so the device knows how many padding bytes to strip.
++ */
++uint16_t verimark_compute_wvalue_write(size_t original_length);
++
++/**
++ * Round `len` up to the next multiple of VERIMARK_ALIGNMENT (8).
++ */
++size_t verimark_align_up(size_t len);
++
++/**
++ * Encode a Tudor application request:
++ *   out[0] = opcode
++ *   out[1..1+payload_len] = payload
++ * `out_buf` must point to at least 1+payload_len bytes.
++ * Returns the total length (1 + payload_len), or 0 if out_buf is too small.
++ */
++size_t verimark_encode_request(uint8_t opcode,
++                               const uint8_t *payload,
++                               size_t payload_len,
++                               uint8_t *out_buf,
++                               size_t out_buf_size);
++
++/**
++ * Parse the Tudor response header (status u16 BE).
++ *
++ * @param wire             Wire buffer.
++ * @param wire_len         Buffer length.
++ * @param[out] status      Status as u16 BE.
++ * @param[out] payload     Pointer to the payload (= wire + 2).
++ * @param[out] payload_len Payload length (= wire_len - 2).
++ *
++ * Returns `true` if the response is at least 2 bytes long, `false` otherwise.
++ */
++bool verimark_parse_response(const uint8_t *wire,
++                             size_t wire_len,
++                             uint16_t *status,
++                             const uint8_t **payload,
++                             size_t *payload_len);
++
++/**
++ * Encode a `get_device_info` request (opcode 0x01, empty payload).
++ * `out_buf` must have at least 1 byte. Returns 1.
++ */
++size_t verimark_encode_get_device_info(uint8_t *out_buf, size_t out_buf_size);
++
++/**
++ * Parsed device-info payload (>= 36 bytes expected).
++ *
++ * See docs/opcodes/0x01.yaml. Multi-byte BE fields are byte-swapped.
++ */
++typedef struct VerimarkDeviceInfo {
++    uint32_t version_word;      /* offset 0x00, byte-swapped */
++    uint32_t build_word;        /* offset 0x04, byte-swapped */
++    uint8_t  b_08;
++    uint8_t  b_09;
++    uint8_t  b_0a;
++    uint8_t  b_0b;
++    uint8_t  b_0c;
++    uint8_t  b_0d;
++    uint8_t  b_0e;
++    uint8_t  b_0f;
++    uint8_t  serial[6];         /* offset 0x10..0x15, = USB iSerial */
++    uint8_t  b_16;
++    uint8_t  b_17;
++    uint16_t field_20;          /* offset 0x20, byte-swapped */
++    uint8_t  b_23;
++} VerimarkDeviceInfo;
++
++/**
++ * Parse the `get_device_info` response payload. Returns `true` if
++ * `payload_len >= 36`, `false` otherwise (info is partial).
++ */
++bool verimark_parse_device_info(const uint8_t *payload,
++                                size_t payload_len,
++                                VerimarkDeviceInfo *out);
++
++/**
++ * Format the serial as 12 lowercase hex characters (no separator),
++ * NUL-terminated. `buf` must have at least 13 bytes.
++ */
++void verimark_format_serial(const VerimarkDeviceInfo *info, char buf[13]);
++
++
++/* ---- Storage info (opcode 0x3E) ---- */
++
++/* A storage partition entry. 12 bytes on the wire, parsed from
++ * `FUN_180062a80` of synaWudfBioUsb132.dll. Type 0x02 designates the
++ * **host partition** where biometric templates are stored. */
++typedef struct VerimarkStorageEntry {
++    uint8_t  type;      /* entry type — 0x02 == host partition */
++    uint8_t  b_1;       /* second byte — meaning TBD */
++    uint16_t field_2;   /* u16 at offset +0x02 (endianness as on wire — LE) */
++    uint32_t field_4;   /* u32 at offset +0x04 (LE) */
++    uint32_t field_8;   /* u32 at offset +0x08 (LE) */
++} VerimarkStorageEntry;
++
++#define VERIMARK_STORAGE_ENTRY_HOST   0x02   /* host-partition entry type */
++
++#define VERIMARK_STORAGE_HEADER_SIZE  14     /* 7 × u16 before the entries */
++#define VERIMARK_STORAGE_ENTRY_SIZE   12     /* per-entry size on the wire */
++#define VERIMARK_STORAGE_MAX_ENTRIES  16     /* practical cap to avoid huge allocs */
++
++typedef struct VerimarkStorageInfo {
++    uint16_t header[6];         /* 6 × u16 LE — semantics TBD */
++    uint16_t entry_count;       /* number of entries actually parsed */
++    VerimarkStorageEntry entries[VERIMARK_STORAGE_MAX_ENTRIES];
++} VerimarkStorageInfo;
++
++/**
++ * Encode an empty `get_storage_info` request (opcode 0x3E).
++ * `out_buf` must hold at least 1 byte. Returns 1.
++ */
++size_t verimark_encode_get_storage_info(uint8_t *out_buf, size_t out_buf_size);
++
++/**
++ * Parse the `get_storage_info` response payload.
++ *
++ * On the wire (payload, i.e., after the 2-byte status):
++ *   [0x00 .. 0x0b]  6 × u16 LE  — header fields (semantics TBD)
++ *   [0x0c]          u16 LE      — entry_count
++ *   [0x0e ..]       N × 12 B    — entries, each one a VerimarkStorageEntry
++ *
++ * The parser caps the parsed count at the smaller of:
++ *   - the declared entry_count
++ *   - VERIMARK_STORAGE_MAX_ENTRIES
++ *   - what physically fits in `payload_len`
++ *
++ * Returns `true` if at least the header is parseable (>= 14 bytes),
++ * `false` otherwise. Partial entries at the tail are silently dropped.
++ */
++bool verimark_parse_storage_info(const uint8_t *payload,
++                                 size_t payload_len,
++                                 VerimarkStorageInfo *out);
++
++/**
++ * Return a pointer to the host-partition entry (type == 0x02), or NULL
++ * if no such entry is present.
++ */
++const VerimarkStorageEntry *
++verimark_storage_find_host_partition(const VerimarkStorageInfo *info);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_PROTO_H */
+diff --git a/libfprint/drivers/verimark/session.c b/libfprint/drivers/verimark/session.c
+new file mode 100644
+index 0000000..b0ca44d
+--- /dev/null
++++ b/libfprint/drivers/verimark/session.c
+@@ -0,0 +1,293 @@
++/*
++ * session.c — TLS 1.2 session AppData wrappers.
++ *
++ * Composes verimark-crypto (AES-GCM) + verimark-tls (record header + AAD)
++ * to provide a minimal "send opcode / receive opcode" API for the upper
++ * driver layer.
++ */
++
++#include "session.h"
++
++#include <string.h>
++
++#include "crypto.h"
++#include "tls.h"
++#include "handshake.h"  /* for VerimarkTransportIO */
++
++
++bool verimark_session_init_from_key_block(VerimarkSession *s,
++                                           const uint8_t key_block[72])
++{
++    if (!s || !key_block) return false;
++    /* TLS 1.2 AEAD-only layout (RFC 5246 §6.3 + RFC 5288) :
++     *   [0..32]  client_write_key
++     *   [32..64] server_write_key
++     *   [64..68] client_write_iv (fixed_iv GCM)
++     *   [68..72] server_write_iv
++     */
++    memcpy(s->client_write_key, key_block + 0, 32);
++    memcpy(s->server_write_key, key_block + 32, 32);
++    memcpy(s->client_write_iv,  key_block + 64, 4);
++    memcpy(s->server_write_iv,  key_block + 68, 4);
++    s->client_seq = 0;
++    s->server_seq = 0;
++    return true;
++}
++
++
++void verimark_session_zero(VerimarkSession *s)
++{
++    if (!s) return;
++    volatile uint8_t *p = (volatile uint8_t *)s;
++    for (size_t i = 0; i < sizeof(*s); i++) p[i] = 0;
++}
++
++
++static inline void write_be64(uint8_t out[8], uint64_t v) {
++    out[0] = (uint8_t)((v >> 56) & 0xff);
++    out[1] = (uint8_t)((v >> 48) & 0xff);
++    out[2] = (uint8_t)((v >> 40) & 0xff);
++    out[3] = (uint8_t)((v >> 32) & 0xff);
++    out[4] = (uint8_t)((v >> 24) & 0xff);
++    out[5] = (uint8_t)((v >> 16) & 0xff);
++    out[6] = (uint8_t)((v >> 8) & 0xff);
++    out[7] = (uint8_t)(v & 0xff);
++}
++
++
++size_t verimark_session_encrypt_appdata(VerimarkSession *s,
++                                         uint8_t opcode,
++                                         const uint8_t *payload,
++                                         size_t payload_len,
++                                         const uint8_t *nonce_explicit_or_null,
++                                         uint8_t *out, size_t out_size)
++{
++    if (!s || !out) return 0;
++    if (payload_len > 0 && !payload) return 0;
++    /* Plaintext = [opcode][payload], length 1 + payload_len. */
++    size_t plain_len = 1 + payload_len;
++    if (plain_len > 0xffff - 8 - 16) return 0;  /* would overflow u16 record len */
++    /* Required output : record header(5) + nonce_explicit(8) + ciphertext(plain_len) + tag(16) */
++    size_t record_len = 5 + 8 + plain_len + 16;
++    if (out_size < record_len) return 0;
++
++    /* Build plaintext on a small stack buffer. */
++    uint8_t plain[1024];
++    if (plain_len > sizeof(plain)) return 0;
++    plain[0] = opcode;
++    if (payload_len) memcpy(plain + 1, payload, payload_len);
++
++    /* nonce_explicit. */
++    uint8_t nonce_explicit[8];
++    if (nonce_explicit_or_null) {
++        memcpy(nonce_explicit, nonce_explicit_or_null, 8);
++    } else {
++        write_be64(nonce_explicit, s->client_seq);
++    }
++
++    /* AAD. */
++    uint8_t aad[13];
++    if (verimark_tls_build_aad_gcm(s->client_seq,
++                                    VERIMARK_CT_APPDATA,
++                                    VERIMARK_TLS_VERSION,
++                                    (uint16_t)plain_len,
++                                    aad, sizeof(aad)) != 13)
++        return 0;
++
++    /* Full GCM nonce = fixed_iv || nonce_explicit. */
++    uint8_t full_nonce[12];
++    memcpy(full_nonce, s->client_write_iv, 4);
++    memcpy(full_nonce + 4, nonce_explicit, 8);
++
++    /* Encrypt. */
++    uint8_t ct_tag[1024 + 16];
++    if (plain_len + 16 > sizeof(ct_tag)) return 0;
++    VerimarkCryptoResult r = verimark_aes256_gcm_encrypt(
++        s->client_write_key, full_nonce,
++        aad, 13,
++        plain, plain_len,
++        ct_tag, sizeof(ct_tag));
++    if (r != VERIMARK_CRYPTO_OK) return 0;
++
++    /* Build the TLS record. */
++    uint8_t body[8 + 1024 + 16];
++    if (8 + plain_len + 16 > sizeof(body)) return 0;
++    memcpy(body, nonce_explicit, 8);
++    memcpy(body + 8, ct_tag, plain_len + 16);
++    size_t n = verimark_tls_encode_record(VERIMARK_CT_APPDATA,
++                                          body, 8 + plain_len + 16,
++                                          out, out_size);
++    if (n == 0) return 0;
++
++    s->client_seq++;
++    return n;
++}
++
++
++/* ---- close_notify : graceful session termination ----------------------- */
++
++bool verimark_session_send_close_notify(VerimarkSession *s,
++                                         struct VerimarkTransportIO *io)
++{
++    if (!s || !io || !io->write) return false;
++
++    /* Alert plaintext : [level=warning=1][desc=close_notify=0]. */
++    static const uint8_t plaintext[2] = { 0x01, 0x00 };
++
++    /* AAD with content_type=0x15 (Alert), version=0x0303, len=2. */
++    uint8_t aad[13];
++    if (verimark_tls_build_aad_gcm(s->client_seq,
++                                    VERIMARK_CT_ALERT,
++                                    VERIMARK_TLS_VERSION,
++                                    sizeof(plaintext),
++                                    aad, sizeof(aad)) != 13)
++        return false;
++
++    /* nonce_explicit = client_seq as u64 BE. */
++    uint8_t nonce_explicit[8];
++    write_be64(nonce_explicit, s->client_seq);
++
++    uint8_t full_nonce[12];
++    memcpy(full_nonce, s->client_write_iv, 4);
++    memcpy(full_nonce + 4, nonce_explicit, 8);
++
++    uint8_t ct_tag[2 + 16];   /* 2 plaintext + 16 tag */
++    if (verimark_aes256_gcm_encrypt(s->client_write_key, full_nonce,
++                                     aad, 13,
++                                     plaintext, sizeof(plaintext),
++                                     ct_tag, sizeof(ct_tag)) != VERIMARK_CRYPTO_OK)
++        return false;
++
++    /* Wrap as record `15 03 03 LL LL [nonce:8][ct:2][tag:16]`. */
++    uint8_t body[8 + sizeof(ct_tag)];
++    memcpy(body, nonce_explicit, 8);
++    memcpy(body + 8, ct_tag, sizeof(ct_tag));
++    uint8_t record[64];
++    size_t n = verimark_tls_encode_record(VERIMARK_CT_ALERT,
++                                           body, sizeof(body),
++                                           record, sizeof(record));
++    if (n == 0) return false;
++
++    if (!io->write(io->ctx, record, n, /*is_handshake*/ false))
++        return false;
++
++    s->client_seq++;
++
++    /* Drain : the sensor replies with its own close_notify Alert IN
++     * (mirror of the standard TLS 1.2 §7.2.1 shutdown handshake). If we
++     * don't read it, the IN endpoint keeps a pending packet that the
++     * NEXT process to open the device will read instead of its expected
++     * ServerHello — manifesting as a handshake failure on every-other
++     * invocation. Discovered 2026-05-24 while debugging the alternating
++     * OK/FAIL pattern on verimark_cli chains. Errors here are ignored :
++     * the sensor may decide not to send the mirror, in which case the
++     * read times out harmlessly. */
++    if (io->read) {
++        uint8_t drain[64];
++        size_t drain_len = 0;
++        (void)io->read(io->ctx, drain, sizeof(drain), &drain_len);
++    }
++
++    return true;
++}
++
++
++/* ---- High-level call_opcode helper ------------------------------------- */
++
++bool verimark_session_call_opcode(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint8_t opcode,
++                                  const uint8_t *payload, size_t payload_len,
++                                  uint8_t *response_buf, size_t response_buf_size,
++                                  uint16_t *status_out,
++                                  const uint8_t **response_payload_out,
++                                  size_t *response_payload_len_out)
++{
++    if (!s || !io || !io->write || !io->read || !response_buf)
++        return false;
++
++    /* Encrypt into a request record (stack-bounded). */
++    uint8_t req_record[1024];
++    size_t req_record_len = verimark_session_encrypt_appdata(
++        s, opcode, payload, payload_len,
++        /* nonce = auto from seq */ NULL,
++        req_record, sizeof(req_record));
++    if (req_record_len == 0) return false;
++
++    /* Send (is_handshake=false : no `44 00 00 00` prefix). */
++    if (!io->write(io->ctx, req_record, req_record_len, /*is_handshake*/ false))
++        return false;
++
++    /* Receive the response record. */
++    uint8_t resp_record[4096];
++    size_t resp_record_len = 0;
++    if (!io->read(io->ctx, resp_record, sizeof(resp_record), &resp_record_len))
++        return false;
++
++    /* Decrypt directly into the caller's response_buf. */
++    size_t plaintext_len = verimark_session_decrypt_appdata(
++        s, resp_record, resp_record_len,
++        response_buf, response_buf_size);
++    if (plaintext_len == 0) return false;
++    if (plaintext_len < 2) return false;   /* must at least contain status u16 */
++
++    if (status_out)
++        *status_out = (uint16_t)((response_buf[0] << 8) | response_buf[1]);
++    if (response_payload_out)
++        *response_payload_out = response_buf + 2;
++    if (response_payload_len_out)
++        *response_payload_len_out = plaintext_len - 2;
++    return true;
++}
++
++
++size_t verimark_session_decrypt_appdata(VerimarkSession *s,
++                                         const uint8_t *record, size_t record_len,
++                                         uint8_t *out, size_t out_size)
++{
++    if (!s || !record || !out) return 0;
++    /* Min record size : 5 hdr + 8 nonce + 0 plain + 16 tag = 29 (with 0-byte plaintext) */
++    if (record_len < 29) return 0;
++
++    uint8_t ct = 0;
++    uint16_t ver = 0;
++    const uint8_t *body = NULL;
++    size_t body_len = 0;
++    if (!verimark_tls_parse_record(record, record_len,
++                                    &ct, &ver, &body, &body_len))
++        return 0;
++    if (ct != VERIMARK_CT_APPDATA) return 0;
++    if (body_len < 8 + 16) return 0;   /* nonce + tag at minimum */
++    if (ver != VERIMARK_TLS_VERSION) return 0;
++
++    const uint8_t *nonce_explicit = body;
++    const uint8_t *ct_and_tag = body + 8;
++    size_t ct_and_tag_len = body_len - 8;
++    size_t plain_len = ct_and_tag_len - 16;
++
++    if (out_size < plain_len) return 0;
++
++    /* Full GCM nonce = server_write_iv || nonce_explicit. */
++    uint8_t full_nonce[12];
++    memcpy(full_nonce, s->server_write_iv, 4);
++    memcpy(full_nonce + 4, nonce_explicit, 8);
++
++    /* AAD with server_seq + plain_len. */
++    uint8_t aad[13];
++    if (verimark_tls_build_aad_gcm(s->server_seq,
++                                    VERIMARK_CT_APPDATA,
++                                    VERIMARK_TLS_VERSION,
++                                    (uint16_t)plain_len,
++                                    aad, sizeof(aad)) != 13)
++        return 0;
++
++    VerimarkCryptoResult r = verimark_aes256_gcm_decrypt(
++        s->server_write_key, full_nonce,
++        aad, 13,
++        ct_and_tag, ct_and_tag_len,
++        out, out_size);
++    if (r != VERIMARK_CRYPTO_OK) return 0;
++
++    s->server_seq++;
++    return plain_len;
++}
+diff --git a/libfprint/drivers/verimark/session.h b/libfprint/drivers/verimark/session.h
+new file mode 100644
+index 0000000..d77e88c
+--- /dev/null
++++ b/libfprint/drivers/verimark/session.h
+@@ -0,0 +1,170 @@
++/*
++ * session.h — Active TLS 1.2 session state + AppData wrappers.
++ *
++ * After the handshake completes (Phase 7.3.a, TBD), a `VerimarkSession`
++ * carries the derived AES-256-GCM keys and the per-direction sequence
++ * counters. This module provides the simplest possible API for the
++ * upper driver layer :
++ *
++ *   - `verimark_session_init_from_key_block()` populates the session
++ *     from a 72-byte TLS 1.2 key_block (AEAD-only layout).
++ *   - `verimark_session_encrypt_appdata()` produces a full TLS record
++ *     ready to send on the wire (no `44 00 00 00` transport prefix —
++ *     that one is handshake-only, removed for AppData ; cf.
++ *     `docs/phase5-tls-psk-linux.md` § "Phase 6 — premiere AppData").
++ *   - `verimark_session_decrypt_appdata()` consumes a full TLS record
++ *     and returns the plaintext (`[status:u16 BE][payload]` for Tudor
++ *     responses).
++ *
++ * The session is reusable : each call increments the appropriate
++ * sequence counter (client for encrypt, server for decrypt).
++ *
++ * **Security** : the session struct contains AES-256 keys. Never log
++ * its content. Caller should `verimark_session_zero()` it before scope
++ * exit / free.
++ */
++
++#ifndef VERIMARK_SESSION_H
++#define VERIMARK_SESSION_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++typedef struct {
++    uint8_t  client_write_key[32];
++    uint8_t  client_write_iv[4];
++    uint8_t  server_write_key[32];
++    uint8_t  server_write_iv[4];
++    uint64_t client_seq;   /* incremented after each successful encrypt */
++    uint64_t server_seq;   /* incremented after each successful decrypt */
++} VerimarkSession;
++
++
++/**
++ * Populate a session from a 72-byte TLS 1.2 key_block for AEAD-only ciphers
++ * (TLS_*_AES_256_GCM_*). Layout :
++ *   [0..32]  client_write_key
++ *   [32..64] server_write_key
++ *   [64..68] client_write_iv (4-byte fixed_iv GCM)
++ *   [68..72] server_write_iv
++ *
++ * Resets both sequence counters to 0. Returns true on success.
++ */
++bool verimark_session_init_from_key_block(VerimarkSession *s,
++                                           const uint8_t key_block[72]);
++
++
++/**
++ * Zero-fill the session struct (constant-time-ish via volatile).
++ */
++void verimark_session_zero(VerimarkSession *s);
++
++
++/**
++ * Encrypt a Tudor application command into a TLS AppData record.
++ *
++ * Plaintext on the wire = `[opcode:1][payload]`.
++ * Output record = `17 03 03 LL LL [nonce_explicit:8][ciphertext][tag:16]`.
++ *
++ * `nonce_explicit_or_null` :
++ *   - if non-NULL : the 8 bytes are used verbatim (test reproducibility).
++ *   - if NULL     : the value is `client_seq` encoded as u64 BE (default).
++ *
++ * On success returns the total record length (>= 5 + 8 + payload_len + 1 + 16)
++ * and increments `client_seq`. On failure returns 0 and leaves the
++ * session counter unchanged.
++ */
++size_t verimark_session_encrypt_appdata(VerimarkSession *s,
++                                         uint8_t opcode,
++                                         const uint8_t *payload,
++                                         size_t payload_len,
++                                         const uint8_t *nonce_explicit_or_null,
++                                         uint8_t *out, size_t out_size);
++
++
++/**
++ * High-level helper : send a Tudor opcode + payload over the live TLS
++ * session and return the parsed response.
++ *
++ * Composes encrypt_appdata + transport.write + transport.read +
++ * decrypt_appdata, with proper sequence-counter management on both sides.
++ *
++ * `transport_io` must have `is_handshake=false` semantics (no `44 00 00 00`
++ * prefix on AppData records — see Phase 6 finding).
++ *
++ * Inputs :
++ *   - `opcode`            : Tudor opcode (e.g. 0x01 = get_device_info)
++ *   - `payload`           : optional payload bytes appended after the opcode
++ *   - `payload_len`       : 0 if no payload
++ *   - `response_buf`      : caller-allocated buffer for the decrypted plaintext
++ *   - `response_buf_size` : capacity of `response_buf`
++ *
++ * Outputs (only written on success) :
++ *   - `*status_out`       : Tudor response status u16 BE (first 2 bytes of plaintext)
++ *   - `*response_payload_out` : pointer INTO `response_buf` (= response_buf + 2)
++ *   - `*response_payload_len_out` : length of payload (plaintext_len - 2)
++ *
++ * Returns true on transport+crypto success. The Tudor protocol-level status
++ * (`*status_out`) may still be non-zero (e.g. UNKNOWN_OPCODE) — that's the
++ * caller's responsibility to inspect.
++ *
++ * Returns false on any of : transport I/O failure, GCM tag mismatch, record
++ * malformed, response too short to contain a u16 status.
++ */
++struct VerimarkTransportIO;
++
++bool verimark_session_call_opcode(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint8_t opcode,
++                                  const uint8_t *payload, size_t payload_len,
++                                  uint8_t *response_buf, size_t response_buf_size,
++                                  uint16_t *status_out,
++                                  const uint8_t **response_payload_out,
++                                  size_t *response_payload_len_out);
++
++
++/**
++ * Send a TLS close_notify alert (level=warning, desc=0) over the active
++ * session, then increment `client_seq`. The alert payload `01 00` is
++ * encrypted with the current AES-GCM key under content_type=0x15.
++ *
++ * This is the polite way to terminate a session — it signals the sensor
++ * to drop its session state. Without it, the sensor often holds onto
++ * stale crypto state and rejects the next handshake until a USB reset
++ * cycle.
++ *
++ * Returns true if the alert was transmitted successfully ; false on
++ * transport or crypto error. The session is zeroed by the caller
++ * (typically via `verimark_session_zero()` after this call).
++ */
++bool verimark_session_send_close_notify(VerimarkSession *s,
++                                         struct VerimarkTransportIO *io);
++
++
++/**
++ * Decrypt a received TLS AppData record into its plaintext.
++ *
++ * `record` must be a full record `17 03 03 LL LL ...`. The function
++ * checks the content type and length, then decrypts using
++ * `server_write_*` with the current `server_seq`.
++ *
++ * On success returns the plaintext length and increments `server_seq`.
++ * On failure returns 0 and leaves the session counter unchanged ; this
++ * includes the case of an invalid GCM tag (potential tampering).
++ */
++size_t verimark_session_decrypt_appdata(VerimarkSession *s,
++                                         const uint8_t *record, size_t record_len,
++                                         uint8_t *out, size_t out_size);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_SESSION_H */
+diff --git a/libfprint/drivers/verimark/storage.c b/libfprint/drivers/verimark/storage.c
+new file mode 100644
+index 0000000..1b40a15
+--- /dev/null
++++ b/libfprint/drivers/verimark/storage.c
+@@ -0,0 +1,191 @@
++/*
++ * storage.c — Tudor storage layer 2 opcodes implementation.
++ *
++ * Each wrapper just builds the request payload, calls
++ * `verimark_session_call_opcode()`, and parses the response payload
++ * according to docs/opcodes/0x{9e,9f,a0}.yaml.
++ */
++
++#include "storage.h"
++
++#include <string.h>
++
++#include "handshake.h"   /* for VerimarkTransportIO definition */
++
++
++/* ---------------------------------------------------------------------------
++ * Common helpers
++ * ------------------------------------------------------------------------- */
++
++static inline uint16_t read_le16(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x9e — GetDbInfo
++ * ------------------------------------------------------------------------- */
++
++/* Response layout (Phase 9 step 4.2 runtime + Ghidra FUN_180085320:61901-3):
++ *   The Ghidra code reads u16 LE at offsets 0x16, 0x1c, 0x22 of the
++ *   FULL response (including the leading status u16 BE). Since
++ *   `verimark_session_call_opcode()` strips the status before handing
++ *   us the payload, our payload-relative offsets are minus 2 :
++ *     +0x14 = count_class_1
++ *     +0x1a = count_class_2
++ *     +0x20 = count_class_3
++ */
++#define DB_INFO_OFFSET_COUNT_1   0x14u
++#define DB_INFO_OFFSET_COUNT_2   0x1au
++#define DB_INFO_OFFSET_COUNT_3   0x20u
++#define DB_INFO_MIN_PAYLOAD_LEN  (DB_INFO_OFFSET_COUNT_3 + 2u)  /* 0x22 = 34 */
++
++bool verimark_storage_get_db_info(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint8_t class_byte,
++                                  VerimarkStorageDbInfo *out,
++                                  uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    uint8_t req_payload[1] = { class_byte };
++    uint8_t resp_buf[64];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x9e,
++        req_payload, sizeof(req_payload),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* transport OK, sensor-level error reported in status */
++    if (payload_len < DB_INFO_MIN_PAYLOAD_LEN || !payload)
++        return false;  /* malformed reply : transport-level failure */
++
++    out->count_class_1 = read_le16(payload + DB_INFO_OFFSET_COUNT_1);
++    out->count_class_2 = read_le16(payload + DB_INFO_OFFSET_COUNT_2);
++    out->count_class_3 = read_le16(payload + DB_INFO_OFFSET_COUNT_3);
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x9f — GetObjectList
++ * ------------------------------------------------------------------------- */
++
++/* Response layout (Phase 9 step 4.2 runtime):
++ *     +0x00 = count : u8
++ *     +0x01 = reserved : u8
++ *     +0x02 = tuids[count * 16] : opaque
++ */
++bool verimark_storage_get_object_list(VerimarkSession *s,
++                                      struct VerimarkTransportIO *io,
++                                      uint8_t class_byte,
++                                      VerimarkStorageObjectList *out,
++                                      uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    uint8_t req_payload[1] = { class_byte };
++    /* 2 header bytes + 8 tuids * 16 bytes = 130 bytes max payload */
++    uint8_t resp_buf[256];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x9f,
++        req_payload, sizeof(req_payload),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    out->count = 0;
++    if (status != 0x0000)
++        return true;
++    if (payload_len < 2 || !payload)
++        return false;
++
++    size_t reported = (size_t)payload[0];
++    /* Sanity check : the response must carry that many tuids. */
++    if (payload_len < 2 + reported * VERIMARK_STORAGE_TUID_LEN)
++        return false;
++
++    /* Truncate at our compile-time cap. The Windows Hello / libfprint
++     * convention is 10 fingers max (we cap at 8 which matches the
++     * sensor's observed enrollment count). */
++    size_t to_copy = reported;
++    if (to_copy > VERIMARK_STORAGE_MAX_OBJECTS)
++        to_copy = VERIMARK_STORAGE_MAX_OBJECTS;
++
++    for (size_t i = 0; i < to_copy; i++) {
++        memcpy(out->tuids[i],
++               payload + 2 + i * VERIMARK_STORAGE_TUID_LEN,
++               VERIMARK_STORAGE_TUID_LEN);
++    }
++    out->count = to_copy;
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0xa0 — GetObjectInfo
++ * ------------------------------------------------------------------------- */
++
++/* Request payload (per Ghidra FUN_180086060:62178-82) :
++ *   [opcode]
++ *   [class:1] [pad:3 = 00 00 00] [tuid:16]
++ *   = 21 bytes total, 20 bytes payload after the opcode.
++ */
++bool verimark_storage_get_object_info(VerimarkSession *s,
++                                      struct VerimarkTransportIO *io,
++                                      uint8_t class_byte,
++                                      const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                                      VerimarkStorageObjectInfo *out,
++                                      uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out || !tuid)
++        return false;
++
++    uint8_t req_payload[20];
++    memset(req_payload, 0, sizeof(req_payload));
++    req_payload[0] = class_byte;
++    /* req_payload[1..4] = padding zeros, already set by memset */
++    memcpy(req_payload + 4, tuid, VERIMARK_STORAGE_TUID_LEN);
++
++    uint8_t resp_buf[64];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0xa0,
++        req_payload, sizeof(req_payload),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;
++    if (payload_len < sizeof(out->bytes) || !payload)
++        return false;
++
++    memcpy(out->bytes, payload, sizeof(out->bytes));
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/storage.h b/libfprint/drivers/verimark/storage.h
+new file mode 100644
+index 0000000..08843da
+--- /dev/null
++++ b/libfprint/drivers/verimark/storage.h
+@@ -0,0 +1,149 @@
++/*
++ * storage.h — Tudor storage layer 2 opcodes (database + objects).
++ *
++ * Wraps the storage-layer-2 opcodes (0x9e, 0x9f, 0xa0) over an active
++ * TLS session. The Synaptics sensor stores biometric enrollments in
++ * its internal flash partitioned by "class" (class 1 = enrollments
++ * proper, class 2/3 = template payloads with restricted access).
++ *
++ * See:
++ *   - docs/opcodes/0x9e.yaml — get_db_info
++ *   - docs/opcodes/0x9f.yaml — get_object_list
++ *   - docs/opcodes/0xa0.yaml — get_object_info
++ *   - docs/phase8-ghidra-findings.md § Layer 2 storage
++ *
++ * Class 1 is the only class we observe enrollments on with the
++ * 8-finger Windows Hello configuration. The cap of 8 below mirrors
++ * libfprint's typical max enrollments per user.
++ */
++
++#ifndef VERIMARK_STORAGE_H
++#define VERIMARK_STORAGE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "session.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/* Forward-declared transport vtable (see handshake.h). */
++struct VerimarkTransportIO;
++
++
++/* ---------------------------------------------------------------------------
++ * 0x9e — tudorCmdGetDbInfo
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Database object counts per class. Returned by `0x9e GetDbInfo`.
++ *
++ * Runtime semantic (Phase 9 step 4.2, 8-finger reference):
++ *   count_class_1 = 8 (= number of fingerprints enrolled)
++ *   count_class_2 / count_class_3 = sensor-side metadata, exact meaning TBD.
++ */
++typedef struct {
++    uint16_t count_class_1;
++    uint16_t count_class_2;
++    uint16_t count_class_3;
++} VerimarkStorageDbInfo;
++
++/**
++ * Send opcode `0x9e` and parse the response.
++ *
++ * `class_byte` is the request parameter ; runtime confirms only
++ * `0x01` returns a useful response (0x00/0x02/0x03 give error codes).
++ *
++ * On success, returns true and fills `*out`. `*status_out` carries
++ * the Tudor protocol status (0x0000 on full success).
++ *
++ * Returns false on transport / crypto failure (the response was not
++ * even received or decrypted).
++ */
++bool verimark_storage_get_db_info(VerimarkSession *s,
++                                  struct VerimarkTransportIO *io,
++                                  uint8_t class_byte,
++                                  VerimarkStorageDbInfo *out,
++                                  uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x9f — tudorCmdGetObjectList
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_STORAGE_MAX_OBJECTS 8
++#define VERIMARK_STORAGE_TUID_LEN    16
++
++/**
++ * Object list returned by `0x9f GetObjectList`. Up to 8 tuids of 16
++ * octets each (= libfprint's typical max enrollments per user).
++ */
++typedef struct {
++    size_t  count;
++    uint8_t tuids[VERIMARK_STORAGE_MAX_OBJECTS][VERIMARK_STORAGE_TUID_LEN];
++} VerimarkStorageObjectList;
++
++/**
++ * Send opcode `0x9f` and parse the response.
++ *
++ * `class_byte` selects which class to enumerate. Runtime confirms
++ * `0x01` returns the user enrollments ; class 2 and 3 return
++ * status 0x0504 ("empty class") on the reference sensor.
++ *
++ * Truncates silently if the sensor returns more than
++ * `VERIMARK_STORAGE_MAX_OBJECTS` entries (highly unlikely given the
++ * 8-finger Windows Hello cap).
++ */
++bool verimark_storage_get_object_list(VerimarkSession *s,
++                                      struct VerimarkTransportIO *io,
++                                      uint8_t class_byte,
++                                      VerimarkStorageObjectList *out,
++                                      uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0xa0 — tudorCmdGetObjectInfo
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Object metadata returned by `0xa0 GetObjectInfo`. Exact field
++ * semantics are unidentified ; runtime shows all zeros for class=1
++ * (probably "metadata not exposed for enrollment master IDs").
++ *
++ * Stored verbatim from the wire ; the caller can introspect.
++ */
++typedef struct {
++    uint8_t bytes[10];
++} VerimarkStorageObjectInfo;
++
++/**
++ * Send opcode `0xa0` and parse the response.
++ *
++ * Request payload (20 octets, per Ghidra FUN_180086060 lines
++ * 62178-62182): `[class:1][pad:3=00 00 00][tuid:16]`.
++ *
++ * Runtime confirms class=1 returns 10 zero bytes for any tuid from
++ * `get_object_list(class=1)` ; class 2/3 with class-1 tuids return
++ * status 0x8306 ("no such object").
++ *
++ * NB: opcode `0xa1 GetObjectData` (template extraction) refuses
++ * systematically — likely the Match-on-Chip protection in action.
++ * See `docs/opcodes/0xa1.yaml` ; not exposed by this module.
++ */
++bool verimark_storage_get_object_info(VerimarkSession *s,
++                                      struct VerimarkTransportIO *io,
++                                      uint8_t class_byte,
++                                      const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                                      VerimarkStorageObjectInfo *out,
++                                      uint16_t *status_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_STORAGE_H */
+diff --git a/libfprint/drivers/verimark/tls.c b/libfprint/drivers/verimark/tls.c
+new file mode 100644
+index 0000000..2634dad
+--- /dev/null
++++ b/libfprint/drivers/verimark/tls.c
+@@ -0,0 +1,236 @@
++/*
++ * tls.c — TLS 1.2 record + handshake message builders/parsers.
++ *
++ * Pure C, no dependencies (no GnuTLS here — see crypto.c for
++ * crypto). Compiles standalone with `-DVERIMARK_STANDALONE`.
++ *
++ * All multi-byte integers on the wire are big-endian.
++ */
++
++#include "tls.h"
++
++#include <string.h>
++
++
++static inline void write_be16(uint8_t *p, uint16_t v) {
++    p[0] = (uint8_t)(v >> 8);
++    p[1] = (uint8_t)(v & 0xff);
++}
++
++static inline void write_be24(uint8_t *p, uint32_t v) {
++    p[0] = (uint8_t)((v >> 16) & 0xff);
++    p[1] = (uint8_t)((v >> 8) & 0xff);
++    p[2] = (uint8_t)(v & 0xff);
++}
++
++static inline void write_be64(uint8_t *p, uint64_t v) {
++    p[0] = (uint8_t)((v >> 56) & 0xff);
++    p[1] = (uint8_t)((v >> 48) & 0xff);
++    p[2] = (uint8_t)((v >> 40) & 0xff);
++    p[3] = (uint8_t)((v >> 32) & 0xff);
++    p[4] = (uint8_t)((v >> 24) & 0xff);
++    p[5] = (uint8_t)((v >> 16) & 0xff);
++    p[6] = (uint8_t)((v >> 8) & 0xff);
++    p[7] = (uint8_t)(v & 0xff);
++}
++
++static inline uint16_t read_be16(const uint8_t *p) {
++    return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++
++/* ---- Record layer -------------------------------------------------------- */
++
++size_t verimark_tls_encode_record(uint8_t content_type,
++                                  const uint8_t *body, size_t body_len,
++                                  uint8_t *out, size_t out_size)
++{
++    if (!out || (body_len > 0 && !body)) return 0;
++    if (body_len > 0xffff) return 0;
++    if (out_size < 5 + body_len) return 0;
++    out[0] = content_type;
++    write_be16(out + 1, VERIMARK_TLS_VERSION);
++    write_be16(out + 3, (uint16_t)body_len);
++    if (body_len) memcpy(out + 5, body, body_len);
++    return 5 + body_len;
++}
++
++
++bool verimark_tls_parse_record(const uint8_t *record, size_t record_len,
++                               uint8_t *ct, uint16_t *version,
++                               const uint8_t **body, size_t *body_len)
++{
++    if (!record || record_len < 5) return false;
++    uint16_t ver = read_be16(record + 1);
++    uint16_t blen = read_be16(record + 3);
++    if (5u + blen > record_len) return false;  /* truncated body */
++    if (ct)       *ct       = record[0];
++    if (version)  *version  = ver;
++    if (body)     *body     = record + 5;
++    if (body_len) *body_len = blen;
++    return true;
++}
++
++
++/* ---- Handshake message encode ------------------------------------------- */
++
++size_t verimark_tls_encode_handshake_msg(uint8_t hs_type,
++                                          const uint8_t *body, size_t body_len,
++                                          uint8_t *out, size_t out_size)
++{
++    if (!out || (body_len > 0 && !body)) return 0;
++    if (body_len > 0xffffff) return 0;
++    if (out_size < 4 + body_len) return 0;
++    out[0] = hs_type;
++    write_be24(out + 1, (uint32_t)body_len);
++    if (body_len) memcpy(out + 4, body, body_len);
++    return 4 + body_len;
++}
++
++
++/* ---- ClientHello (Synaptics format, 80 octets) -------------------------- */
++
++size_t verimark_tls_build_client_hello(const uint8_t random_32[32],
++                                       uint8_t *out, size_t out_size)
++{
++    /* Reverse-engineered from synaWudfBioUsb132.dll FUN_180072530, validated
++     * runtime (Phase 5). Layout :
++     *   [5]   TLS record hdr  : 16 03 03 00 4b   (len = 75)
++     *   [4]   HS hdr          : 01 00 00 47      (ClientHello, len 71)
++     *   [2]   version         : 03 03
++     *   [32]  random
++     *   [1]   session_id_len  : 07
++     *   [7]   session_id      : 00 × 7
++     *   [2]   cs_len          : 00 0c
++     *   [12]  cipher_suites   : c0 05 c0 2e 00 3d 00 8d 00 a8 00 a9
++     *   [1]   comp_meth_len   : 00              (Synaptics quirk, RFC says ≥1)
++     *   [2]   ext_list_len    : 00 0a
++     *   [6]   ext supported_groups : 00 04 00 02 00 17
++     *   [6]   ext ec_point_formats : 00 0b 00 02 01 00
++     */
++    if (!out || !random_32) return 0;
++    if (out_size < 80) return 0;
++    static const uint8_t head[] = {
++        0x16, 0x03, 0x03, 0x00, 0x4b,            /* record hdr */
++        0x01, 0x00, 0x00, 0x47,                  /* HS hdr */
++        0x03, 0x03,                               /* version */
++    };
++    static const uint8_t tail[] = {
++        0x07,                                                /* sid_len */
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            /* sid */
++        0x00, 0x0c,                                          /* cs_len */
++        0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d,                   /* cs */
++        0x00, 0x8d, 0x00, 0xa8, 0x00, 0xa9,
++        0x00,                                                /* comp_meth_len */
++        0x00, 0x0a,                                          /* ext_list_len */
++        0x00, 0x04, 0x00, 0x02, 0x00, 0x17,                   /* ext supported_groups */
++        0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,                   /* ext ec_point_formats */
++    };
++    memcpy(out, head, sizeof(head));
++    memcpy(out + sizeof(head), random_32, 32);
++    memcpy(out + sizeof(head) + 32, tail, sizeof(tail));
++    return 80;
++}
++
++
++/* ---- Certificate body --------------------------------------------------- */
++
++size_t verimark_tls_build_certificate_body(const uint8_t client_cert_400[400],
++                                            uint8_t *out, size_t out_size)
++{
++    if (!out || !client_cert_400) return 0;
++    if (out_size < 408) return 0;
++    /* chain_len = 400 (3 octets BE), cert#0_len = 400 (3 octets BE),
++     * magic 0x0d 0xd0, then cert. Synaptics format. */
++    write_be24(out + 0, 400);
++    write_be24(out + 3, 400);
++    out[6] = 0x0d;
++    out[7] = 0xd0;
++    memcpy(out + 8, client_cert_400, 400);
++    return 408;
++}
++
++
++/* ---- ClientKeyExchange body --------------------------------------------- */
++
++size_t verimark_tls_build_cke_body(const uint8_t eph_pub_uncompressed[65],
++                                    uint8_t *out, size_t out_size)
++{
++    if (!out || !eph_pub_uncompressed) return 0;
++    if (eph_pub_uncompressed[0] != 0x04) return 0;
++    if (out_size < 65) return 0;
++    memcpy(out, eph_pub_uncompressed, 65);
++    return 65;
++}
++
++
++/* ---- CertificateVerify body --------------------------------------------- */
++
++size_t verimark_tls_build_cv_body(const uint8_t *sig_der, size_t sig_der_len,
++                                   uint8_t *out, size_t out_size)
++{
++    if (!out || !sig_der) return 0;
++    if (out_size < sig_der_len) return 0;
++    memcpy(out, sig_der, sig_der_len);
++    return sig_der_len;
++}
++
++
++/* ---- Finished body ------------------------------------------------------ */
++
++size_t verimark_tls_build_finished_body(const uint8_t *verify_data,
++                                         size_t verify_data_len,
++                                         uint8_t *out, size_t out_size)
++{
++    if (!out || !verify_data) return 0;
++    if (out_size < 4 + verify_data_len) return 0;
++    if (verify_data_len > 0xffffff) return 0;
++    out[0] = VERIMARK_HS_FINISHED;
++    write_be24(out + 1, (uint32_t)verify_data_len);
++    memcpy(out + 4, verify_data, verify_data_len);
++    return 4 + verify_data_len;
++}
++
++
++/* ---- AAD GCM ------------------------------------------------------------ */
++
++size_t verimark_tls_build_aad_gcm(uint64_t seq_num, uint8_t content_type,
++                                   uint16_t version, uint16_t plaintext_len,
++                                   uint8_t *out, size_t out_size)
++{
++    if (!out || out_size < 13) return 0;
++    write_be64(out + 0, seq_num);
++    out[8] = content_type;
++    write_be16(out + 9, version);
++    write_be16(out + 11, plaintext_len);
++    return 13;
++}
++
++
++/* ---- ServerHello parser ------------------------------------------------- */
++
++bool verimark_tls_parse_server_hello(const uint8_t *body, size_t body_len,
++                                     uint8_t server_random_out[32],
++                                     uint16_t *cipher_suite_out)
++{
++    /* Layout (Synaptics-compatible, RFC 5246 §7.4.1.3) :
++     *   [2]    legacy_version
++     *   [32]   server_random
++     *   [1]    session_id_len  (typically 7 ; "TLS" + 4 random bytes)
++     *   [N]    session_id (N = session_id_len)
++     *   [2]    cipher_suite
++     *   then comp_method + extensions (Synaptics format diverges here, we
++     *   don't need to parse).
++     */
++    if (!body || body_len < 2 + 32 + 1) return false;
++    size_t off = 0;
++    off += 2;  /* skip legacy_version */
++    if (server_random_out) memcpy(server_random_out, body + off, 32);
++    off += 32;
++    uint8_t sid_len = body[off++];
++    if (off + sid_len + 2 > body_len) return false;
++    off += sid_len;
++    uint16_t cs = read_be16(body + off);
++    if (cipher_suite_out) *cipher_suite_out = cs;
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/tls.h b/libfprint/drivers/verimark/tls.h
+new file mode 100644
+index 0000000..796db77
+--- /dev/null
++++ b/libfprint/drivers/verimark/tls.h
+@@ -0,0 +1,166 @@
++/*
++ * tls.h — TLS 1.2 record + handshake message builders/parsers for
++ * the VeriMark/Synaptics driver.
++ *
++ * This module implements the **wire format** specific to Synaptics (cipher
++ * 0xc02e custom variant). It does NOT do any crypto — see crypto.h
++ * for PRF, GCM, ECDH, ECDSA. The two layers compose : builders produce
++ * plaintext bytes that the crypto layer wraps in GCM, parsers undo the
++ * record header before the crypto layer decrypts.
++ *
++ * Synaptics quirks encoded here :
++ *   - ClientHello : version 0x0303, 6 cipher suites (incl. 0xc02e), session_id
++ *     of 7 zero bytes, compression_methods_length=0 (non-RFC), 2 extensions
++ *     custom (0x0004 type 0x0017, 0x000b type 0x0100).
++ *   - Certificate body : `[chain_len:3 BE][cert#0_len:3 BE][magic 0d d0:2][cert:400]`.
++ *     Magic `0d d0` is a constant Synaptics field (validated runtime).
++ *   - ClientKeyExchange body : `04 || X || Y` (65 octets, no length prefix).
++ *   - CertificateVerify body : DER ECDSA signature directly, NO
++ *     SignatureAndHashAlgorithm prefix.
++ *
++ * Layer style : zero-copy where possible (parsers return pointers into the
++ * caller's buffer). All functions return `bool` ; on `false` the caller may
++ * read `*err` if non-NULL.
++ */
++
++#ifndef VERIMARK_TLS_H
++#define VERIMARK_TLS_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/* ---- Record layer constants (TLS 1.2) ----------------------------------- */
++
++#define VERIMARK_TLS_VERSION 0x0303u
++
++#define VERIMARK_CT_CCS          0x14
++#define VERIMARK_CT_ALERT        0x15
++#define VERIMARK_CT_HANDSHAKE    0x16
++#define VERIMARK_CT_APPDATA      0x17
++
++#define VERIMARK_HS_CLIENT_HELLO        0x01
++#define VERIMARK_HS_SERVER_HELLO        0x02
++#define VERIMARK_HS_CERTIFICATE         0x0b
++#define VERIMARK_HS_CERTIFICATE_VERIFY  0x0f
++#define VERIMARK_HS_CLIENT_KEY_EXCHANGE 0x10
++#define VERIMARK_HS_FINISHED            0x14
++
++
++/* ---- Record encoding/decoding ------------------------------------------- */
++
++/* Encode a TLS record header `[ct:1][ver:2 BE][len:2 BE]` then copy `body`.
++ *
++ * Returns the total bytes written (5 + body_len) on success, or 0 on
++ * buffer too small / body too large for u16.
++ */
++size_t verimark_tls_encode_record(uint8_t content_type,
++                                  const uint8_t *body, size_t body_len,
++                                  uint8_t *out, size_t out_size);
++
++
++/* Parse a TLS record header. On success returns true and fills `*ct`,
++ * `*version`, `*body`, `*body_len`. `*body` points INTO `record` (no copy).
++ */
++bool verimark_tls_parse_record(const uint8_t *record, size_t record_len,
++                               uint8_t *ct,
++                               uint16_t *version,
++                               const uint8_t **body,
++                               size_t *body_len);
++
++
++/* ---- Handshake message encoding ----------------------------------------- */
++
++/* Encode `[type:1][len:u24 BE][body]`. Returns total bytes written
++ * (4 + body_len) or 0 on overflow. */
++size_t verimark_tls_encode_handshake_msg(uint8_t hs_type,
++                                          const uint8_t *body, size_t body_len,
++                                          uint8_t *out, size_t out_size);
++
++
++/* ---- Synaptics-specific HS builders ------------------------------------- */
++
++/* Build the full ClientHello record (80 octets) with the Synaptics format.
++ * `random_32` is the 32-byte ClientHello.random.
++ *
++ * Returns 80 on success, 0 on buffer too small.
++ */
++size_t verimark_tls_build_client_hello(const uint8_t random_32[32],
++                                       uint8_t *out, size_t out_size);
++
++
++/* Build the Certificate body (NOT the full HS message) :
++ *   `[chain_len 3 BE = 400][cert#0_len 3 BE = 400][magic 0d d0][cert_400]`
++ *
++ * Returns 408 on success, 0 on buffer too small.
++ */
++size_t verimark_tls_build_certificate_body(const uint8_t client_cert_400[400],
++                                            uint8_t *out, size_t out_size);
++
++
++/* Build the ClientKeyExchange body (NOT the full HS message) :
++ *   `04 || X_be(32) || Y_be(32)` = 65 octets.
++ *
++ * Returns 65 on success, 0 on buffer too small.
++ */
++size_t verimark_tls_build_cke_body(const uint8_t eph_pub_uncompressed[65],
++                                    uint8_t *out, size_t out_size);
++
++
++/* Build the CertificateVerify body (NOT the full HS message) :
++ *   the raw DER ECDSA signature (NO SignatureAndHash prefix).
++ *
++ * For Synaptics, the signature is DER ECDSA P-256/SHA-256 (70..72 octets).
++ * Returns `sig_der_len` on success, 0 on buffer too small.
++ */
++size_t verimark_tls_build_cv_body(const uint8_t *sig_der, size_t sig_der_len,
++                                   uint8_t *out, size_t out_size);
++
++
++/* Build the Finished body : `[HS_FINISHED:1][len:u24 BE = verify_data_len][verify_data]`.
++ *
++ * Returns 4 + verify_data_len on success, 0 on buffer too small.
++ *
++ * Note : caller typically passes verify_data_len=12 (standard TLS 1.2).
++ */
++size_t verimark_tls_build_finished_body(const uint8_t *verify_data,
++                                         size_t verify_data_len,
++                                         uint8_t *out, size_t out_size);
++
++
++/* ---- AAD GCM (TLS 1.2 record auth tag) ---------------------------------- */
++
++/* Build the AAD for AES-256-GCM record authentication :
++ *   `seq_num:u64 BE || content_type:u8 || version:u16 BE || plaintext_len:u16 BE`
++ *
++ * Always writes 13 bytes. Returns 13 on success, 0 if out_size < 13.
++ */
++size_t verimark_tls_build_aad_gcm(uint64_t seq_num, uint8_t content_type,
++                                   uint16_t version, uint16_t plaintext_len,
++                                   uint8_t *out, size_t out_size);
++
++
++/* ---- ServerHello parser (Synaptics custom format) ----------------------- */
++
++/* Parse a ServerHello HS body and extract the 32-byte server_random and the
++ * chosen cipher suite.
++ *
++ * `body` points to the HS body (NOT including the 4-byte HS header).
++ *
++ * Returns true on success, false on parse error.
++ */
++bool verimark_tls_parse_server_hello(const uint8_t *body, size_t body_len,
++                                     uint8_t server_random_out[32],
++                                     uint16_t *cipher_suite_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_TLS_H */
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+new file mode 100644
+index 0000000..05ccbf6
+--- /dev/null
++++ b/libfprint/drivers/verimark/transport.c
+@@ -0,0 +1,336 @@
++/*
++ * transport.c — USB vendor transport for the VeriMark DT (libgusb backend).
++ *
++ * Implements the primitives declared in transport.h using
++ * GUsbDevice (libgusb 0.4+), as required by upstream libfprint.
++ *
++ * For standalone tests (without libfprint installed), a parallel
++ * libusb-1.0 implementation could be added (TODO: verimark-transport-libusb.c).
++ * The high-level helpers (`verimark_transceive`, `verimark_init_sequence`)
++ * only depend on the `verimark_ctrl_out` / `verimark_ctrl_in` primitives,
++ * so they are shared across backends.
++ *
++ * Status: Phase 6 skeleton. The high-level logic mirrors the
++ * synaWudfBioUsb132.dll pseudo-C (see ../../docs/protocol.md and
++ * ../../docs/phase5-tls-psk-linux.md) and the Python prototype
++ * ../../tools/verimark_transport.py. Building requires libgusb 0.4+
++ * (provided by shell.nix; see ../../README.md).
++ */
++
++#include "proto.h"
++#include "transport.h"
++#include "handshake.h"   /* for VerimarkTransportIO struct */
++
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++
++#ifdef VERIMARK_HAVE_LIBGUSB
++#include <gusb.h>
++#endif
++
++
++/* The handle wraps a GUsbDevice * (libgusb build) or another native handle. */
++struct VerimarkUsbHandle {
++    void *native;  /* GUsbDevice * in libgusb build */
++};
++
++
++VerimarkUsbHandle *verimark_handle_new(void *native)
++{
++    VerimarkUsbHandle *h = (VerimarkUsbHandle *)calloc(1, sizeof(*h));
++    if (h == NULL)
++        return NULL;
++    h->native = native;
++    return h;
++}
++
++
++void verimark_handle_free(VerimarkUsbHandle *h)
++{
++    free(h);
++}
++
++
++/* --- Low-level primitives (libgusb) --------------------------------------- */
++
++#ifdef VERIMARK_HAVE_LIBGUSB
++
++VerimarkResult verimark_ctrl_out(VerimarkUsbHandle *h,
++                                 uint8_t bRequest,
++                                 uint16_t wValue,
++                                 uint16_t wIndex,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms)
++{
++    if (h == NULL || (data_len > 0 && data == NULL))
++        return VERIMARK_ERR_INVALID_ARG;
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_autoptr(GError) error = NULL;
++    gsize actual = 0;
++    gboolean ok = g_usb_device_control_transfer(
++        dev,
++        G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        bRequest, wValue, wIndex,
++        (guint8 *)data, data_len, &actual,
++        timeout_ms, NULL, &error);
++    if (!ok)
++        return VERIMARK_ERR_TRANSPORT;
++    if (actual != data_len)
++        return VERIMARK_ERR_SHORT_READ;
++    return VERIMARK_OK;
++}
++
++
++VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
++                                uint8_t bRequest,
++                                uint16_t wValue,
++                                uint16_t wIndex,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms)
++{
++    if (h == NULL || data == NULL)
++        return VERIMARK_ERR_INVALID_ARG;
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_autoptr(GError) error = NULL;
++    gsize actual = 0;
++    gboolean ok = g_usb_device_control_transfer(
++        dev,
++        G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        bRequest, wValue, wIndex,
++        data, data_size, &actual,
++        timeout_ms, NULL, &error);
++    if (!ok)
++        return VERIMARK_ERR_TRANSPORT;
++    if (received)
++        *received = (size_t)actual;
++    return VERIMARK_OK;
++}
++
++#else
++
++/* Stubs when libgusb is not available — allow the high-level layer to
++ * compile outside libfprint (e.g., tests). Linking against these stubs
++ * means runtime calls will fail with VERIMARK_ERR_TRANSPORT. */
++
++VerimarkResult verimark_ctrl_out(VerimarkUsbHandle *h,
++                                 uint8_t bRequest,
++                                 uint16_t wValue,
++                                 uint16_t wIndex,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms)
++{
++    (void)h; (void)bRequest; (void)wValue; (void)wIndex;
++    (void)data; (void)data_len; (void)timeout_ms;
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
++                                uint8_t bRequest,
++                                uint16_t wValue,
++                                uint16_t wIndex,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms)
++{
++    (void)h; (void)bRequest; (void)wValue; (void)wIndex;
++    (void)data; (void)data_size; (void)received; (void)timeout_ms;
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
++
++
++/* --- Backend-independent high-level helpers ------------------------------- */
++
++VerimarkResult verimark_init_sequence(VerimarkUsbHandle *h,
++                                      uint8_t *init_status,
++                                      unsigned timeout_ms)
++{
++    /* Step 1: bRequest=0x19 OUT, wValue=0x0001, no data */
++    VerimarkResult r = verimark_ctrl_out(h, VERIMARK_REQ_CTRL_19, 0x0001, 0,
++                                         NULL, 0, timeout_ms);
++    if (r != VERIMARK_OK)
++        return r;
++
++    /* Step 2: bRequest=0x1A IN, wLength=1 */
++    uint8_t byte = 0;
++    size_t received = 0;
++    r = verimark_ctrl_in(h, VERIMARK_REQ_READ_1A, 0x0000, 0,
++                        &byte, 1, &received, timeout_ms);
++    if (r != VERIMARK_OK)
++        return r;
++    if (received < 1)
++        return VERIMARK_ERR_SHORT_READ;
++    if (init_status)
++        *init_status = byte;
++    return VERIMARK_OK;
++}
++
++
++VerimarkResult verimark_read_tls_status(VerimarkUsbHandle *h,
++                                        uint8_t status_bytes[2],
++                                        unsigned timeout_ms)
++{
++    if (status_bytes == NULL)
++        return VERIMARK_ERR_INVALID_ARG;
++    size_t received = 0;
++    VerimarkResult r = verimark_ctrl_in(h, VERIMARK_REQ_TLS_STATUS,
++                                        0x0000, 0,
++                                        status_bytes, 2, &received,
++                                        timeout_ms);
++    if (r != VERIMARK_OK)
++        return r;
++    if (received < 2)
++        return VERIMARK_ERR_SHORT_READ;
++    return VERIMARK_OK;
++}
++
++
++/* --- VerimarkTransportIO adapter ----------------------------------------- */
++
++#define VERIMARK_TLS_HANDSHAKE_PREFIX_LEN 4
++static const uint8_t VERIMARK_TLS_HANDSHAKE_PREFIX[VERIMARK_TLS_HANDSHAKE_PREFIX_LEN] = {
++    0x44, 0x00, 0x00, 0x00,
++};
++
++static bool transport_io_write(void *ctx_v, const uint8_t *data, size_t len,
++                                bool is_handshake)
++{
++    VerimarkTransportIoCtx *ctx = (VerimarkTransportIoCtx *)ctx_v;
++    if (!ctx || !ctx->h) return false;
++
++    /* Compose : optional 44 00 00 00 prefix + record bytes, padded to 8. */
++    size_t prefix = is_handshake ? VERIMARK_TLS_HANDSHAKE_PREFIX_LEN : 0;
++    size_t logical = prefix + len;
++    size_t aligned = verimark_align_up(logical);
++
++    uint8_t stack_buf[2048];
++    uint8_t *buf = stack_buf;
++    uint8_t *heap = NULL;
++    if (aligned > sizeof(stack_buf)) {
++        heap = (uint8_t *)malloc(aligned);
++        if (!heap) return false;
++        buf = heap;
++    }
++    memset(buf, 0, aligned);
++    if (prefix) memcpy(buf, VERIMARK_TLS_HANDSHAKE_PREFIX, prefix);
++    memcpy(buf + prefix, data, len);
++
++    /* wValue is computed from the SYNAPTICS formula on the logical length
++     * (= what's sent before alignment padding). */
++    uint16_t wvalue = verimark_compute_wvalue_write(logical);
++
++    VerimarkResult r = verimark_ctrl_out(ctx->h, VERIMARK_REQ_WRITE, wvalue, 0,
++                                          buf, aligned, ctx->timeout_ms);
++    if (heap) free(heap);
++    return r == VERIMARK_OK;
++}
++
++
++static bool transport_io_read(void *ctx_v, uint8_t *buf, size_t buf_size,
++                               size_t *out_len)
++{
++    VerimarkTransportIoCtx *ctx = (VerimarkTransportIoCtx *)ctx_v;
++    if (!ctx || !ctx->h || !buf || !out_len) return false;
++    size_t received = 0;
++    VerimarkResult r = verimark_ctrl_in(ctx->h, VERIMARK_REQ_READ, 0, 0,
++                                         buf, buf_size, &received,
++                                         ctx->timeout_ms);
++    if (r != VERIMARK_OK) return false;
++    *out_len = received;
++    return true;
++}
++
++
++void verimark_transport_io_bind(struct VerimarkTransportIO *out_io,
++                                 VerimarkTransportIoCtx *ctx)
++{
++    if (!out_io || !ctx) return;
++    out_io->write = transport_io_write;
++    out_io->read  = transport_io_read;
++    out_io->ctx   = ctx;
++}
++
++
++const struct VerimarkTransportIO *verimark_transport_io_vtable(void)
++{
++    static const struct VerimarkTransportIO vtable = {
++        .write = transport_io_write,
++        .read  = transport_io_read,
++        .ctx   = NULL,
++    };
++    return &vtable;
++}
++
++
++VerimarkResult verimark_transceive(VerimarkUsbHandle *h,
++                                   const uint8_t *data,
++                                   size_t data_len,
++                                   uint8_t *resp,
++                                   size_t resp_size,
++                                   size_t *resp_len,
++                                   unsigned timeout_ms)
++{
++    if (h == NULL || data == NULL || data_len == 0 || resp == NULL)
++        return VERIMARK_ERR_INVALID_ARG;
++
++    /* wValue is computed using the Synaptics formula. */
++    uint16_t wvalue = verimark_compute_wvalue_write(data_len);
++
++    /* Fragment by CHUNK_SIZE (= 4096), pad to the next multiple of 8.
++     * Most Tudor application frames are <= 200 bytes → single chunk,
++     * padding < 8 bytes.
++     *
++     * We copy into an aligned buffer when necessary, preserving the
++     * original input and guaranteeing zero padding. */
++    size_t aligned = verimark_align_up(data_len);
++    uint8_t stack_buf[256];
++    uint8_t *send_buf = stack_buf;
++    uint8_t *heap_buf = NULL;
++    if (aligned > sizeof(stack_buf)) {
++        heap_buf = (uint8_t *)malloc(aligned);
++        if (heap_buf == NULL)
++            return VERIMARK_ERR_TRANSPORT;
++        send_buf = heap_buf;
++    }
++    memset(send_buf, 0, aligned);
++    memcpy(send_buf, data, data_len);
++
++    /* Write 0x16 — payloads > 4096 would need to loop with per-chunk
++     * wValue (cf. pseudo-C FUN_1800478e0, "first chunk" flag and
++     * magic_high bits). Single-chunk only for now. */
++    VerimarkResult r = VERIMARK_OK;
++    if (aligned <= VERIMARK_CHUNK_SIZE) {
++        r = verimark_ctrl_out(h, VERIMARK_REQ_WRITE, wvalue, 0,
++                              send_buf, aligned, timeout_ms);
++    } else {
++        /* TODO: multi-chunk transmit with per-chunk wValue. */
++        r = VERIMARK_ERR_INVALID_ARG;
++    }
++    if (heap_buf)
++        free(heap_buf);
++    if (r != VERIMARK_OK)
++        return r;
++
++    /* Read 0x17 */
++    size_t received = 0;
++    r = verimark_ctrl_in(h, VERIMARK_REQ_READ, 0x0000, 0,
++                        resp, resp_size, &received, timeout_ms);
++    if (r != VERIMARK_OK)
++        return r;
++    if (resp_len)
++        *resp_len = received;
++    return VERIMARK_OK;
++}
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+new file mode 100644
+index 0000000..3bf7f12
+--- /dev/null
++++ b/libfprint/drivers/verimark/transport.h
+@@ -0,0 +1,191 @@
++/*
++ * transport.h — USB vendor transport for the VeriMark DT.
++ *
++ * Abstracts the vendor control transfers (bRequest 0x14..0x1B) over either
++ * a GUsbDevice (libfprint build) or a libusb_device_handle (standalone
++ * tests).
++ *
++ * For wire-level details see ../../docs/protocol.md § Couche transport.
++ * The wValue formula, fragmentation, and 8-byte alignment all come from
++ * `palWinUsbBulkWriteEp0InEp0Out` (see ../../docs/phase5-tls-psk-linux.md).
++ *
++ * The API is transport-agnostic; implementations are:
++ *   - verimark-transport-gusb.c   (libgusb, for libfprint)
++ *   - verimark-transport-libusb.c (libusb-1.0, for standalone tests — TODO)
++ * Only one backend is linked, selected at build time (see meson.build).
++ */
++
++#ifndef VERIMARK_TRANSPORT_H
++#define VERIMARK_TRANSPORT_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/* Opaque handle — wraps a GUsbDevice * or a libusb_device_handle *. */
++typedef struct VerimarkUsbHandle VerimarkUsbHandle;
++
++
++/* Transport error codes — aligned with POSIX errno where it makes sense. */
++typedef enum {
++    VERIMARK_OK              = 0,
++    VERIMARK_ERR_TRANSPORT   = -1,   /* generic libusb/libgusb failure */
++    VERIMARK_ERR_TIMEOUT     = -2,
++    VERIMARK_ERR_STALL       = -3,
++    VERIMARK_ERR_DISCONNECT  = -4,
++    VERIMARK_ERR_SHORT_READ  = -5,
++    VERIMARK_ERR_INVALID_ARG = -6,
++} VerimarkResult;
++
++
++/* --- Low-level primitives ------------------------------------------------- */
++
++/**
++ * Issue a vendor OUT control transfer (bmRequestType=0x40).
++ *
++ * @param h           USB handle (MI_01 must have been claimed).
++ * @param bRequest    Vendor request code.
++ * @param wValue      Setup-packet wValue.
++ * @param wIndex      Setup-packet wIndex (typically 0).
++ * @param data        Data to send (may be NULL if data_len == 0).
++ * @param data_len    Data length.
++ * @param timeout_ms  Timeout in milliseconds.
++ *
++ * @return VERIMARK_OK or an error code.
++ */
++VerimarkResult verimark_ctrl_out(VerimarkUsbHandle *h,
++                                 uint8_t bRequest,
++                                 uint16_t wValue,
++                                 uint16_t wIndex,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms);
++
++/**
++ * Issue a vendor IN control transfer (bmRequestType=0xC0).
++ *
++ * @param[out] data       Receive buffer (caller-allocated).
++ * @param      data_size  Buffer capacity.
++ * @param[out] received   Number of bytes actually received.
++ *
++ * @return VERIMARK_OK or an error code.
++ */
++VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
++                                uint8_t bRequest,
++                                uint16_t wValue,
++                                uint16_t wIndex,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms);
++
++
++/* --- High-level helpers --------------------------------------------------- */
++
++/**
++ * Init sequence observed in `_tudorInitDevice` and the matik captures:
++ *   1. bRequest=0x19 OUT, wValue=0x0001 (no data)
++ *   2. bRequest=0x1A IN, wLength=1 (reads 1 byte — typically 0x01)
++ *
++ * Must be called after `claim_interface(MI_01)` and before any transceive.
++ * Returns VERIMARK_OK even if the read byte is not 0x01 — this is only a
++ * diagnostic read.
++ *
++ * @param[out] init_status  Byte read (may be NULL).
++ */
++VerimarkResult verimark_init_sequence(VerimarkUsbHandle *h,
++                                      uint8_t *init_status,
++                                      unsigned timeout_ms);
++
++/**
++ * Read the TLS session status (bRequest=0x14 IN, 2 bytes).
++ *
++ * @param[out] status_bytes  Two-byte buffer for the status.
++ */
++VerimarkResult verimark_read_tls_status(VerimarkUsbHandle *h,
++                                        uint8_t status_bytes[2],
++                                        unsigned timeout_ms);
++
++/**
++ * Send a cleartext Tudor command (no TLS) and read the response.
++ *
++ * Fragments `data` by VERIMARK_CHUNK_SIZE, pads up to the next multiple
++ * of VERIMARK_ALIGNMENT, computes wValue via (length & 7), then reads
++ * the response via bRequest=0x17.
++ *
++ * @param      data       Application frame `[opcode][payload]`.
++ * @param      data_len   Frame length.
++ * @param[out] resp       Response buffer (caller-allocated).
++ * @param      resp_size  Response buffer capacity.
++ * @param[out] resp_len   Bytes actually received.
++ */
++VerimarkResult verimark_transceive(VerimarkUsbHandle *h,
++                                   const uint8_t *data,
++                                   size_t data_len,
++                                   uint8_t *resp,
++                                   size_t resp_size,
++                                   size_t *resp_len,
++                                   unsigned timeout_ms);
++
++
++/* --- VerimarkTransportIO adapter (for the handshake orchestrator) -------- */
++
++/* Forward declaration to avoid pulling handshake.h here. */
++struct VerimarkTransportIO;
++
++/**
++ * Build a `VerimarkTransportIO` vtable that drives the given USB handle.
++ * The vtable's `write()` prepends `44 00 00 00` when `is_handshake=true`
++ * (handshake records only — AppData records pass through unchanged).
++ *
++ * `ctx_out` will be set to an internal context pointer; it has the same
++ * lifetime as `h` (no heap allocation). Pass it as `io.ctx`.
++ *
++ * The returned vtable lives in static storage and never needs to be
++ * freed.
++ */
++const struct VerimarkTransportIO *
++verimark_transport_io_vtable(void);
++
++/**
++ * Initialize an `io` context bound to `h`. The caller wires
++ *   `io->ctx = &ctx; io->write = ...; io->read = ...`
++ * via the helper below.
++ */
++typedef struct {
++    VerimarkUsbHandle *h;
++    unsigned timeout_ms;
++} VerimarkTransportIoCtx;
++
++/**
++ * Convenience : build a full vtable+context pair into the caller's
++ * `out_io` (which lives in caller stack/struct), using `ctx` as the
++ * backing context. After this call `out_io->ctx = ctx`.
++ */
++void verimark_transport_io_bind(struct VerimarkTransportIO *out_io,
++                                 VerimarkTransportIoCtx *ctx);
++
++
++/* --- Lifecycle ------------------------------------------------------------ */
++
++/**
++ * Build a transport handle around a native USB handle.
++ * `native` is either `GUsbDevice *` (libgusb build) or
++ * `libusb_device_handle *` (libusb build).
++ *
++ * Returns NULL on allocation failure.
++ */
++VerimarkUsbHandle *verimark_handle_new(void *native);
++
++void verimark_handle_free(VerimarkUsbHandle *h);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_TRANSPORT_H */
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+new file mode 100644
+index 0000000..63eb85e
+--- /dev/null
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -0,0 +1,479 @@
++/*
++ * verimark.c — libfprint driver for the Kensington VeriMark DT (047d:00f2).
++ *
++ * Target: upstream integration as `libfprint/drivers/verimark/`.
++ *
++ * Phase 7.4 status (2026-05-23):
++ *   - probe()  : reads opcode 0x01 (get_device_info) in cleartext for
++ *                serial extraction.
++ *   - open()   : claims MI_01, runs init sequence, loads sub1 pairing
++ *                data from /var/lib/fprintd/verimark/sub1_<serial>.bin,
++ *                performs the full TLS handshake (synchronous blocking).
++ *                On success, a `VerimarkSession` is stored in `self`.
++ *   - close()  : zeros the session, releases MI_01.
++ *   - list()   : reads the storage partition table (cleartext 0x3E),
++ *                then enumerates enrolled templates via TLS AppData
++ *                (0x40 read partition over `session`).
++ *   - verify() / enroll() / identify() / delete() : require additional
++ *                Tudor opcodes that are reachable via the now-active
++ *                TLS session ; see Phase 7.5.
++ *
++ * Reference driver pattern: `libfprint/drivers/goodixmoc/` (match-on-chip,
++ * USB vendor — the closest functional match).
++ *
++ * Synchronous handshake : `verimark_handshake_perform()` blocks ~100ms.
++ * Acceptable for open() ; for an upstream-grade driver we would wrap it
++ * in a `fpi_ssm` state machine. The current implementation is testable
++ * end-to-end via `verimark_handshake_runtime` (standalone binary built
++ * by the meson `verimark` target).
++ */
++
++#include "verimark.h"
++#include "proto.h"
++#include "transport.h"
++#include "pairing.h"
++#include "handshake.h"
++#include "session.h"
++
++#define FP_COMPONENT "verimark"
++#include "fpi-log.h"
++
++#include <gusb.h>
++#include <gio/gio.h>
++#include <string.h>
++
++
++struct _FpiDeviceVerimark {
++    FpDevice parent;
++
++    /* Transport handle — allocated in open(), freed in close(). */
++    VerimarkUsbHandle *transport;
++
++    /* Device identification, read at probe / open. */
++    VerimarkDeviceInfo dev_info;
++    gboolean dev_info_valid;
++
++    /* TLS session — populated by open() after the handshake. Zeroed by
++     * close(). All AppData commands (verify/enroll/list templates) go
++     * through this session. */
++    VerimarkSession session;
++    gboolean session_active;
++};
++
++G_DEFINE_TYPE(FpiDeviceVerimark, fpi_device_verimark, FP_TYPE_DEVICE)
++
++
++/* ---- USB ID table -------------------------------------------------------- */
++
++static const FpIdEntry id_table[] = {
++    { .vid = VERIMARK_VID, .pid = VERIMARK_PID },
++    { .vid = 0, .pid = 0 },
++};
++
++
++/* ---- Internal helpers ---------------------------------------------------- */
++
++/**
++ * Wrap the libfprint-owned GUsbDevice in a VerimarkUsbHandle. To be called
++ * after libfprint has opened/claimed the device (open path).
++ */
++static VerimarkUsbHandle *get_transport(FpDevice *device)
++{
++    GUsbDevice *usb = fpi_device_get_usb_device(device);
++    return verimark_handle_new(usb);
++}
++
++/**
++ * Send `[opcode]` in cleartext, read the response, parse `[status][payload]`.
++ * Returns TRUE if status == 0x0000, FALSE otherwise. On success, the output
++ * pointers `*payload_out` / `*payload_len_out` point INSIDE `resp_buf`
++ * (no copy); their lifetime equals `resp_buf`'s.
++ */
++static gboolean send_simple_opcode(FpiDeviceVerimark *self,
++                                   uint8_t opcode,
++                                   uint8_t *resp_buf,
++                                   size_t resp_buf_size,
++                                   const uint8_t **payload_out,
++                                   size_t *payload_len_out,
++                                   uint16_t *status_out,
++                                   GError **error)
++{
++    uint8_t req[1];
++    size_t n = verimark_encode_request(opcode, NULL, 0, req, sizeof(req));
++    if (n == 0) {
++        g_set_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                    "encode failed for opcode 0x%02x", opcode);
++        return FALSE;
++    }
++    size_t recv_len = 0;
++    VerimarkResult r = verimark_transceive(self->transport,
++                                           req, n,
++                                           resp_buf, resp_buf_size,
++                                           &recv_len, 2000);
++    if (r != VERIMARK_OK) {
++        g_set_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "transceive failed (opcode 0x%02x): %d", opcode, r);
++        return FALSE;
++    }
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++    if (!verimark_parse_response(resp_buf, recv_len,
++                                 &status, &payload, &payload_len)) {
++        g_set_error(error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "short response (opcode 0x%02x): %zu bytes",
++                    opcode, recv_len);
++        return FALSE;
++    }
++    if (status_out)      *status_out = status;
++    if (payload_out)     *payload_out = payload;
++    if (payload_len_out) *payload_len_out = payload_len;
++    return status == VERIMARK_STATUS_OK;
++}
++
++
++/* ---- FpDevice callbacks -------------------------------------------------- */
++
++static void verimark_probe(FpDevice *device)
++{
++    G_DEBUG_HERE();
++
++    /* probe() runs before open() — libfprint gives us access to the
++     * GUsbDevice via fpi_device_get_usb_device(). We open it, claim
++     * MI_01, run the init sequence, query get_device_info, then release
++     * and close. Goal: return a unique device identifier (the serial)
++     * so libfprint can distinguish multiple devices.
++     */
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    GUsbDevice *usb = fpi_device_get_usb_device(device);
++    g_autoptr(GError) error = NULL;
++
++    if (!g_usb_device_open(usb, &error)) {
++        fpi_device_probe_complete(device, NULL, NULL, error);
++        return;
++    }
++    if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
++        g_usb_device_close(usb, NULL);
++        fpi_device_probe_complete(device, NULL, NULL, error);
++        return;
++    }
++
++    self->transport = verimark_handle_new(usb);
++    uint8_t init_status = 0;
++    VerimarkResult r = verimark_init_sequence(self->transport, &init_status, 2000);
++    if (r != VERIMARK_OK) {
++        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++        g_usb_device_close(usb, NULL);
++        verimark_handle_free(self->transport);
++        self->transport = NULL;
++        g_set_error(&error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "init sequence failed (%d)", r);
++        fpi_device_probe_complete(device, NULL, NULL, error);
++        return;
++    }
++
++    uint8_t resp_buf[128];
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++    uint16_t status = 0;
++    gboolean ok = send_simple_opcode(self, VERIMARK_OP_GET_DEVICE_INFO,
++                                     resp_buf, sizeof(resp_buf),
++                                     &payload, &payload_len, &status, &error);
++    if (!ok) {
++        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++        g_usb_device_close(usb, NULL);
++        verimark_handle_free(self->transport);
++        self->transport = NULL;
++        fpi_device_probe_complete(device, NULL, NULL, error);
++        return;
++    }
++
++    self->dev_info_valid = verimark_parse_device_info(payload, payload_len,
++                                                      &self->dev_info);
++
++    g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++    g_usb_device_close(usb, NULL);
++    verimark_handle_free(self->transport);
++    self->transport = NULL;
++
++    char serial[13] = "unknown";
++    if (self->dev_info_valid)
++        verimark_format_serial(&self->dev_info, serial);
++
++    fpi_device_probe_complete(device,
++                              g_strdup(serial),
++                              g_strdup("Kensington VeriMark DT"),
++                              NULL);
++}
++
++
++/**
++ * Locate the sub1 pairing file for this device : try
++ *   /var/lib/fprintd/verimark/sub1_<serial>.bin
++ * with the serial formatted as 12 hex digits, then fall back to
++ *   /var/lib/fprintd/verimark/sub1.bin
++ * for single-device test installs.
++ *
++ * Returns a heap-allocated path (caller frees with g_free), or NULL.
++ */
++static gchar *find_sub1_path(FpiDeviceVerimark *self)
++{
++    if (self->dev_info_valid) {
++        char serial[13];
++        verimark_format_serial(&self->dev_info, serial);
++        gchar *p = g_strdup_printf("/var/lib/fprintd/verimark/sub1_%s.bin", serial);
++        if (g_file_test(p, G_FILE_TEST_EXISTS)) return p;
++        g_free(p);
++    }
++    gchar *fallback = g_strdup("/var/lib/fprintd/verimark/sub1.bin");
++    if (g_file_test(fallback, G_FILE_TEST_EXISTS)) return fallback;
++    g_free(fallback);
++    return NULL;
++}
++
++
++static void verimark_open(FpDevice *device)
++{
++    G_DEBUG_HERE();
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    GUsbDevice *usb = fpi_device_get_usb_device(device);
++    g_autoptr(GError) error = NULL;
++
++    if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
++        fpi_device_open_complete(device, error);
++        return;
++    }
++    self->transport = verimark_handle_new(usb);
++    uint8_t init_status = 0;
++    VerimarkResult r = verimark_init_sequence(self->transport, &init_status, 2000);
++    if (r != VERIMARK_OK) {
++        verimark_handle_free(self->transport);
++        self->transport = NULL;
++        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++        g_set_error(&error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                    "init sequence failed (%d)", r);
++        fpi_device_open_complete(device, error);
++        return;
++    }
++
++    /* Load pairing data (sub1). Without it we cannot establish the TLS
++     * session — verify/enroll/list will be unusable. open() still
++     * succeeds so probe-level introspection keeps working. */
++    g_autofree gchar *sub1_path = find_sub1_path(self);
++    if (!sub1_path) {
++        fp_warn("verimark: no sub1 found in /var/lib/fprintd/verimark/ ; "
++                "device opens in cleartext-only mode (no TLS session)");
++        fpi_device_open_complete(device, NULL);
++        return;
++    }
++
++    VerimarkPairingData pairing;
++    if (!verimark_pairing_load_from_file(sub1_path, &pairing)) {
++        fp_warn("verimark: failed to load sub1 from %s", sub1_path);
++        fpi_device_open_complete(device, NULL);
++        return;
++    }
++
++    /* Bind transport_io vtable around our USB handle. */
++    VerimarkTransportIoCtx io_ctx = { .h = self->transport, .timeout_ms = 3000 };
++    VerimarkTransportIO io;
++    verimark_transport_io_bind(&io, &io_ctx);
++
++    VerimarkHandshakeResult hr = verimark_handshake_perform(
++        &io, &pairing, /* repro = */ NULL, &self->session);
++    /* Wipe the heap copy of pairing immediately. */
++    verimark_pairing_data_zero(&pairing);
++
++    if (hr != VERIMARK_HANDSHAKE_OK) {
++        fp_warn("verimark: TLS handshake failed (%d) ; AppData commands disabled",
++                hr);
++        verimark_session_zero(&self->session);
++        self->session_active = FALSE;
++    } else {
++        self->session_active = TRUE;
++        fp_dbg("verimark: TLS session established");
++    }
++    fpi_device_open_complete(device, NULL);
++}
++
++
++static void verimark_close(FpDevice *device)
++{
++    G_DEBUG_HERE();
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    GUsbDevice *usb = fpi_device_get_usb_device(device);
++    g_autoptr(GError) error = NULL;
++
++    /* Zero out the TLS session keys before releasing the handle. */
++    verimark_session_zero(&self->session);
++    self->session_active = FALSE;
++
++    if (self->transport) {
++        verimark_handle_free(self->transport);
++        self->transport = NULL;
++    }
++    g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, &error);
++    fpi_device_close_complete(device, error);
++}
++
++
++/* ---- Stubs: verify / enroll / identify / list / delete ------------------- */
++
++static void verimark_verify(FpDevice *device)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    g_autoptr(GError) error = NULL;
++    if (!self->session_active) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "verify: TLS session not active "
++                            "(sub1 pairing data missing in /var/lib/fprintd/verimark/)");
++    } else {
++        /* TODO Phase 7.5 : implement the verify SSM. The session is
++         * ready ; we need to map fprintd's verify() onto the Tudor
++         * opcodes for fingerprint capture + on-chip match. */
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "verify: not yet implemented (Phase 7.5)");
++    }
++    fpi_device_verify_complete(device, error);
++}
++
++
++static void verimark_enroll(FpDevice *device)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    g_autoptr(GError) error = NULL;
++    if (!self->session_active) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "enroll: TLS session not active");
++    } else {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "enroll: not yet implemented (Phase 7.5)");
++    }
++    fpi_device_enroll_complete(device, NULL, error);
++}
++
++
++static void verimark_identify(FpDevice *device)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    g_autoptr(GError) error = NULL;
++    if (!self->session_active) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "identify: TLS session not active");
++    } else {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                            "identify: not yet implemented (Phase 7.5)");
++    }
++    fpi_device_identify_complete(device, error);
++}
++
++
++static void verimark_list(FpDevice *device)
++{
++    /*
++     * libfprint `list()` returns the prints currently enrolled on the
++     * sensor. Reading the actual template data requires reading the host
++     * partition (opcode 0x40), which lives inside the encrypted TLS
++     * session. Until the TLS handshake is solved (see
++     * ../../docs/phase5-tls-psk-linux.md), we can still **locate** the
++     * host partition via the cleartext opcode 0x3E (get_storage_info)
++     * and return an explicit error pointing at the missing piece.
++     *
++     * This stub at least validates the storage_info parser on the wire
++     * and gives fprintd a more informative failure than NOT_SUPPORTED.
++     */
++    G_DEBUG_HERE();
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    g_autoptr(GError) error = NULL;
++
++    uint8_t resp_buf[256];
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++    uint16_t status = 0;
++    gboolean ok = send_simple_opcode(self, VERIMARK_OP_GET_STORAGE_INFO,
++                                     resp_buf, sizeof(resp_buf),
++                                     &payload, &payload_len, &status, &error);
++    if (!ok) {
++        fpi_device_list_complete(device, NULL, error);
++        return;
++    }
++
++    VerimarkStorageInfo info;
++    if (!verimark_parse_storage_info(payload, payload_len, &info)) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "list: storage_info parse failed "
++                            "(payload %zu bytes)", payload_len);
++        fpi_device_list_complete(device, NULL, error);
++        return;
++    }
++
++    const VerimarkStorageEntry *host =
++        verimark_storage_find_host_partition(&info);
++    if (host == NULL) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "list: no host partition (type=0x02) in "
++                            "storage_info (%u entries)", info.entry_count);
++        fpi_device_list_complete(device, NULL, error);
++        return;
++    }
++
++    fp_dbg("list: host partition located (b_1=0x%02x field_2=0x%04x "
++           "field_4=0x%08x field_8=0x%08x), but template enumeration "
++           "requires TLS session",
++           host->b_1, host->field_2, host->field_4, host->field_8);
++
++    error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                        "list: host partition located (%u storage entries), "
++                        "but reading enrolled templates requires the TLS-PSK "
++                        "session (Phase 5 blocker)", info.entry_count);
++    fpi_device_list_complete(device, NULL, error);
++}
++
++
++static void verimark_delete(FpDevice *device)
++{
++    g_autoptr(GError) error = g_error_new(FP_DEVICE_ERROR,
++                                          FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                          "delete: requires partition-write API (TLS handshake required)");
++    fpi_device_delete_complete(device, error);
++}
++
++
++/* ---- GObject boilerplate ------------------------------------------------- */
++
++static void fpi_device_verimark_init(FpiDeviceVerimark *self)
++{
++    self->transport = NULL;
++    self->dev_info_valid = FALSE;
++    verimark_session_zero(&self->session);
++    self->session_active = FALSE;
++}
++
++
++static void fpi_device_verimark_class_init(FpiDeviceVerimarkClass *klass)
++{
++    FpDeviceClass *dev_class = FP_DEVICE_CLASS(klass);
++
++    dev_class->id        = "verimark";
++    dev_class->full_name = "Kensington VeriMark DT";
++    dev_class->type      = FP_DEVICE_TYPE_USB;
++    dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++    dev_class->id_table  = id_table;
++    dev_class->nr_enroll_stages = 8;
++    dev_class->features  = FP_DEVICE_FEATURE_CAPTURE
++                         | FP_DEVICE_FEATURE_IDENTIFY
++                         | FP_DEVICE_FEATURE_VERIFY
++                         | FP_DEVICE_FEATURE_STORAGE
++                         | FP_DEVICE_FEATURE_STORAGE_LIST
++                         | FP_DEVICE_FEATURE_STORAGE_DELETE
++                         | FP_DEVICE_FEATURE_DUPLICATES_CHECK;
++
++    dev_class->probe    = verimark_probe;
++    dev_class->open     = verimark_open;
++    dev_class->close    = verimark_close;
++    dev_class->verify   = verimark_verify;
++    dev_class->enroll   = verimark_enroll;
++    dev_class->identify = verimark_identify;
++    dev_class->list     = verimark_list;
++    dev_class->delete   = verimark_delete;
++}
+diff --git a/libfprint/drivers/verimark/verimark.h b/libfprint/drivers/verimark/verimark.h
+new file mode 100644
+index 0000000..c759bdf
+--- /dev/null
++++ b/libfprint/drivers/verimark/verimark.h
+@@ -0,0 +1,22 @@
++/*
++ * verimark.h — libfprint driver for the Kensington VeriMark DT (047d:00f2).
++ *
++ * Target: upstream integration as `libfprint/drivers/verimark/`.
++ *
++ * Phase 6 status: skeleton. probe()/open()/close() use the cleartext Tudor
++ * channel (opcode 0x01 = get_device_info). verify/enroll/identify are stubs
++ * until the TLS-PSK handshake is solved (see
++ * ../../docs/phase5-tls-psk-linux.md § "Question résiduelle").
++ */
++
++#ifndef VERIMARK_H
++#define VERIMARK_H
++
++#pragma once
++
++#include "fpi-device.h"
++
++G_DECLARE_FINAL_TYPE(FpiDeviceVerimark, fpi_device_verimark,
++                     FPI, DEVICE_VERIMARK, FpDevice)
++
++#endif /* VERIMARK_H */

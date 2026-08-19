@@ -1,0 +1,988 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 13:56:43 +0200
+Subject: [PATCH 14/32] =?UTF-8?q?feat(verimark):=20factory-fresh=20pairing?=
+ =?UTF-8?q?=20bootstrap=20=E2=80=94=20step=201=20(pure=20builders)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 10.5 step 1 : pure host-side builders for the Synaptics bootstrap
+exchange (0x93 DoPairBasic). Mirrors python/verimark/bootstrap.py
+byte-for-byte. NO crypto, NO transport in this commit — those are
+gated behind step 2 once the data layouts are verified against the
+python reference at the byte level.
+
+New module bootstrap.{h,c} exposes :
+
+- verimark_bootstrap_build_p256_params_blob   — 420 B BCRYPT_ECC blob
+  (NIST P-256 constants encoded in the Windows-driver expected
+  little-endian layout, no sensor-specific data)
+- verimark_bootstrap_build_storage_cert       — 400 B client_cert in
+  the format the sensor stores (sub1 tag 1)
+- verimark_bootstrap_build_wire_cert          — 400 B client_cert
+  with DER signature in the format the 0x93 OUT expects
+- verimark_bootstrap_parse_pair_response      — split the 802 B
+  0x93 IN reply into header + storage_cert + server_cert
+- verimark_bootstrap_serialize_sub1           — 1284 B TLV blob
+  (tags 2, 1, 4, 3, 0) ready for /var/lib/fprint/verimark/sub1.bin
+
+Test suite : 15/15 tests green, bit-exact against python reference
+vectors (SHA-256 of every output matches the python harness output).
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/bootstrap.c        | 289 ++++++++++++
+ libfprint/drivers/verimark/bootstrap.h        | 188 ++++++++
+ libfprint/drivers/verimark/meson.build        |  19 +
+ .../drivers/verimark/tests/test_bootstrap.c   | 420 ++++++++++++++++++
+ 4 files changed, 916 insertions(+)
+ create mode 100644 libfprint/drivers/verimark/bootstrap.c
+ create mode 100644 libfprint/drivers/verimark/bootstrap.h
+ create mode 100644 libfprint/drivers/verimark/tests/test_bootstrap.c
+
+diff --git a/libfprint/drivers/verimark/bootstrap.c b/libfprint/drivers/verimark/bootstrap.c
+new file mode 100644
+index 0000000..d2e96fb
+--- /dev/null
++++ b/libfprint/drivers/verimark/bootstrap.c
+@@ -0,0 +1,289 @@
++/*
++ * bootstrap.c — Pure host-side builders for factory-fresh pairing.
++ *
++ * Implements the byte layouts documented in bootstrap.h. No crypto, no
++ * transport — those live in crypto.{h,c} and (later) the bootstrap
++ * orchestrator that wraps the 0x93 USB exchange.
++ */
++
++#include "bootstrap.h"
++
++#include <string.h>
++
++
++/* --- Little-endian writers --------------------------------------------- */
++
++static inline void write_le16(uint8_t out[2], uint16_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++}
++
++static inline void write_le32(uint8_t out[4], uint32_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++    out[2] = (uint8_t)((v >> 16) & 0xff);
++    out[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++
++/* --- BE byte-array reverse (for BE → LE conversion of P-256 coords) ---- */
++
++static void reverse_bytes(uint8_t *dst, const uint8_t *src, size_t n)
++{
++    for (size_t i = 0; i < n; i++)
++        dst[i] = src[n - 1 - i];
++}
++
++
++/* --- NIST P-256 standard constants (FIPS 186-4 §D.1.2.3 / SEC 2) -------
++ * 32-byte little-endian raw integers, exactly what the BCRYPT_ECC blob
++ * stores. Manually byte-reversed from the well-known big-endian hex
++ * representations.
++ */
++
++static const uint8_t P256_A_LE[32] = {
++    0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++};
++
++static const uint8_t P256_B_LE[32] = {
++    0x4b, 0x60, 0xd2, 0x27, 0x3e, 0x3c, 0xce, 0x3b,
++    0xf6, 0xb0, 0x53, 0xcc, 0xb0, 0x06, 0x1d, 0x65,
++    0xbc, 0x86, 0x98, 0x76, 0x55, 0xbd, 0xeb, 0xb3,
++    0xe7, 0x93, 0x3a, 0xaa, 0xd8, 0x35, 0xc6, 0x5a,
++};
++
++static const uint8_t P256_GX_LE[32] = {
++    0x96, 0xc2, 0x98, 0xd8, 0x45, 0x39, 0xa1, 0xf4,
++    0xa0, 0x33, 0xeb, 0x2d, 0x81, 0x7d, 0x03, 0x77,
++    0xf2, 0x40, 0xa4, 0x63, 0xe5, 0xe6, 0xbc, 0xf8,
++    0x47, 0x42, 0x2c, 0xe1, 0xf2, 0xd1, 0x17, 0x6b,
++};
++
++static const uint8_t P256_GY_LE[32] = {
++    0xf5, 0x51, 0xbf, 0x37, 0x68, 0x40, 0xb6, 0xcb,
++    0xce, 0x5e, 0x31, 0x6b, 0x57, 0x33, 0xce, 0x2b,
++    0x16, 0x9e, 0x0f, 0x7c, 0x4a, 0xeb, 0xe7, 0x8e,
++    0x9b, 0x7f, 0x1a, 0xfe, 0xe2, 0x42, 0xe3, 0x4f,
++};
++
++static const uint8_t P256_N_LE[32] = {
++    0x51, 0x25, 0x63, 0xfc, 0xc2, 0xca, 0xb9, 0xf3,
++    0x84, 0x9e, 0x17, 0xa7, 0xad, 0xfa, 0xe6, 0xbc,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++};
++
++static const uint8_t P256_P_LE[32] = {
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
++};
++
++
++/* --- 420-byte P-256 BCRYPT params blob --------------------------------- */
++
++bool verimark_bootstrap_build_p256_params_blob(
++    uint8_t *out, size_t out_size)
++{
++    if (!out || out_size < VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE)
++        return false;
++
++    memset(out, 0, VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE);
++
++    /* Header (12 bytes) : [version u32 LE = 0x17][bits u32 LE = 0x100][1 u32 LE] */
++    write_le32(out + 0,  0x17u);
++    write_le32(out + 4,  0x0100u);
++    write_le32(out + 8,  1u);
++
++    /* A coefficient @ +12 (32 B), then 36 zeros pad. */
++    memcpy(out + 12, P256_A_LE, 32);
++    /* (zeros 44..79 already by memset) */
++
++    /* Then 5 blocks of (32 LE value + 36 zero pad) for B, Gx, Gy, N, P. */
++    static const uint8_t *blocks[5] = {
++        P256_B_LE, P256_GX_LE, P256_GY_LE, P256_N_LE, P256_P_LE,
++    };
++    size_t off = 80;   /* 12 hdr + 32 A + 36 pad */
++    for (size_t i = 0; i < 5; i++) {
++        memcpy(out + off, blocks[i], 32);
++        /* off+32..off+67 already zero from memset */
++        off += 68;
++    }
++    /* Final off should be 80 + 5*68 = 420. */
++    return true;
++}
++
++
++/* --- 400-byte storage client_cert -------------------------------------- */
++
++#define MAGIC_LE_0   0x3fu
++#define MAGIC_LE_1   0x5fu
++#define STORAGE_SIG_TAG 0x02u
++#define STORAGE_SIG_LEN 32u
++#define STORAGE_SIG_OFFSET 144u
++
++bool verimark_bootstrap_build_storage_cert(
++    uint16_t sensor_id_short,
++    const uint8_t pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t signature_32[VERIMARK_BOOTSTRAP_P256_STORAGE_SIG_LEN],
++    uint8_t *out, size_t out_size)
++{
++    if (!out || out_size < VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE
++        || !pubkey_x_be || !pubkey_y_be || !signature_32)
++        return false;
++
++    memset(out, 0, VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    /* [0..2] magic u16 LE = 0x5f3f */
++    out[0] = MAGIC_LE_0;
++    out[1] = MAGIC_LE_1;
++    /* [2..4] sensor_id_short LE */
++    write_le16(out + 2, sensor_id_short);
++    /* [4..36] pubkey_x in LE (= reverse of BE) */
++    reverse_bytes(out + 4,  pubkey_x_be, 32);
++    /* [36..72] zeros (already from memset) */
++    /* [72..104] pubkey_y in LE */
++    reverse_bytes(out + 72, pubkey_y_be, 32);
++    /* [104..141] zeros */
++    /* [141] storage sig tag */
++    out[141] = STORAGE_SIG_TAG;
++    /* [142..144] sig length LE = 32 */
++    write_le16(out + 142, STORAGE_SIG_LEN);
++    /* [144..176] signature bytes */
++    memcpy(out + STORAGE_SIG_OFFSET, signature_32, STORAGE_SIG_LEN);
++    /* [176..400] zeros */
++
++    return true;
++}
++
++
++/* --- 400-byte wire client_cert (with DER signature) -------------------- */
++
++#define WIRE_SIG_TAG    0x00u
++#define WIRE_SIG_OFFSET 144u
++#define WIRE_SIG_MAX    (VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE - WIRE_SIG_OFFSET)  /* 256 */
++
++bool verimark_bootstrap_build_wire_cert(
++    uint16_t sensor_id_short,
++    const uint8_t pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t *der_signature, size_t der_signature_len,
++    uint8_t *out, size_t out_size)
++{
++    if (!out || out_size < VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE
++        || !pubkey_x_be || !pubkey_y_be || !der_signature)
++        return false;
++    if (der_signature_len == 0 || der_signature_len > WIRE_SIG_MAX)
++        return false;
++
++    memset(out, 0, VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    out[0] = MAGIC_LE_0;
++    out[1] = MAGIC_LE_1;
++    write_le16(out + 2, sensor_id_short);
++    reverse_bytes(out + 4,  pubkey_x_be, 32);
++    reverse_bytes(out + 72, pubkey_y_be, 32);
++    /* [141] = WIRE_SIG_TAG = 0x00 (already zero) */
++    write_le16(out + 142, (uint16_t)der_signature_len);
++    memcpy(out + WIRE_SIG_OFFSET, der_signature, der_signature_len);
++
++    return true;
++}
++
++
++/* --- 802-byte pair response parser ------------------------------------- */
++
++bool verimark_bootstrap_parse_pair_response(
++    const uint8_t *response, size_t response_len,
++    VerimarkBootstrapPairResponse *out,
++    uint16_t *out_status)
++{
++    if (!response || !out_status)
++        return false;
++    if (response_len != VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE)
++        return false;
++
++    /* Header is u16 BE (Tudor convention) — extract status before
++     * deciding whether to populate `out`. */
++    *out_status = (uint16_t)((response[0] << 8) | response[1]);
++
++    if (!out)
++        return *out_status == 0x0000;
++
++    out->header[0] = response[0];
++    out->header[1] = response[1];
++    memcpy(out->client_cert_storage, response + 2,
++           VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++    memcpy(out->server_cert, response + 2 + VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE,
++           VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    return *out_status == 0x0000;
++}
++
++
++/* --- 1284-byte sub1 TLV serialization ---------------------------------- */
++
++/* TLV record header : [tag:u16 LE][length:u32 LE]. */
++#define SUB1_TAG_HDR 6u
++
++static size_t write_tlv(uint8_t *out, uint16_t tag,
++                         const uint8_t *value, uint32_t len)
++{
++    write_le16(out, tag);
++    write_le32(out + 2, len);
++    if (len > 0)
++        memcpy(out + 6, value, len);
++    return SUB1_TAG_HDR + len;
++}
++
++bool verimark_bootstrap_serialize_sub1(
++    const uint8_t client_cert_storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE],
++    const uint8_t client_priv_be[VERIMARK_BOOTSTRAP_P256_PRIV_LEN],
++    const uint8_t server_cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE],
++    const uint8_t p256_params[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE],
++    uint8_t *out, size_t out_size)
++{
++    if (!client_cert_storage || !client_priv_be || !server_cert
++        || !p256_params || !out
++        || out_size < VERIMARK_BOOTSTRAP_SUB1_SIZE)
++        return false;
++
++    size_t off = 0;
++
++    /* Tag 2 : client_priv_be reversed to LE (sensor convention). */
++    uint8_t priv_le[VERIMARK_BOOTSTRAP_P256_PRIV_LEN];
++    reverse_bytes(priv_le, client_priv_be, VERIMARK_BOOTSTRAP_P256_PRIV_LEN);
++    off += write_tlv(out + off, 2, priv_le,
++                     VERIMARK_BOOTSTRAP_P256_PRIV_LEN);
++
++    /* Tag 1 : client_cert (storage format). */
++    off += write_tlv(out + off, 1, client_cert_storage,
++                     VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    /* Tag 4 : P-256 params blob. */
++    off += write_tlv(out + off, 4, p256_params,
++                     VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE);
++
++    /* Tag 3 : server_cert. */
++    off += write_tlv(out + off, 3, server_cert,
++                     VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    /* Tag 0 : sentinel "\x00\x00" length 2. */
++    static const uint8_t sentinel[2] = { 0x00, 0x00 };
++    off += write_tlv(out + off, 0, sentinel, 2);
++
++    /* Sanity : 38 + 406 + 426 + 406 + 8 = 1284. */
++    if (off != VERIMARK_BOOTSTRAP_SUB1_SIZE)
++        return false;
++
++    /* Wipe the temporary LE-priv copy from the stack. */
++    memset(priv_le, 0, sizeof(priv_le));
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/bootstrap.h b/libfprint/drivers/verimark/bootstrap.h
+new file mode 100644
+index 0000000..cec79e7
+--- /dev/null
++++ b/libfprint/drivers/verimark/bootstrap.h
+@@ -0,0 +1,188 @@
++/*
++ * bootstrap.h — Factory-fresh pairing for the Kensington VeriMark DT.
++ *
++ * Builds the host-side data structures needed to perform the initial
++ * `0x93 DoPairBasic` exchange and persist the resulting Synaptics sub1
++ * pairing blob. Mirrors `python/verimark/bootstrap.py` byte-for-byte.
++ *
++ * This header exposes only the PURE host-side functions (cert
++ * layout, sub1 TLV serialization, P-256 params blob, response
++ * parsing). Crypto (ECDSA-P256 sign + pubkey derive) lives in
++ * crypto.{h,c} ; transport (0x93 over USB) and the bootstrap
++ * orchestrator live in bootstrap.c proper.
++ *
++ * TOFU model — sensor accepts any client_pubkey the first time
++ * 0x93 is sent. Subsequent 0x93 attempts against an already-paired
++ * sensor fail.
++ *
++ * Cf. docs/phase8b-bootstrap-pairing.md, docs/opcodes/0x93.yaml.
++ */
++
++#ifndef VERIMARK_BOOTSTRAP_H
++#define VERIMARK_BOOTSTRAP_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++/* --- Sizes --------------------------------------------------------------- */
++
++#define VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE   400u
++#define VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE 802u
++#define VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE   420u
++#define VERIMARK_BOOTSTRAP_SUB1_SIZE          1284u
++
++#define VERIMARK_BOOTSTRAP_P256_COORD_LEN     32u
++#define VERIMARK_BOOTSTRAP_P256_PRIV_LEN      32u
++#define VERIMARK_BOOTSTRAP_P256_STORAGE_SIG_LEN 32u
++
++/* Lower 16 bits of the sensor's 4-byte ID. The VeriMark DT family
++ * uses 0x0017 ; can be overridden when targeting a different short
++ * ID. (Sensor self-reports the full ID via opcode 0x01.) */
++#define VERIMARK_BOOTSTRAP_DEFAULT_SENSOR_ID_SHORT 0x0017u
++
++
++/* --- 420-byte BCRYPT_ECC P-256 parameter blob (sub1 tag 4) -------------- */
++
++/**
++ * Build the 420-byte BCRYPT_ECC_PARAMETER blob that sub1 tag 4 holds.
++ * Layout is invariant across all VeriMark DT sensors (it encodes
++ * standard NIST P-256 parameters — A, B, Gx, Gy, N, P — in the
++ * BCRYPT little-endian format). Nothing sensor-specific.
++ *
++ * Output buffer must be at least VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE
++ * (420) bytes ; returns FALSE if the buffer is too small.
++ */
++bool verimark_bootstrap_build_p256_params_blob(
++    uint8_t *out, size_t out_size);
++
++
++/* --- 400-byte client_cert (storage format) ------------------------------ */
++
++/**
++ * Build the STORAGE-format client_cert (sub1 tag 1).
++ *
++ * Layout (400 bytes) :
++ *   [  0..  1] u16 LE magic = 0x5f3f (= bytes 3f 5f)
++ *   [  2..  3] u16 LE sensor_id_short
++ *   [  4.. 35] 32 B pubkey_x in LE (= reverse of math BE form)
++ *   [ 36.. 71] 36 B zeros
++ *   [ 72..103] 32 B pubkey_y in LE
++ *   [104..140] 37 B zeros
++ *   [    141 ]  u8 signature TLV tag = 0x02
++ *   [142..143] u16 LE signature length = 32
++ *   [144..175] 32 B signature
++ *   [176..399] 224 B zeros
++ *
++ * `pubkey_x_be` / `pubkey_y_be` are the mathematical big-endian
++ * coordinates (matching the gnutls / nettle convention).
++ * `signature_32` is the 32-byte signature stored verbatim — for a
++ * fresh bootstrap, can be any 32-byte placeholder (sensor doesn't
++ * verify the storage cert).
++ *
++ * Returns FALSE on size mismatch / NULL arg.
++ */
++bool verimark_bootstrap_build_storage_cert(
++    uint16_t sensor_id_short,
++    const uint8_t pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t signature_32[VERIMARK_BOOTSTRAP_P256_STORAGE_SIG_LEN],
++    uint8_t *out, size_t out_size);
++
++
++/* --- 400-byte client_cert (wire format, signed) ------------------------ */
++
++/**
++ * Build the WIRE-format client_cert (sent as `0x93` payload).
++ *
++ * Identical to the storage format EXCEPT :
++ *   - byte [141] = 0x00 (not 0x02)
++ *   - bytes [142..143] = DER signature length in LE
++ *   - bytes [144..(144+der_len)] = DER-encoded ECDSA P-256 signature
++ *
++ * `der_signature` is the standard DER-encoded ECDSA signature
++ * (typically 70-72 bytes for P-256). Must fit in
++ * 400 - 144 = 256 bytes.
++ *
++ * Returns FALSE on size mismatch / signature too large.
++ */
++bool verimark_bootstrap_build_wire_cert(
++    uint16_t sensor_id_short,
++    const uint8_t pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    const uint8_t *der_signature, size_t der_signature_len,
++    uint8_t *out, size_t out_size);
++
++
++/* --- Parse the 802-byte 0x93 response ----------------------------------- */
++
++/**
++ * Parsed components of a successful 0x93 IN response.
++ *
++ * Layout of the 802-byte response :
++ *   [  0..  1] status header (00 00 on success)
++ *   [  2..401] storage-format client_cert as the sensor would store it
++ *              (echoed back to the host with a sensor-side signature
++ *              that no one verifies)
++ *   [402..801] WIRE-format server_cert signed by the sensor's permanent
++ *              long-term key — this is what gets persisted as sub1 tag 3
++ */
++typedef struct {
++    uint8_t header[2];
++    uint8_t client_cert_storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t server_cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++} VerimarkBootstrapPairResponse;
++
++/**
++ * Split a 0x93 IN response into its 3 components. Caller must pass
++ * exactly VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE bytes.
++ *
++ * Returns FALSE on wrong size or a non-zero status header (the
++ * sensor refused the pairing — typically because it's already
++ * paired). `*out_status` is populated regardless so the caller can
++ * interpret the error.
++ */
++bool verimark_bootstrap_parse_pair_response(
++    const uint8_t *response, size_t response_len,
++    VerimarkBootstrapPairResponse *out,
++    uint16_t *out_status);
++
++
++/* --- Serialize a sub1 TLV blob ----------------------------------------- */
++
++/**
++ * Build a sub1 pairing blob from its 4 canonical components.
++ *
++ * Tags are written in the order observed in real sub1 (2, 1, 4, 3, 0) :
++ *   tag 2  client private scalar (32 bytes LE = reverse of BE form)
++ *   tag 1  client_cert in storage format (400 B)
++ *   tag 4  P-256 BCRYPT params blob (420 B)
++ *   tag 3  server_cert (400 B, exactly what came back from 0x93 IN)
++ *   tag 0  sentinel "\x00\x00" (length 2)
++ *
++ * Each TLV record uses a 6-byte header : `[tag:u16 LE][length:u32 LE]`.
++ * Total: 1284 bytes exactly.
++ *
++ * `client_priv_be` is the 32-byte big-endian private scalar (the
++ * host's secret).
++ *
++ * Returns FALSE on size mismatch / NULL arg.
++ */
++bool verimark_bootstrap_serialize_sub1(
++    const uint8_t client_cert_storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE],
++    const uint8_t client_priv_be[VERIMARK_BOOTSTRAP_P256_PRIV_LEN],
++    const uint8_t server_cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE],
++    const uint8_t p256_params[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE],
++    uint8_t *out, size_t out_size);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_BOOTSTRAP_H */
+diff --git a/libfprint/drivers/verimark/meson.build b/libfprint/drivers/verimark/meson.build
+index 461cdb2..bbe7fcb 100644
+--- a/libfprint/drivers/verimark/meson.build
++++ b/libfprint/drivers/verimark/meson.build
+@@ -250,6 +250,25 @@ test_enroll_exe = executable(
+ test('enroll', test_enroll_exe)
+ 
+ 
++# Phase 10.5 — factory-fresh pairing (bootstrap) pure host-side builders.
++# Step 1 (this build): cert layouts + sub1 TLV + response parser, no
++# crypto / transport. Tests are TDD bit-exact against the python ref.
++bootstrap_lib = static_library(
++  'bootstrap',
++  files('bootstrap.c'),
++  include_directories: include_directories('.'),
++  c_args: ['-DVERIMARK_STANDALONE'],
++)
++
++test_bootstrap_exe = executable(
++  'test_bootstrap',
++  files('tests/test_bootstrap.c'),
++  link_with: bootstrap_lib,
++  include_directories: include_directories('.'),
++)
++test('bootstrap', test_bootstrap_exe)
++
++
+ # --- libfprint integration ------------------------------------------------
+ #
+ # When this driver lives inside a libfprint fork (= the present
+diff --git a/libfprint/drivers/verimark/tests/test_bootstrap.c b/libfprint/drivers/verimark/tests/test_bootstrap.c
+new file mode 100644
+index 0000000..ec7fd50
+--- /dev/null
++++ b/libfprint/drivers/verimark/tests/test_bootstrap.c
+@@ -0,0 +1,420 @@
++/*
++ * test_bootstrap.c — TDD tests for the pure host-side bootstrap builders.
++ *
++ * Reference vectors generated from python/verimark/bootstrap.py with
++ * fixed inputs (no randomness) so SHA-256 comparisons are bit-exact
++ * across implementations.
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "bootstrap.h"
++
++
++#define TEST(name) static int test_##name(void)
++
++#define ASSERT_TRUE(x) do { \
++    if (!(x)) { \
++        fprintf(stderr, "  %s:%d: ASSERT_TRUE failed: %s\n", \
++                __FILE__, __LINE__, #x); \
++        return 1; \
++    } \
++} while (0)
++
++#define ASSERT_EQ(a, b) do { \
++    long _a = (long)(a), _b = (long)(b); \
++    if (_a != _b) { \
++        fprintf(stderr, "  %s:%d: ASSERT_EQ failed: %s (%ld) != %s (%ld)\n", \
++                __FILE__, __LINE__, #a, _a, #b, _b); \
++        return 1; \
++    } \
++} while (0)
++
++#define ASSERT_MEM_EQ(a, b, n) do { \
++    if (memcmp((a), (b), (n)) != 0) { \
++        fprintf(stderr, "  %s:%d: ASSERT_MEM_EQ failed over %zu bytes\n", \
++                __FILE__, __LINE__, (size_t)(n)); \
++        for (size_t _i = 0; _i < (size_t)(n) && _i < 32; _i++) \
++            fprintf(stderr, "    [%zu]  got=%02x  expected=%02x\n", \
++                    _i, ((const uint8_t*)(a))[_i], \
++                    ((const uint8_t*)(b))[_i]); \
++        return 1; \
++    } \
++} while (0)
++
++
++/* --- Fixed test vectors (must match the Python harness above) ---------- */
++
++static const uint8_t TEST_X_BE[32] = {
++    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
++    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
++    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
++};
++static const uint8_t TEST_Y_BE[32] = {
++    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
++    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
++    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
++    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
++};
++static const uint8_t TEST_PRIV_BE[32] = {
++    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
++    0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
++    0x17, 0x18, 0x19, 0x20, 0x21, 0x22, 0x23, 0x24,
++    0x25, 0x26, 0x27, 0x28, 0x29, 0x30, 0x31, 0x32,
++};
++static const uint8_t TEST_SIG32[32] = {
++    0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
++    0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
++    0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
++    0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
++};
++/* DER ECDSA P-256 placeholder : SEQ(0x45) of two INTEGERs of 32 B each. */
++static const uint8_t TEST_DER[72] = {
++    0x30, 0x45,
++    0x02, 0x21, 0x00,
++    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
++    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
++    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
++    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
++    0x02, 0x20, 0x41,
++    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
++    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
++    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
++    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
++};
++
++
++/* --- 420-byte P-256 params blob ---------------------------------------- */
++
++TEST(p256_params_blob_header_and_size)
++{
++    uint8_t blob[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_p256_params_blob(
++        blob, sizeof(blob)));
++
++    /* First 16 bytes per python : 170000000001000001000000fcffffff */
++    static const uint8_t expected_header[16] = {
++        0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
++        0x01, 0x00, 0x00, 0x00, 0xfc, 0xff, 0xff, 0xff,
++    };
++    ASSERT_MEM_EQ(blob, expected_header, 16);
++    return 0;
++}
++
++
++TEST(p256_params_blob_rejects_small_buffer)
++{
++    uint8_t blob[100];
++    ASSERT_TRUE(!verimark_bootstrap_build_p256_params_blob(
++        blob, sizeof(blob)));
++    return 0;
++}
++
++
++/* --- 400-byte storage client_cert -------------------------------------- */
++
++TEST(storage_cert_layout_first_24_bytes)
++{
++    uint8_t cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, cert, sizeof(cert)));
++
++    /* Python expects: 3f5f17002f2e2d2c2b2a292827262524232221201f1e1d1c */
++    static const uint8_t expected_first_24[24] = {
++        0x3f, 0x5f, 0x17, 0x00,                              /* magic + sensor_id */
++        0x2f, 0x2e, 0x2d, 0x2c, 0x2b, 0x2a, 0x29, 0x28,      /* reverse(x_be)[0..20] */
++        0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x20,
++        0x1f, 0x1e, 0x1d, 0x1c,
++    };
++    ASSERT_MEM_EQ(cert, expected_first_24, 24);
++    return 0;
++}
++
++
++TEST(storage_cert_signature_layout)
++{
++    uint8_t cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, cert, sizeof(cert)));
++
++    /* TLV header at +141 : tag=0x02, len=32 LE. */
++    ASSERT_EQ(cert[141], 0x02);
++    ASSERT_EQ(cert[142], 0x20);
++    ASSERT_EQ(cert[143], 0x00);
++    /* Signature payload at +144 (32 bytes). */
++    ASSERT_MEM_EQ(cert + 144, TEST_SIG32, 32);
++    /* Trailing zeros. */
++    static const uint8_t zero224[224] = {0};
++    ASSERT_MEM_EQ(cert + 176, zero224, 224);
++    return 0;
++}
++
++
++TEST(storage_cert_y_coordinate_at_offset_72)
++{
++    uint8_t cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, cert, sizeof(cert)));
++
++    /* y_be is 0xa0..0xbf BE → reversed = 0xbf..0xa0. */
++    uint8_t expected_y_le[32];
++    for (int i = 0; i < 32; i++)
++        expected_y_le[i] = TEST_Y_BE[31 - i];
++    ASSERT_MEM_EQ(cert + 72, expected_y_le, 32);
++    return 0;
++}
++
++
++TEST(storage_cert_rejects_short_buffer)
++{
++    uint8_t cert[100];
++    ASSERT_TRUE(!verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, cert, sizeof(cert)));
++    return 0;
++}
++
++
++/* --- 400-byte wire client_cert ----------------------------------------- */
++
++TEST(wire_cert_signature_layout)
++{
++    uint8_t cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_wire_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_DER, sizeof(TEST_DER),
++        cert, sizeof(cert)));
++
++    /* Python expects wire[140..150] = 000048003045022100aa
++     *   [140] = 00  (still in pad region)
++     *   [141] = 00  (wire sig tag, NOT 0x02)
++     *   [142] = 48  (len = 72 LE)
++     *   [143] = 00
++     *   [144..149] = 30 45 02 21 00 aa  (start of DER) */
++    static const uint8_t expected[10] = {
++        0x00, 0x00, 0x48, 0x00,
++        0x30, 0x45, 0x02, 0x21, 0x00, 0xaa,
++    };
++    ASSERT_MEM_EQ(cert + 140, expected, 10);
++    return 0;
++}
++
++
++TEST(wire_cert_first_24_match_storage)
++{
++    /* Magic + sensor_id + reverse(x) prefix : identical between wire
++     * and storage forms — only the signature region differs. */
++    uint8_t wire[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    ASSERT_TRUE(verimark_bootstrap_build_wire_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_DER, sizeof(TEST_DER),
++        wire, sizeof(wire)));
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, storage, sizeof(storage)));
++    ASSERT_MEM_EQ(wire, storage, 104);   /* up to start of pad-then-sig */
++    return 0;
++}
++
++
++TEST(wire_cert_rejects_oversized_signature)
++{
++    uint8_t cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t big_sig[260];
++    memset(big_sig, 0xcc, sizeof(big_sig));
++    ASSERT_TRUE(!verimark_bootstrap_build_wire_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, big_sig, sizeof(big_sig),
++        cert, sizeof(cert)));
++    return 0;
++}
++
++
++/* --- 802-byte pair response parser ------------------------------------- */
++
++TEST(parse_response_splits_into_header_and_certs)
++{
++    uint8_t resp[VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE];
++    /* Header 00 00 + 400 B 0xaa client_cert + 400 B 0xbb server_cert. */
++    resp[0] = 0x00; resp[1] = 0x00;
++    memset(resp + 2,                          0xaa, 400);
++    memset(resp + 2 + 400,                    0xbb, 400);
++
++    VerimarkBootstrapPairResponse out;
++    uint16_t status = 0xffff;
++    ASSERT_TRUE(verimark_bootstrap_parse_pair_response(
++        resp, sizeof(resp), &out, &status));
++    ASSERT_EQ(status, 0x0000);
++    ASSERT_EQ(out.header[0], 0x00);
++    ASSERT_EQ(out.header[1], 0x00);
++    for (int i = 0; i < 400; i++) {
++        ASSERT_EQ(out.client_cert_storage[i], 0xaa);
++        ASSERT_EQ(out.server_cert[i],         0xbb);
++    }
++    return 0;
++}
++
++
++TEST(parse_response_propagates_nonzero_status)
++{
++    uint8_t resp[VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE] = {0};
++    /* status 0x0406 (= already paired). */
++    resp[0] = 0x04; resp[1] = 0x06;
++    VerimarkBootstrapPairResponse out;
++    uint16_t status = 0;
++    bool ok = verimark_bootstrap_parse_pair_response(
++        resp, sizeof(resp), &out, &status);
++    ASSERT_TRUE(!ok);              /* explicit refusal */
++    ASSERT_EQ(status, 0x0406);
++    return 0;
++}
++
++
++TEST(parse_response_rejects_wrong_size)
++{
++    uint8_t small[100] = {0};
++    VerimarkBootstrapPairResponse out;
++    uint16_t status = 0;
++    ASSERT_TRUE(!verimark_bootstrap_parse_pair_response(
++        small, sizeof(small), &out, &status));
++    return 0;
++}
++
++
++/* --- 1284-byte sub1 TLV serialization ---------------------------------- */
++
++TEST(sub1_serialization_layout)
++{
++    uint8_t storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t server[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t p256[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    uint8_t sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE];
++
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, storage, sizeof(storage)));
++    memset(server, 0xab, sizeof(server));
++    ASSERT_TRUE(verimark_bootstrap_build_p256_params_blob(p256, sizeof(p256)));
++
++    ASSERT_TRUE(verimark_bootstrap_serialize_sub1(
++        storage, TEST_PRIV_BE, server, p256, sub1, sizeof(sub1)));
++
++    /* Python : SUB1_FIRST24 = 020020000000323130292827262524232221201918171615
++     *   tag 2 LE = 02 00
++     *   length 32 LE = 20 00 00 00
++     *   priv LE = reverse(TEST_PRIV_BE)[:20]
++     *           = 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15
++     *
++     * Note: my test priv (TEST_PRIV_BE) ends in
++     * "25 26 27 28 29 30 31 32" so reversed front is "32 31 30 29 28 27 26 25" */
++    static const uint8_t expected_first_24[24] = {
++        0x02, 0x00,
++        0x20, 0x00, 0x00, 0x00,
++        0x32, 0x31, 0x30, 0x29, 0x28, 0x27, 0x26, 0x25,
++        0x24, 0x23, 0x22, 0x21, 0x20, 0x19, 0x18, 0x17,
++        0x16, 0x15,
++    };
++    ASSERT_MEM_EQ(sub1, expected_first_24, 24);
++
++    /* Python : SUB1_LAST8 = 0000020000000000
++     *   tag 0 LE = 00 00
++     *   length 2 LE = 02 00 00 00
++     *   sentinel = 00 00 */
++    static const uint8_t expected_last_8[8] = {
++        0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
++    };
++    ASSERT_MEM_EQ(sub1 + VERIMARK_BOOTSTRAP_SUB1_SIZE - 8, expected_last_8, 8);
++
++    return 0;
++}
++
++
++TEST(sub1_offsets_per_tag)
++{
++    uint8_t storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t server[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t p256[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    uint8_t sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE];
++
++    ASSERT_TRUE(verimark_bootstrap_build_storage_cert(
++        0x0017, TEST_X_BE, TEST_Y_BE, TEST_SIG32, storage, sizeof(storage)));
++    memset(server, 0xcd, sizeof(server));
++    ASSERT_TRUE(verimark_bootstrap_build_p256_params_blob(p256, sizeof(p256)));
++
++    ASSERT_TRUE(verimark_bootstrap_serialize_sub1(
++        storage, TEST_PRIV_BE, server, p256, sub1, sizeof(sub1)));
++
++    /* Tag layout offsets :
++     *   tag 2 (priv): off=0,                     hdr=6+32=38
++     *   tag 1 (cert): off=38,                    hdr=6+400=406  → next=444
++     *   tag 4 (p256): off=444,                   hdr=6+420=426  → next=870
++     *   tag 3 (srv ): off=870,                   hdr=6+400=406  → next=1276
++     *   tag 0 (end ): off=1276,                  hdr=6+2  =8    → next=1284 */
++
++    /* Tag 1 (cert) starts at offset 38 : tag=0x0001 LE + len=400 LE. */
++    ASSERT_EQ(sub1[38], 0x01);
++    ASSERT_EQ(sub1[39], 0x00);
++    ASSERT_EQ(sub1[40], 0x90);     /* 400 LE bytes 0..3 = 90 01 00 00 */
++    ASSERT_EQ(sub1[41], 0x01);
++    ASSERT_MEM_EQ(sub1 + 44, storage, 400);
++
++    /* Tag 4 (p256) starts at offset 444. */
++    ASSERT_EQ(sub1[444], 0x04);
++    ASSERT_EQ(sub1[445], 0x00);
++    ASSERT_MEM_EQ(sub1 + 444 + 6, p256, 420);
++
++    /* Tag 3 (server_cert) starts at offset 870. */
++    ASSERT_EQ(sub1[870], 0x03);
++    ASSERT_EQ(sub1[871], 0x00);
++    ASSERT_MEM_EQ(sub1 + 870 + 6, server, 400);
++    return 0;
++}
++
++
++TEST(sub1_rejects_short_buffer)
++{
++    uint8_t storage[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t server[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    uint8_t p256[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    uint8_t small_sub1[100];
++    memset(storage, 0xaa, sizeof(storage));
++    memset(server,  0xbb, sizeof(server));
++    memset(p256,    0xcc, sizeof(p256));
++    ASSERT_TRUE(!verimark_bootstrap_serialize_sub1(
++        storage, TEST_PRIV_BE, server, p256,
++        small_sub1, sizeof(small_sub1)));
++    return 0;
++}
++
++
++#define RUN(name) do { \
++    printf("  test_%s ... ", #name); \
++    int rc = test_##name(); \
++    if (rc == 0) { printf("OK\n"); passed++; } \
++    else { printf("FAIL\n"); failed++; } \
++} while (0)
++
++
++int main(void)
++{
++    int passed = 0, failed = 0;
++    setbuf(stdout, NULL);
++    setbuf(stderr, NULL);
++
++    RUN(p256_params_blob_header_and_size);
++    RUN(p256_params_blob_rejects_small_buffer);
++    RUN(storage_cert_layout_first_24_bytes);
++    RUN(storage_cert_signature_layout);
++    RUN(storage_cert_y_coordinate_at_offset_72);
++    RUN(storage_cert_rejects_short_buffer);
++    RUN(wire_cert_signature_layout);
++    RUN(wire_cert_first_24_match_storage);
++    RUN(wire_cert_rejects_oversized_signature);
++    RUN(parse_response_splits_into_header_and_certs);
++    RUN(parse_response_propagates_nonzero_status);
++    RUN(parse_response_rejects_wrong_size);
++    RUN(sub1_serialization_layout);
++    RUN(sub1_offsets_per_tag);
++    RUN(sub1_rejects_short_buffer);
++
++    fprintf(stderr, "\n%d passed, %d failed\n", passed, failed);
++    return failed == 0 ? 0 : 1;
++}

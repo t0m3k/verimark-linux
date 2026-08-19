@@ -195,31 +195,54 @@ class PatchSeriesTests(unittest.TestCase):
                         before,
                     )
 
-        self.assertEqual(authors, [SCELLES_AUTHOR] * 61 + [CLEANUP_AUTHOR])
+        self.assertEqual(
+            authors,
+            [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 6,
+        )
 
     def test_active_patches_exclude_prohibited_provenance_residue(self):
-        patch_text = "\n".join(
-            (CURRENT / name).read_text(errors="replace") for name in read_series()
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            patch_text = read_text_tree(
+                checkout / "libfprint" / "drivers" / "verimark"
+            )
 
         for description, pattern in PROHIBITED_RESIDUE.items():
             with self.subTest(description=description):
                 self.assertIsNone(pattern.search(patch_text))
-        for marker in SYNTHETIC_FIXTURE_MARKERS:
-            with self.subTest(marker=marker):
-                self.assertIn(marker, patch_text)
 
-    def test_active_patch_series_registers_both_verimark_ids(self):
+    def test_active_patch_series_registers_only_desktop_verimark_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            patch_text = read_text_tree(checkout / "libfprint")
+
+        for marker in ("0x00f2",):
+            with self.subTest(marker=marker):
+                self.assertIn(marker.lower(), patch_text.lower())
+        for marker in ("0x8054", "+usb:v047Dp8054*"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker.lower(), patch_text.lower())
+
+    def test_factory_beta_never_bootstraps_during_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            patch_text = read_text_tree(checkout / "libfprint" / "drivers" / "verimark")
+
+        self.assertNotIn("VERIMARK_ALLOW_BOOTSTRAP", patch_text)
+        self.assertNotIn(".allow_bootstrap", patch_text)
+        self.assertNotIn("verimark_try_bootstrap", patch_text)
+
+    def test_pairing_loader_enforces_secure_regular_files_and_strict_tlvs(self):
         patch_text = "\n".join((CURRENT / name).read_text() for name in read_series())
 
-        for marker in (
-            "0x00f2",
-            "0x8054",
-            "+usb:v047Dp00F2*",
-            "+usb:v047Dp8054*",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, patch_text)
+        self.assertIn("O_NOFOLLOW", patch_text)
+        self.assertIn("st_mode & 0777", patch_text)
+        self.assertIn("reserved != 0", patch_text)
+        self.assertIn("got_tag1", patch_text)
+        self.assertIn("off == blob_len", patch_text)
 
     def test_series_applies_as_mail_on_the_exact_base(self):
         self.assertTrue(DRIVER_WORKTREE.is_dir(), "driver checkout is required")
@@ -238,9 +261,12 @@ class PatchSeriesTests(unittest.TestCase):
                 "--format=%an <%ae>",
                 f"{BASE_COMMIT}..HEAD",
             ).splitlines()
-            self.assertEqual(authors, [SCELLES_AUTHOR] * 61 + [CLEANUP_AUTHOR])
+            self.assertEqual(
+                authors,
+                [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 6,
+            )
 
-    def test_materialized_driver_has_only_implemented_features_for_both_ids(self):
+    def test_materialized_driver_has_only_implemented_features_for_desktop_id(self):
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / "libfprint"
             apply_series(self, checkout)
@@ -255,11 +281,11 @@ class PatchSeriesTests(unittest.TestCase):
             )
             self.assertIsNotNone(id_table)
             self.assertEqual(
-                re.findall(r"\.pid = (VERIMARK_PID_[A-Z]+)", id_table.group(1)),
-                ["VERIMARK_PID_DT", "VERIMARK_PID_IT"],
+                re.findall(r"\.pid = (VERIMARK_PID(?:_[A-Z]+)?)", id_table.group(1)),
+                ["VERIMARK_PID"],
             )
-            self.assertRegex(header, r"(?m)^#define VERIMARK_PID_DT\s+0x00F2\b")
-            self.assertRegex(header, r"(?m)^#define VERIMARK_PID_IT\s+0x8054\b")
+            self.assertRegex(header, r"(?m)^#define VERIMARK_PID\s+0x00F2\b")
+            self.assertNotRegex(header, r"(?m)^#define VERIMARK_PID_IT\s+0x8054\b")
 
             features = re.search(
                 r"dev_class->features\s*=\s*(.*?);", source, re.DOTALL
@@ -273,6 +299,8 @@ class PatchSeriesTests(unittest.TestCase):
                     "FP_DEVICE_FEATURE_STORAGE",
                     "FP_DEVICE_FEATURE_STORAGE_LIST",
                     "FP_DEVICE_FEATURE_STORAGE_DELETE",
+                    "FP_DEVICE_FEATURE_CAPTURE",
+                    "FP_DEVICE_FEATURE_DUPLICATES_CHECK",
                 },
             )
             for callback in ("enroll", "identify", "verify", "list", "delete"):
@@ -294,9 +322,6 @@ class PatchSeriesTests(unittest.TestCase):
         for description, pattern in PROHIBITED_RESIDUE.items():
             with self.subTest(description=description):
                 self.assertIsNone(pattern.search(driver_text))
-        for marker in SYNTHETIC_FIXTURE_MARKERS:
-            with self.subTest(marker=marker):
-                self.assertIn(marker, driver_text)
 
     def test_pkgbuild_applies_the_checked_series_in_order(self):
         package_build = (REPOSITORY / "packaging" / "arch" / "PKGBUILD").read_text()

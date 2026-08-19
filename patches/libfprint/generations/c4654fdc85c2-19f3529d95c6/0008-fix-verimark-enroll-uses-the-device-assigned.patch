@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 12:02:03 +0200
+Subject: [PATCH 08/31] fix(verimark): enroll uses the device-assigned
+ storage_handle as tuid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the sensor doesn't honour the host-supplied 16-byte tuid we pass
+in the 0x96 03 commit payload — observed runtime: a Linux-side host
+tuid X goes in, but 0x9f returns a different Y for the same fresh
+enrollment — the FpPrint we hand back to libfprint disagrees with
+what `list()` reports the next time round.
+
+fprintd's verify path (`_handle_verify_finished` -> "verifying local
+storage") iterates the user's cached FpPrints and removes any that
+fp_print_equal does NOT find on the device. Mismatched tuids look
+like the print is "unknown to device" and fprintd silently deletes
+the user's enrollment from disk mid-verify — then verify hangs with
+nothing left to match against. Journal :
+
+  Deleted stored finger 7 for user scelles as it is unknown to device.
+
+Snapshot the class-1 storage handle set BEFORE commit, then list
+AFTER commit and diff to find the entry the sensor actually assigned.
+Use that as the FpPrint's fpi-data instead of the host-supplied
+random tuid. Falls back gracefully to the random tuid (worst case
+they're the same — no harm done).
+
+This is also why the standalone the standalone verify harness succeeded
+earlier: it used the gallery returned by list() directly, never going
+through fprintd's cache-vs-device reconciliation.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 61 +++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index d879f3e..0c2015a 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1078,13 +1078,28 @@ static void verimark_enroll(FpDevice *device)
+         fpi_device_enroll_complete(device, NULL, error);
+         return;
+     }
+-    fp_dbg("enroll: new tuid = %02x%02x%02x%02x%02x%02x%02x%02x"
++    fp_dbg("enroll: new tuid (host-supplied) = %02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            new_tuid[0],  new_tuid[1],  new_tuid[2],  new_tuid[3],
+            new_tuid[4],  new_tuid[5],  new_tuid[6],  new_tuid[7],
+            new_tuid[8],  new_tuid[9],  new_tuid[10], new_tuid[11],
+            new_tuid[12], new_tuid[13], new_tuid[14], new_tuid[15]);
+ 
++    /* === Snapshot pre-enroll storage handles. === */
++    /* Some Tudor sensors don't honour the host-supplied tuid in
++     * 0x96 03 — they assign their own storage_handle on commit and
++     * return it via 0x9f. To guarantee the FpPrint we hand back to
++     * libfprint actually matches what `list()` will report (and
++     * therefore that fprintd's fp_print_equal succeeds during
++     * verify), we snapshot the pre-enroll handle set and pick the
++     * NEW entry from the post-commit list. */
++    VerimarkStorageObjectList pre_list = {0};
++    uint16_t pre_st = 0;
++    verimark_storage_get_object_list(&self->session, &io,
++                                      /* class_byte = */ 0x01,
++                                      &pre_list, &pre_st);
++    fp_dbg("enroll: %zu prints on device before commit", pre_list.count);
++
+     /* === 0x19 init + PRELUDE === */
+     verimark_capture_init_session(&self->session, &io, &st);
+     fp_dbg("enroll: 0x19 init status=0x%04x", st);
+@@ -1231,6 +1246,46 @@ static void verimark_enroll(FpDevice *device)
+     verimark_enroll_finish(&self->session, &io, &st);
+     fp_info("enroll: FINISH 0x96 04 status=0x%04x", st);
+ 
++    /* === Resolve the actual storage_handle the sensor assigned. ===
++     * Some sensors don't honour the host-supplied tuid — they generate
++     * their own ID on commit. To make the FpPrint match what `list()`
++     * returns later (so fprintd's fp_print_equal succeeds during
++     * verify), compare the pre-/post-commit storage handle sets and
++     * use the diff. Falls back to the host-supplied tuid if anything
++     * goes wrong (worst case = the host-supplied tuid IS the
++     * storage_handle, in which case both match anyway). */
++    VerimarkStorageObjectList post_list = {0};
++    uint16_t post_st = 0;
++    uint8_t  effective_tuid[VERIMARK_STORAGE_TUID_LEN];
++    memcpy(effective_tuid, new_tuid, VERIMARK_STORAGE_TUID_LEN);
++    if (verimark_storage_get_object_list(&self->session, &io,
++                                          /* class_byte = */ 0x01,
++                                          &post_list, &post_st)
++        && post_st == 0x0000)
++    {
++        for (size_t i = 0; i < post_list.count; i++) {
++            gboolean in_pre = FALSE;
++            for (size_t j = 0; j < pre_list.count; j++) {
++                if (memcmp(post_list.tuids[i], pre_list.tuids[j],
++                           VERIMARK_STORAGE_TUID_LEN) == 0) {
++                    in_pre = TRUE;
++                    break;
++                }
++            }
++            if (!in_pre) {
++                memcpy(effective_tuid, post_list.tuids[i],
++                       VERIMARK_STORAGE_TUID_LEN);
++                if (memcmp(effective_tuid, new_tuid,
++                           VERIMARK_STORAGE_TUID_LEN) != 0) {
++                    fp_warn("enroll: sensor reassigned tuid — "
++                            "using device-reported storage_handle for "
++                            "FpPrint match later");
++                }
++                break;
++            }
++        }
++    }
++
+     /* === Attach the tuid to the user-supplied template and report success ===
+      * The libfprint convention (cf. goodixmoc) is to mutate the
+      * caller-supplied template, not allocate a new FpPrint. */
+@@ -1238,7 +1293,7 @@ static void verimark_enroll(FpDevice *device)
+     fpi_device_get_enroll_data(device, &template);
+     if (template != NULL) {
+         GVariant *tid = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+-                                                   new_tuid,
++                                                   effective_tuid,
+                                                    VERIMARK_STORAGE_TUID_LEN,
+                                                    1);
+         GVariant *data = g_variant_new("(@ay)", tid);
+@@ -1259,7 +1314,7 @@ static void verimark_enroll(FpDevice *device)
+     } else {
+         /* Defensive fallback : if libfprint didn't hand us a template
+          * (shouldn't happen on a real enroll() call), synthesize one. */
+-        FpPrint *fallback = verimark_print_from_tuid(device, new_tuid);
++        FpPrint *fallback = verimark_print_from_tuid(device, effective_tuid);
+         g_object_ref_sink(fallback);
+         fpi_device_enroll_complete(device, fallback, NULL);
+     }

@@ -1,0 +1,2489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 10:38:24 +0200
+Subject: [PATCH 02/31] feat(verimark): wire all 8 vfuncs
+ (list/delete/verify/identify/enroll)
+
+Adds the libfprint vfunc implementations for the Kensington VeriMark DT
+on top of the existing TLS-PSK handshake / session pre-integration:
+
+- list:     0x9f 01 returns FpPrint array carrying class-1 storage_handle
+- delete:   0xa3 (cascading 3-class delete confirmed runtime)
+- verify:   capture pipeline (0x39 RICH / 0x86 frame_ready_arm /
+            structured 0x80 / poll 0x87 / 0x39 SPARSE / 0x81)
+            + 0x99 simple match + 0xa0 02 resolver class-2 to class-1
+            for strict per-print verification
+- identify: same pipeline + gallery search by resolved storage_handle
+- enroll:   12-opcode prelude, 0x96 01 begin, per-swipe WARM-mode capture
+            with RICH/SPARSE LED keep-alive and pre-cycle drain,
+            bitmask-gated 7-stage progress, 0x96 03 commit, 0x9e refresh,
+            0x96 04 finish (template attached to user-supplied FpPrint)
+
+New wrappers:
+- capture.{h,c}: 0x19 init, structured 0x80 capture_start, 0x86 event_config
+                 with 128-bit masks (LE), 0x87 event_read returning parsed
+                 event records with frame-ready helper
+- match.{h,c}: simple 0x99 flag-only call returning the 175-byte verdict
+- storage.{h,c}: 0xa3 delete_object, 0xa0 02 resolve_template_to_handle
+- enroll.{h,c}: new module wrapping 0x96 sub-commands 01/02/03/04 with
+                the 80-byte add_image response parser (bitmask, verdict,
+                swipe index, cumulative quality)
+
+All 8 vfuncs runtime-validated against a real 047d:00f2 sensor.
+
+Test suite: 10 meson suites, 94 tests green (proto, crypto, tls, pairing,
+session, handshake, storage, capture, match, enroll). New TDD coverage
+for every wrapper added in this commit.
+
+Known limitations (follow-ups):
+- Synchronous implementation throughout; upstream merge requires fpi_ssm
+  refactor.
+- Single-attempt verify/identify; on-chip pre-filter rejects ~50% of
+  touches without the retry loop the Python reference uses (3 attempts,
+  WARM mode on retry).
+- Red-LED no-match feedback not deterministic; exact 0x39 payload-to-LED
+  mapping not formally reversed yet.
+- TOFU dual-OS: a sensor paired under Linux must be re-paired to keep
+  Windows Hello working (no host-side unpair opcode exists).
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/capture.c  |  216 ++++-
+ libfprint/drivers/verimark/capture.h  |  122 +++
+ libfprint/drivers/verimark/enroll.c   |  226 +++++
+ libfprint/drivers/verimark/enroll.h   |  150 +++
+ libfprint/drivers/verimark/match.c    |   53 ++
+ libfprint/drivers/verimark/match.h    |   41 +
+ libfprint/drivers/verimark/storage.c  |  104 +++
+ libfprint/drivers/verimark/storage.h  |   62 ++
+ libfprint/drivers/verimark/verimark.c | 1248 +++++++++++++++++++++++--
+ 9 files changed, 2138 insertions(+), 84 deletions(-)
+ create mode 100644 libfprint/drivers/verimark/enroll.c
+ create mode 100644 libfprint/drivers/verimark/enroll.h
+
+diff --git a/libfprint/drivers/verimark/capture.c b/libfprint/drivers/verimark/capture.c
+index 236f98c..438d3f7 100644
+--- a/libfprint/drivers/verimark/capture.c
++++ b/libfprint/drivers/verimark/capture.c
+@@ -18,6 +18,57 @@ static inline uint16_t read_le16(const uint8_t *p)
+     return (uint16_t)(p[0] | (p[1] << 8));
+ }
+ 
++static inline uint32_t read_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0]
++         | ((uint32_t)p[1] << 8)
++         | ((uint32_t)p[2] << 16)
++         | ((uint32_t)p[3] << 24);
++}
++
++static inline void write_le16(uint8_t out[2], uint16_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++}
++
++static inline void write_le32(uint8_t out[4], uint32_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++    out[2] = (uint8_t)((v >> 16) & 0xff);
++    out[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x19 — init capture session
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_init_session(VerimarkSession *s,
++                                   struct VerimarkTransportIO *io,
++                                   uint16_t *status_out)
++{
++    if (!s || !io || !status_out)
++        return false;
++
++    /* The response can carry up to a few dozen bytes of session
++     * metadata ; 128 is comfortable. */
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x19,
++        NULL, 0,
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
+ 
+ /* ---------------------------------------------------------------------------
+  * 0x39 — capture_config
+@@ -32,7 +83,7 @@ bool verimark_capture_config(VerimarkSession *s,
+         return false;
+ 
+     /* Response carries no payload — just the 2-byte status. */
+-    uint8_t resp_buf[8];
++    uint8_t resp_buf[128];
+     uint16_t status = 0;
+     const uint8_t *payload = NULL;
+     size_t payload_len = 0;
+@@ -126,7 +177,7 @@ bool verimark_capture_get_frame(VerimarkSession *s,
+     if (!s || !io || !status_out)
+         return false;
+ 
+-    uint8_t resp_buf[8];
++    uint8_t resp_buf[128];
+     uint16_t status = 0;
+     const uint8_t *payload = NULL;
+     size_t payload_len = 0;
+@@ -155,7 +206,7 @@ bool verimark_capture_status_poll(VerimarkSession *s,
+         return false;
+ 
+     /* Empty payload — opcode 0x81 alone. */
+-    uint8_t resp_buf[8];
++    uint8_t resp_buf[128];
+     uint16_t status = 0;
+     const uint8_t *payload = NULL;
+     size_t payload_len = 0;
+@@ -232,3 +283,162 @@ bool verimark_capture_get_frame_data(VerimarkSession *s,
+     *out_image_size = payload_len;
+     return true;
+ }
++
++
++/* ---------------------------------------------------------------------------
++ * 0x80 — capture_start (custom 16-byte payload)
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_start(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t payload[VERIMARK_CAPTURE_START_PAYLOAD_LEN],
++                            uint16_t *status_out)
++{
++    if (!s || !io || !payload || !status_out)
++        return false;
++
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *resp_payload = NULL;
++    size_t resp_payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x80,
++        payload, VERIMARK_CAPTURE_START_PAYLOAD_LEN,
++        resp_buf, sizeof(resp_buf),
++        &status, &resp_payload, &resp_payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x86 — event_config
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_event_config(VerimarkSession *s,
++                                   struct VerimarkTransportIO *io,
++                                   const uint8_t *mask_a,
++                                   const uint8_t *mask_b,
++                                   uint32_t field_21,
++                                   uint16_t *status_out)
++{
++    if (!s || !io || !status_out)
++        return false;
++
++    uint8_t req[VERIMARK_EVENT_MASK_LEN * 2 + 4];
++    memset(req, 0, sizeof(req));
++    if (mask_a)
++        memcpy(req + 0,  mask_a, VERIMARK_EVENT_MASK_LEN);
++    if (mask_b)
++        memcpy(req + VERIMARK_EVENT_MASK_LEN, mask_b, VERIMARK_EVENT_MASK_LEN);
++    write_le32(req + VERIMARK_EVENT_MASK_LEN * 2, field_21);
++
++    /* Response is documented as ~0x40 bytes ; we don't currently parse
++     * it (caller only needs the status to know the subscribe was
++     * accepted). Provision the buffer generously. */
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x86,
++        req, sizeof(req),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x87 — event_read
++ * ------------------------------------------------------------------------- */
++
++bool verimark_capture_event_read(VerimarkSession *s,
++                                 struct VerimarkTransportIO *io,
++                                 uint16_t cursor,
++                                 uint16_t max_events,
++                                 VerimarkEventReadResult *out,
++                                 uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    /* Build the 8-byte LE payload : [cursor:u16][max:u16][field_05:u32=1]. */
++    uint8_t req[8];
++    write_le16(req + 0, cursor);
++    write_le16(req + 2, max_events);
++    write_le32(req + 4, 1);
++
++    /* Response can carry up to max_events * 12 + 6 bytes of payload. */
++    uint8_t resp_buf[VERIMARK_EVENT_MAX_RETURNED * 12 + 256];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    memset(out, 0, sizeof(*out));
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x87,
++        req, sizeof(req),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* sensor-level error, out left zeroed */
++    if (payload_len < 4 || !payload)
++        return false;
++
++    /* Header : [returned_count:u16 LE][total_count:u16 LE]. */
++    out->returned_count = read_le16(payload + 0);
++    out->total_count    = read_le16(payload + 2);
++
++    size_t to_decode = out->returned_count;
++    if (to_decode > VERIMARK_EVENT_MAX_RETURNED)
++        to_decode = VERIMARK_EVENT_MAX_RETURNED;
++    if (payload_len < 4 + to_decode * 12) {
++        /* Sensor returned fewer bytes than its own count says — clamp. */
++        size_t available_records = (payload_len - 4) / 12;
++        if (available_records < to_decode)
++            to_decode = available_records;
++    }
++
++    for (size_t i = 0; i < to_decode; i++) {
++        const uint8_t *rec = payload + 4 + i * 12;
++        out->events[i].type = rec[0];
++        out->events[i].b1   = rec[1];
++        out->events[i].b2   = rec[2];
++        out->events[i].b3   = rec[3];
++        out->events[i].val0 = read_le32(rec + 4);
++        out->events[i].val1 = read_le32(rec + 8);
++    }
++    /* Reflect the truncation in the returned count so callers don't
++     * iterate past the decoded events. */
++    out->returned_count = (uint16_t)to_decode;
++    return true;
++}
++
++
++bool verimark_capture_events_have_frame_ready(const VerimarkEventReadResult *r,
++                                              VerimarkSensorEvent *out_event)
++{
++    if (!r)
++        return false;
++    for (size_t i = 0; i < r->returned_count; i++) {
++        const VerimarkSensorEvent *ev = &r->events[i];
++        if ((ev->val0 | ev->val1) & VERIMARK_EVENT_FRAME_READY_BIT) {
++            if (out_event)
++                *out_event = *ev;
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/libfprint/drivers/verimark/capture.h b/libfprint/drivers/verimark/capture.h
+index e4747f3..f76403d 100644
+--- a/libfprint/drivers/verimark/capture.h
++++ b/libfprint/drivers/verimark/capture.h
+@@ -40,6 +40,23 @@ extern "C" {
+ struct VerimarkTransportIO;
+ 
+ 
++/* ---------------------------------------------------------------------------
++ * 0x19 — init capture session
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send opcode `0x19` (no payload, 1 byte total on the wire) to ask
++ * the sensor to (re)initialize its capture-side internal state.
++ *
++ * Observed runtime as the very first call of the canonical Linux
++ * verify pipeline (cf. `python/verimark/match.py:main()` preamble).
++ * The response is a single 2-byte status with no payload.
++ */
++bool verimark_capture_init_session(VerimarkSession *s,
++                                   struct VerimarkTransportIO *io,
++                                   uint16_t *status_out);
++
++
+ /* ---------------------------------------------------------------------------
+  * 0x39 — capture_config
+  * ------------------------------------------------------------------------- */
+@@ -159,6 +176,111 @@ bool verimark_capture_get_frame_data(VerimarkSession *s,
+                                      uint16_t *status_out);
+ 
+ 
++/* ---------------------------------------------------------------------------
++ * 0x80 — capture_start (with caller-supplied 16-byte structured payload)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_CAPTURE_START_PAYLOAD_LEN 16
++
++/**
++ * Send opcode `0x80` with a caller-supplied 16-byte payload.
++ *
++ * The canonical "verify-style" payload is
++ *   `14 00 00 00 01 00 00 00 01 00 00 08 01 01 01 00`
++ * (cf. `python/verimark/match.py:build_capture_start_payload()`).
++ * Distinct from `verimark_capture_get_frame()`, which sends 16 zeros
++ * and was the early Phase 9 "naive" entrypoint.
++ */
++bool verimark_capture_start(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t payload[VERIMARK_CAPTURE_START_PAYLOAD_LEN],
++                            uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x86 — event_config (subscribe to sensor events)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_EVENT_MASK_LEN 16
++
++/**
++ * Send opcode `0x86` with a 36-byte payload :
++ *   `[mask_a:16][mask_b:16][field_21:u32 LE]`
++ *
++ * Wire is LITTLE-ENDIAN despite what the YAML claims — that's the v3
++ * "Linux runtime" finding documented in `python/verimark/match.py`.
++ *
++ * Subscribe a set of event IDs (0..127) by setting bit `(id & 0x1f)`
++ * in `mask[id // 32 * 4 ...]` (little-endian u32 inside the 16-byte
++ * mask). `field_21 = 4` is the "subscribe-all" flag (used when both
++ * masks are zero) ; `field_21 = 0` is the default.
++ *
++ * Caller fills both masks (they are typically identical). Pass NULL
++ * mask pointers to send a zero mask.
++ */
++bool verimark_capture_event_config(VerimarkSession *s,
++                                   struct VerimarkTransportIO *io,
++                                   const uint8_t *mask_a,    /* 16 bytes or NULL = zeros */
++                                   const uint8_t *mask_b,    /* 16 bytes or NULL = zeros */
++                                   uint32_t field_21,
++                                   uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x87 — event_read (poll the sensor's event queue)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_EVENT_MAX_RETURNED      32
++#define VERIMARK_EVENT_FRAME_READY_BIT   0x1000u
++
++/**
++ * One sensor event record (12 bytes on the wire). Wire format
++ * little-endian (cf. v3 finding).
++ */
++typedef struct {
++    uint8_t  type;
++    uint8_t  b1, b2, b3;
++    uint32_t val0;
++    uint32_t val1;
++} VerimarkSensorEvent;
++
++/**
++ * Result of one `0x87 event_read` call.
++ *
++ * `total_count` is the total number of events still buffered sensor-
++ * side ; `returned_count` is how many we actually got in this page
++ * (capped at VERIMARK_EVENT_MAX_RETURNED — the wire allows more but
++ * we truncate ; if you need more, call again with an updated cursor).
++ */
++typedef struct {
++    uint16_t total_count;
++    uint16_t returned_count;
++    VerimarkSensorEvent events[VERIMARK_EVENT_MAX_RETURNED];
++} VerimarkEventReadResult;
++
++/**
++ * Send opcode `0x87` with an 8-byte payload :
++ *   `[cursor:u16 LE][max_events:u16 LE][field_05:u32 LE = 1]`
++ *
++ * Returns the parsed event page. Cursor=0 + max_events=32 is the
++ * typical polling pattern (cf. Python `_poll_for_frame_ready`).
++ */
++bool verimark_capture_event_read(VerimarkSession *s,
++                                 struct VerimarkTransportIO *io,
++                                 uint16_t cursor,
++                                 uint16_t max_events,
++                                 VerimarkEventReadResult *out,
++                                 uint16_t *status_out);
++
++/**
++ * Scan a parsed event page for the frame-ready signal. Returns true
++ * if any event has `(val0 | val1) & VERIMARK_EVENT_FRAME_READY_BIT`.
++ * If `out_event` is non-NULL, copies the matching event in.
++ */
++bool verimark_capture_events_have_frame_ready(const VerimarkEventReadResult *r,
++                                              VerimarkSensorEvent *out_event);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libfprint/drivers/verimark/enroll.c b/libfprint/drivers/verimark/enroll.c
+new file mode 100644
+index 0000000..15de03b
+--- /dev/null
++++ b/libfprint/drivers/verimark/enroll.c
+@@ -0,0 +1,226 @@
++/*
++ * enroll.c — Tudor enroll FSM implementation.
++ *
++ * Each wrapper builds the right `0x96 NN` sub-command payload, sends
++ * it through the active TLS session, and parses the response per
++ * `docs/opcodes/0x96.yaml`.
++ */
++
++#include "enroll.h"
++
++#include <string.h>
++
++#include "handshake.h"   /* for VerimarkTransportIO definition */
++
++
++static inline uint16_t read_le16(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static inline uint32_t read_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0]
++         | ((uint32_t)p[1] << 8)
++         | ((uint32_t)p[2] << 16)
++         | ((uint32_t)p[3] << 24);
++}
++
++static inline void write_le16(uint8_t out[2], uint16_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++}
++
++static inline void write_le32(uint8_t out[4], uint32_t v)
++{
++    out[0] = (uint8_t)(v & 0xff);
++    out[1] = (uint8_t)((v >> 8) & 0xff);
++    out[2] = (uint8_t)((v >> 16) & 0xff);
++    out[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 01 — enroll begin
++ * ------------------------------------------------------------------------- */
++
++/* Payload : 12 bytes = 0x01 + 11 zeros. */
++static const uint8_t ENROLL_BEGIN_PAYLOAD[12] = {
++    0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++
++bool verimark_enroll_begin(VerimarkSession *s,
++                           struct VerimarkTransportIO *io,
++                           uint16_t *status_out)
++{
++    if (!s || !io || !status_out)
++        return false;
++
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x96,
++        ENROLL_BEGIN_PAYLOAD, sizeof(ENROLL_BEGIN_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 02 — add image
++ * ------------------------------------------------------------------------- */
++
++/* Payload : 4 bytes = 0x02 + 3 zeros. */
++static const uint8_t ENROLL_ADD_IMAGE_PAYLOAD[4] = { 0x02, 0, 0, 0 };
++
++/* Response layout (80 bytes, per python parse_add_image_response):
++ *   +0x00 .. +0x0f : header (16 B candidate tuid — typically zeros until commit)
++ *   +0x10 .. +0x13 : u32 const = 60
++ *   +0x14 .. +0x15 : u16 LE progress_bitmask
++ *   +0x16          : u8 verdict_char ('d' = 0x64 = accepted)
++ *   +0x18 .. +0x1f : 8 B quality_metrics
++ *   +0x34 .. +0x37 : u32 LE cumulative
++ *   +0x38 .. +0x3b : u32 LE swipe_index (1-based)
++ *   +0x3c .. +0x3f : u32 LE quality_2 */
++#define ADD_IMAGE_OFFSET_BITMASK     0x14u
++#define ADD_IMAGE_OFFSET_VERDICT     0x16u
++#define ADD_IMAGE_OFFSET_CUMULATIVE  0x34u
++#define ADD_IMAGE_OFFSET_SWIPE_IDX   0x38u
++#define ADD_IMAGE_MIN_PAYLOAD_LEN    64u
++
++bool verimark_enroll_add_image(VerimarkSession *s,
++                               struct VerimarkTransportIO *io,
++                               VerimarkEnrollAddImageResult *out,
++                               uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    uint8_t resp_buf[256];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    memset(out, 0, sizeof(*out));
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x96,
++        ENROLL_ADD_IMAGE_PAYLOAD, sizeof(ENROLL_ADD_IMAGE_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* sensor-side rejection (e.g. capture invalid) */
++    if (payload_len < ADD_IMAGE_MIN_PAYLOAD_LEN || !payload)
++        return false;
++
++    out->progress_bitmask = read_le16(payload + ADD_IMAGE_OFFSET_BITMASK);
++    out->verdict_char     = payload[ADD_IMAGE_OFFSET_VERDICT];
++    out->cumulative       = read_le32(payload + ADD_IMAGE_OFFSET_CUMULATIVE);
++    out->swipe_index      = read_le32(payload + ADD_IMAGE_OFFSET_SWIPE_IDX);
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 03 — commit
++ * ------------------------------------------------------------------------- */
++
++#define ENROLL_COMMIT_PAYLOAD_LEN 123u
++
++bool verimark_enroll_commit(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                            const uint8_t *sid_28,
++                            uint16_t *status_out)
++{
++    if (!s || !io || !tuid || !status_out)
++        return false;
++
++    uint8_t p[ENROLL_COMMIT_PAYLOAD_LEN];
++    memset(p, 0, sizeof(p));
++
++    /* [0]   subcmd                                                          */
++    p[0] = 0x03;
++    /* [8..11]  u32 field_2 = 0x6f                                            */
++    write_le32(p + 8,  0x6f);
++    /* [14..17] u32 field_4 = 0x10                                            */
++    write_le32(p + 14, 0x10);
++    /* [18..33] 16B tuid                                                      */
++    memcpy(p + 18, tuid, VERIMARK_STORAGE_TUID_LEN);
++    /* [34..35] u16 field_5 = 0x0001                                          */
++    write_le16(p + 34, 0x0001);
++    /* [36..39] u32 field_6 = 0x4c                                            */
++    write_le32(p + 36, 0x4c);
++    /* [40..43] u32 field_7 = 3                                               */
++    write_le32(p + 40, 3);
++    /* [44..47] u32 sid_byte_length = 28                                      */
++    write_le32(p + 44, VERIMARK_ENROLL_SID_LEN);
++    /* [48..75] 28B SID — caller-supplied or zeros                            */
++    if (sid_28)
++        memcpy(p + 48, sid_28, VERIMARK_ENROLL_SID_LEN);
++    /* [76..115] 40B padding zeros — already done by memset                  */
++    /* [116..122] 7B footer marker  02 00 01 00 00 00 f6                     */
++    p[116] = 0x02;
++    p[117] = 0x00;
++    p[118] = 0x01;
++    p[119] = 0x00;
++    p[120] = 0x00;
++    p[121] = 0x00;
++    p[122] = 0xf6;
++
++    uint8_t resp_buf[256];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x96,
++        p, sizeof(p),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 04 — finish
++ * ------------------------------------------------------------------------- */
++
++/* Payload : 4 bytes = 0x04 + 3 zeros. */
++static const uint8_t ENROLL_FINISH_PAYLOAD[4] = { 0x04, 0, 0, 0 };
++
++bool verimark_enroll_finish(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            uint16_t *status_out)
++{
++    if (!s || !io || !status_out)
++        return false;
++
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x96,
++        ENROLL_FINISH_PAYLOAD, sizeof(ENROLL_FINISH_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    return ok;
++}
+diff --git a/libfprint/drivers/verimark/enroll.h b/libfprint/drivers/verimark/enroll.h
+new file mode 100644
+index 0000000..2195ebd
+--- /dev/null
++++ b/libfprint/drivers/verimark/enroll.h
+@@ -0,0 +1,150 @@
++/*
++ * enroll.h — Tudor enroll FSM wrappers (opcode 0x96 sub-commands).
++ *
++ * The Synaptics VeriMark DT enroll flow is driven by opcode `0x96` with
++ * 4 sub-commands carried in the payload's first byte :
++ *
++ *   0x96 01  enroll begin    — initialise the on-chip enroll FSM
++ *   0x96 02  add image       — submit a captured swipe (returns 80-B status)
++ *   0x96 03  commit          — finalize the template (123-B payload : tuid + SID)
++ *   0x96 04  finish          — cleanup the FSM
++ *
++ * Wire format & semantics : `docs/opcodes/0x96.yaml` +
++ * `docs/phase9-enroll-flow-windows.md`. The Linux reference impl that
++ * decoded all of this is `python/verimark/enroll.py`.
++ *
++ * Capture pipeline opcodes (0x39, 0x80, 0x86, 0x87, 0x81) used during
++ * the per-swipe capture cycles live in `capture.h`.
++ */
++
++#ifndef VERIMARK_ENROLL_H
++#define VERIMARK_ENROLL_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "session.h"
++#include "storage.h"   /* for VERIMARK_STORAGE_TUID_LEN */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++struct VerimarkTransportIO;
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 01 — enroll begin
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send `0x96 01` with a 12-byte zero payload. Initializes the on-chip
++ * enroll FSM ; must be called BEFORE the first capture cycle.
++ *
++ * Returns true on transport success. `status == 0` is the only valid
++ * "ready to enroll" reply.
++ */
++bool verimark_enroll_begin(VerimarkSession *s,
++                           struct VerimarkTransportIO *io,
++                           uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 02 — add image (called after each successful swipe)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_ENROLL_VERDICT_ACCEPTED 0x64   /* 'd' = accepted (per Ghidra) */
++#define VERIMARK_ENROLL_TARGET_BITMASK   0x7f   /* 7 unique slots = template complete */
++
++/**
++ * Parsed 80-byte response payload from `0x96 02`.
++ *
++ * Field semantics (cf. `python/verimark/enroll.py:parse_add_image_response`):
++ *   - `progress_bitmask`  : grows from 0x01 → 0x03 → 0x07 … 0x7f as
++ *                            each UNIQUE swipe is accepted. Stays
++ *                            unchanged when the engine rejects a
++ *                            duplicate.
++ *   - `verdict_char`      : 0x64 ('d') means accepted ; anything else
++ *                            = rejected (duplicate / low quality /
++ *                            geometry).
++ *   - `swipe_index`       : 1-based counter of UNIQUE swipes so far.
++ *   - `cumulative`        : grows ~4540 per accepted swipe (quality
++ *                            accumulator — exact semantic TBD).
++ */
++typedef struct {
++    uint16_t progress_bitmask;
++    uint8_t  verdict_char;
++    uint32_t swipe_index;
++    uint32_t cumulative;
++} VerimarkEnrollAddImageResult;
++
++/**
++ * Send `0x96 02` (4-byte payload) and parse the 80-byte response.
++ *
++ * Returns true on transport success ; on sensor-level non-zero status
++ * the result struct is left zeroed but `*status_out` is filled.
++ */
++bool verimark_enroll_add_image(VerimarkSession *s,
++                               struct VerimarkTransportIO *io,
++                               VerimarkEnrollAddImageResult *out,
++                               uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 03 — commit (finalize the new template)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_ENROLL_SID_LEN 28
++
++/**
++ * Send `0x96 03` (123-byte payload) committing the just-captured
++ * template under the host-supplied 16-byte `tuid`. The Windows SID
++ * (28 bytes) is optional ; pass NULL or all-zeros for a Linux PoC.
++ *
++ * Wire payload layout (LE throughout, cf. python/verimark/enroll.py
++ * `build_enroll_commit_payload`) :
++ *   [ 0]   u8   subcmd = 0x03
++ *   [ 4..7]   u32  field_1   = 0
++ *   [ 8..11]  u32  field_2   = 0x6f
++ *   [12..13]  u16  field_3   = 0
++ *   [14..17]  u32  field_4   = 0x10
++ *   [18..33]  16B  tuid
++ *   [34..35]  u16  field_5   = 0x0001
++ *   [36..39]  u32  field_6   = 0x4c
++ *   [40..43]  u32  field_7   = 3
++ *   [44..47]  u32  sid_len   = 28
++ *   [48..75]  28B  sid
++ *   [76..115] 40B  padding
++ *   [116..122] 7B  footer    = 02 00 01 00 00 00 f6
++ *
++ * Pre-condition : the `0x96 02 add_image` `progress_bitmask` must
++ * have reached `VERIMARK_ENROLL_TARGET_BITMASK` (= 0x7f, = 7 unique
++ * slots). Otherwise the sensor refuses with status `0x0404`.
++ */
++bool verimark_enroll_commit(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                            const uint8_t *sid_28,   /* may be NULL → zeros */
++                            uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0x96 04 — finish (cleanup the on-chip FSM)
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Send `0x96 04` (4-byte payload). Cleanup ; called after commit (or
++ * after a failed enroll to release the FSM).
++ */
++bool verimark_enroll_finish(VerimarkSession *s,
++                            struct VerimarkTransportIO *io,
++                            uint16_t *status_out);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VERIMARK_ENROLL_H */
+diff --git a/libfprint/drivers/verimark/match.c b/libfprint/drivers/verimark/match.c
+index 1335c50..5cc1451 100644
+--- a/libfprint/drivers/verimark/match.c
++++ b/libfprint/drivers/verimark/match.c
+@@ -158,3 +158,56 @@ bool verimark_match_request(VerimarkSession *s,
+     memcpy(out->reserved, resp_payload + 13, 23);
+     return true;
+ }
++
++
++/* ---------------------------------------------------------------------------
++ * 0x99 — simplified flag-only variant
++ * ------------------------------------------------------------------------- */
++
++/* Canonical Linux 0x99 payload : single flag byte + 11 zeros. The
++ * sensor sources image + tuids from session state. Cf.
++ * python/verimark/match.py:build_match_request_payload(). */
++static const uint8_t MATCH_SIMPLE_PAYLOAD[12] = {
++    0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++bool verimark_match_simple(VerimarkSession *s,
++                           struct VerimarkTransportIO *io,
++                           VerimarkMatchVerdict *out,
++                           uint16_t *status_out)
++{
++    if (!s || !io || !out || !status_out)
++        return false;
++
++    /* Response can be 0 .. ~175 bytes ; allocate a bit of overhead. */
++    uint8_t resp_buf[VERIMARK_MATCH_VERDICT_MAX + 64];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    memset(out, 0, sizeof(*out));
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0x99,
++        MATCH_SIMPLE_PAYLOAD, sizeof(MATCH_SIMPLE_PAYLOAD),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* sensor reported no-match (e.g. 0x0905) */
++
++    /* Truncate at our compile-time cap. The 175-byte positive verdict
++     * easily fits ; longer responses would just lose the tail. */
++    size_t to_copy = payload_len;
++    if (to_copy > VERIMARK_MATCH_VERDICT_MAX)
++        to_copy = VERIMARK_MATCH_VERDICT_MAX;
++    if (payload && to_copy)
++        memcpy(out->bytes, payload, to_copy);
++    out->len = to_copy;
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/match.h b/libfprint/drivers/verimark/match.h
+index 4b9d05f..2d9c4ae 100644
+--- a/libfprint/drivers/verimark/match.h
++++ b/libfprint/drivers/verimark/match.h
+@@ -125,6 +125,47 @@ bool verimark_match_request(VerimarkSession *s,
+                             uint16_t *status_out);
+ 
+ 
++/* ---------------------------------------------------------------------------
++ * 0x99 — simplified match call (the variant actually used by the canonical
++ * Linux verify pipeline, cf. python/verimark/match.py)
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_MATCH_VERDICT_MAX 256
++
++/**
++ * Variable-length match verdict returned by the simplified `0x99`
++ * call. The positive verdict observed runtime is 175 bytes ; the
++ * first 16 bytes carry the matched_tuid (= class-2 template ID, NOT
++ * the class-1 storage_handle ; cross-resolve via `0xa0 02 + matched`
++ * if you need the libfprint-visible identifier). Empty / very short
++ * responses indicate no match.
++ */
++typedef struct {
++    size_t  len;
++    uint8_t bytes[VERIMARK_MATCH_VERDICT_MAX];
++} VerimarkMatchVerdict;
++
++/**
++ * Send opcode `0x99` with the canonical 12-byte simplified payload
++ * `01 00 00 00 00 00 00 00 00 00 00 00` (a single flag byte +
++ * 11 zeros). The sensor sources the captured image + candidate
++ * enrollments from its internal session state, so this call is
++ * meaningful only after the `0x39 / 0x86 / 0x80 / 0x87 / 0x81`
++ * capture preamble (cf. `python/verimark/match.py`).
++ *
++ * Outcomes :
++ *   - `status == 0x0000` + non-empty response → match accepted ;
++ *     `out->bytes[0..16]` is the matched_tuid.
++ *   - `status != 0x0000` (typically `0x0905`)              → no match.
++ *   - returns false                                         → transport
++ *     or crypto failure ; do not interpret `status`/`out`.
++ */
++bool verimark_match_simple(VerimarkSession *s,
++                           struct VerimarkTransportIO *io,
++                           VerimarkMatchVerdict *out,
++                           uint16_t *status_out);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libfprint/drivers/verimark/storage.c b/libfprint/drivers/verimark/storage.c
+index 1b40a15..5dafdea 100644
+--- a/libfprint/drivers/verimark/storage.c
++++ b/libfprint/drivers/verimark/storage.c
+@@ -189,3 +189,107 @@ bool verimark_storage_get_object_info(VerimarkSession *s,
+     memcpy(out->bytes, payload, sizeof(out->bytes));
+     return true;
+ }
++
++
++/* ---------------------------------------------------------------------------
++ * 0xa3 — DeleteObject  (DESTRUCTIVE)
++ * ------------------------------------------------------------------------- */
++
++/* Request payload identical to 0xa0 GetObjectInfo : [class:1][pad:3][tuid:16].
++ * Response payload : u16_le deleted_count (cascading delete count across
++ * the 3 internal classes ; runtime confirms = 3 for a class-1 tuid). */
++bool verimark_storage_delete_object(VerimarkSession *s,
++                                    struct VerimarkTransportIO *io,
++                                    uint8_t class_byte,
++                                    const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                                    uint16_t *deleted_count_out,
++                                    uint16_t *status_out)
++{
++    if (!s || !io || !tuid || !deleted_count_out || !status_out)
++        return false;
++
++    uint8_t req_payload[20];
++    memset(req_payload, 0, sizeof(req_payload));
++    req_payload[0] = class_byte;
++    /* req_payload[1..3] = padding zeros, already set by memset */
++    memcpy(req_payload + 4, tuid, VERIMARK_STORAGE_TUID_LEN);
++
++    uint8_t resp_buf[64];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0xa3,
++        req_payload, sizeof(req_payload),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++    *deleted_count_out = 0;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* transport OK ; sensor-side error reported in status */
++    if (payload_len < 2 || !payload)
++        return false;  /* malformed reply : transport-level failure */
++
++    *deleted_count_out = read_le16(payload);
++    return true;
++}
++
++
++/* ---------------------------------------------------------------------------
++ * 0xa0 02 — class-2 template → class-1 storage_handle resolver
++ * ------------------------------------------------------------------------- */
++
++/* Request payload identical to 0xa0 GetObjectInfo (class=2 here) :
++ *   [class:1=0x02][pad:3=00 00 00][matched_tuid:16]
++ * Response payload : 50 bytes, with storage_handle at offset 18..33. */
++#define RESOLVE_RESP_HANDLE_OFFSET 18u
++#define RESOLVE_RESP_MIN_LEN       (RESOLVE_RESP_HANDLE_OFFSET + VERIMARK_STORAGE_TUID_LEN)
++
++bool verimark_storage_resolve_template_to_handle(
++    VerimarkSession *s,
++    struct VerimarkTransportIO *io,
++    const uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN],
++    uint8_t out_storage_handle[VERIMARK_STORAGE_TUID_LEN],
++    uint16_t *status_out)
++{
++    if (!s || !io || !matched_tuid || !out_storage_handle || !status_out)
++        return false;
++
++    uint8_t req_payload[20];
++    memset(req_payload, 0, sizeof(req_payload));
++    req_payload[0] = 0x02;   /* class byte = 2 (template binary IDs) */
++    /* req_payload[1..3] = padding zeros, already set by memset */
++    memcpy(req_payload + 4, matched_tuid, VERIMARK_STORAGE_TUID_LEN);
++
++    uint8_t resp_buf[128];
++    uint16_t status = 0;
++    const uint8_t *payload = NULL;
++    size_t payload_len = 0;
++
++    memset(out_storage_handle, 0, VERIMARK_STORAGE_TUID_LEN);
++
++    bool ok = verimark_session_call_opcode(
++        s, io,
++        /*opcode*/ 0xa0,
++        req_payload, sizeof(req_payload),
++        resp_buf, sizeof(resp_buf),
++        &status, &payload, &payload_len);
++    *status_out = status;
++
++    if (!ok)
++        return false;
++    if (status != 0x0000)
++        return true;   /* sensor-side error (e.g. 0x8306 unknown tuid) */
++    if (payload_len < RESOLVE_RESP_MIN_LEN || !payload)
++        return false;
++
++    memcpy(out_storage_handle,
++           payload + RESOLVE_RESP_HANDLE_OFFSET,
++           VERIMARK_STORAGE_TUID_LEN);
++    return true;
++}
+diff --git a/libfprint/drivers/verimark/storage.h b/libfprint/drivers/verimark/storage.h
+index 08843da..9644734 100644
+--- a/libfprint/drivers/verimark/storage.h
++++ b/libfprint/drivers/verimark/storage.h
+@@ -142,6 +142,68 @@ bool verimark_storage_get_object_info(VerimarkSession *s,
+                                       uint16_t *status_out);
+ 
+ 
++/* ---------------------------------------------------------------------------
++ * 0xa3 — tudorCmdDeleteObject  (DESTRUCTIVE, no undo)
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Delete a single object from sensor storage by tuid.
++ *
++ * Request payload layout (per Ghidra FUN_180086c30 and
++ * `docs/opcodes/0xa3.yaml`) : `[class:1][pad:3=00 00 00][tuid:16]`
++ * = 20 bytes after the opcode. Identical layout to `0xa0
++ * GetObjectInfo` ; only the opcode byte differs.
++ *
++ * Response payload : a single `u16` (little-endian) carrying the
++ * number of internal sensor objects deleted as a side effect. For a
++ * class-1 tuid (= user enrollment) the runtime value is **3** — the
++ * sensor cascades the delete across the 3 internal classes that
++ * jointly back one fingerprint. The caller usually only cares that
++ * the count is non-zero ; pass NULL for `deleted_count_out` to skip.
++ *
++ * Runtime confirmed 2026-05-25 (cf. `tools/probe_delete.py`).
++ *
++ * Returns true on transport success ; sensor-level errors (e.g.
++ * `0x8306` = no such object) are reported via `*status_out` with
++ * `*deleted_count_out` left at 0.
++ */
++bool verimark_storage_delete_object(VerimarkSession *s,
++                                    struct VerimarkTransportIO *io,
++                                    uint8_t class_byte,
++                                    const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN],
++                                    uint16_t *deleted_count_out,
++                                    uint16_t *status_out);
++
++
++/* ---------------------------------------------------------------------------
++ * 0xa0 02 — resolve class-2 template id → class-1 storage handle
++ * ------------------------------------------------------------------------- */
++
++/**
++ * Resolve a `matched_tuid` (= class-2 template ID returned by the
++ * `0x99` verdict) to the corresponding `storage_handle` (= class-1
++ * tuid that `verimark list` / `verimark delete` operate on).
++ *
++ * Wire layout (per `docs/opcodes/0xa0.yaml` § Phase 9 v3) :
++ *   request  : opcode + [class=02][pad:3=00 00 00][matched_tuid:16] = 20 B
++ *   response : 50 B, storage_handle at offset 18..33.
++ *
++ * Returns true on transport success. Sensor-level errors (notably
++ * `0x8306` = "matched_tuid not in class-2") are reported via
++ * `*status_out` with `out_storage_handle` left zeroed.
++ *
++ * Discovered runtime 2026-05-25 — the matched_tuid carried by a
++ * positive 0x99 verdict is NOT directly comparable to the tuid
++ * libfprint stores ; this opcode is the bridge.
++ */
++bool verimark_storage_resolve_template_to_handle(
++    VerimarkSession *s,
++    struct VerimarkTransportIO *io,
++    const uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN],
++    uint8_t out_storage_handle[VERIMARK_STORAGE_TUID_LEN],
++    uint16_t *status_out);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 63eb85e..497e07f 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -34,6 +34,10 @@
+ #include "pairing.h"
+ #include "handshake.h"
+ #include "session.h"
++#include "storage.h"
++#include "capture.h"
++#include "match.h"
++#include "enroll.h"
+ 
+ #define FP_COMPONENT "verimark"
+ #include "fpi-log.h"
+@@ -73,16 +77,6 @@ static const FpIdEntry id_table[] = {
+ 
+ /* ---- Internal helpers ---------------------------------------------------- */
+ 
+-/**
+- * Wrap the libfprint-owned GUsbDevice in a VerimarkUsbHandle. To be called
+- * after libfprint has opened/claimed the device (open path).
+- */
+-static VerimarkUsbHandle *get_transport(FpDevice *device)
+-{
+-    GUsbDevice *usb = fpi_device_get_usb_device(device);
+-    return verimark_handle_new(usb);
+-}
+-
+ /**
+  * Send `[opcode]` in cleartext, read the response, parse `[status][payload]`.
+  * Returns TRUE if status == 0x0000, FALSE otherwise. On success, the output
+@@ -208,11 +202,20 @@ static void verimark_probe(FpDevice *device)
+ 
+ 
+ /**
+- * Locate the sub1 pairing file for this device : try
+- *   /var/lib/fprintd/verimark/sub1_<serial>.bin
+- * with the serial formatted as 12 hex digits, then fall back to
+- *   /var/lib/fprintd/verimark/sub1.bin
+- * for single-device test installs.
++ * Locate the sub1 pairing file for this device. Search order :
++ *   1.  /var/lib/fprintd/verimark/sub1_<biometric_serial>.bin   (production,
++ *       system-wide, biometric serial from opcode 0x01)
++ *   2.  /var/lib/fprintd/verimark/sub1.bin                       (single-device
++ *       legacy fallback)
++ *   3.  $XDG_CONFIG_HOME/verimark/sub1-<usb_iserial>.bin         (developer
++ *       convenience, matches the Python PoC's naming convention)
++ *   4.  $XDG_CONFIG_HOME/verimark/sub1.bin                       (developer
++ *       fallback)
++ *
++ * `$XDG_CONFIG_HOME` defaults to `$HOME/.config`. The dash separator
++ * + USB iSerial of path 3 mirrors the convention used by
++ * `python/verimark/handshake.py:_default_sub1_path()` and lets the C
++ * driver share a bootstrap with the Python reference PoC.
+  *
+  * Returns a heap-allocated path (caller frees with g_free), or NULL.
+  */
+@@ -228,6 +231,27 @@ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+     gchar *fallback = g_strdup("/var/lib/fprintd/verimark/sub1.bin");
+     if (g_file_test(fallback, G_FILE_TEST_EXISTS)) return fallback;
+     g_free(fallback);
++
++    /* Developer / single-user paths under XDG_CONFIG_HOME. */
++    const gchar *xdg_cfg = g_get_user_config_dir();   /* never NULL */
++    GUsbDevice *usb = fpi_device_get_usb_device(FP_DEVICE(self));
++    g_autofree gchar *iserial = NULL;
++    if (usb != NULL) {
++        guint8 idx = g_usb_device_get_serial_number_index(usb);
++        if (idx != 0) {
++            iserial = g_usb_device_get_string_descriptor(usb, idx, NULL);
++        }
++    }
++    if (iserial != NULL && iserial[0] != '\0') {
++        gchar *user_p = g_strdup_printf("%s/verimark/sub1-%s.bin",
++                                         xdg_cfg, iserial);
++        if (g_file_test(user_p, G_FILE_TEST_EXISTS)) return user_p;
++        g_free(user_p);
++    }
++    gchar *user_fb = g_strdup_printf("%s/verimark/sub1.bin", xdg_cfg);
++    if (g_file_test(user_fb, G_FILE_TEST_EXISTS)) return user_fb;
++    g_free(user_fb);
++
+     return NULL;
+ }
+ 
+@@ -317,125 +341,1186 @@ static void verimark_close(FpDevice *device)
+ }
+ 
+ 
+-/* ---- Stubs: verify / enroll / identify / list / delete ------------------- */
++/* Forward declarations — definitions live further down with the
++ * list/delete code that originally introduced them. */
++static gboolean verimark_extract_tuid_from_print(FpPrint *print,
++                                                  GVariant **tid_var_out,
++                                                  const uint8_t **tuid_out);
++static FpPrint *verimark_print_from_tuid(FpDevice *device,
++                                          const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN]);
++
++
++/* ---- verify pipeline ----------------------------------------------------
++ *
++ * Canonical Linux verify flow (cf. `python/verimark/match.py`) :
++ *
++ *   preamble : 0x19 / 0x86 events_1_2 / 0x87 cursor=0 / 0x86 subscribe_all
++ *   capture  : 0x39 RICH / 0x86 frame_ready_arm / 0x80 / loop 0x87 / 0x39 SPARSE
++ *              / 0x86 subscribe_all / 0x81 / 0x99
++ *   postamble: 0x39 MIXED / 0x86 / 0x87 cursor=2 / 0x86 / 0x86 / 0x39 SPARSE / 0x86
++ *
++ * Implemented synchronously (the libfprint vfunc blocks the main loop
++ * for up to FRAME_READY_TIMEOUT_S while we poll the sensor's event
++ * queue ; that matches how every other vfunc here is written).
++ *
++ * v1 limitation : we only know "the sensor matched something" — not
++ * "the sensor matched THIS print". The simplified 0x99 flag-only call
++ * tells the sensor to match against ANY enrollment, and the verdict's
++ * matched_tuid is a class-2 template ID that requires a follow-up
++ * 0xa0 02 query to resolve back to the class-1 storage_handle that
++ * libfprint compares against. For users with a single enrollment this
++ * is functionally indistinguishable from a strict match ; multi-finger
++ * setups will see false-positives. Resolver is tracked as a follow-up.
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_VERIFY_POLL_INTERVAL_MS 250
++#define VERIMARK_VERIFY_TIMEOUT_S        30
++
++
++/* Capture config templates — exact bytes from python/verimark/match.py
++ * CAPTURE_CONFIG_VERIFY_VARIANTS["…"] / Ghidra reverse of the WindDbg
++ * input structs. Each is 124 bytes (= the `0x39` payload). */
++
++static const uint8_t VERIMARK_CFG_RICH[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0x00, 0x71, 0x02, 0x00,
++    0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xff, 0xff, 0x00, 0x00, 0x05, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++static const uint8_t VERIMARK_CFG_SPARSE[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* WARM template — firmware "retry mode" / brief red-LED feedback. Sent
++ * after a no-match verdict so the user gets a visual cue (and on retry
++ * attempts to loosen the pre-filter). Bytes from
++ * python/verimark/match.py:CAPTURE_CONFIG_VERIFY_VARIANTS["WARM"]. */
++static const uint8_t VERIMARK_CFG_WARM[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0xe8, 0x03, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20,
++    0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    /* tail padding to reach 124 bytes total (4 hdr + 4×20 records = 84 → +40) */
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00,
++};
++
++static const uint8_t VERIMARK_CFG_MIXED[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0xf4, 0x01, 0x00, 0x00,
++    0xf4, 0x01, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xf4, 0x01, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* 16-byte structured 0x80 payload — "verify-style" capture_start.
++ * Source: python/verimark/match.py:build_capture_start_payload(). */
++static const uint8_t VERIMARK_CAPSTART_VERIFY[VERIMARK_CAPTURE_START_PAYLOAD_LEN] = {
++    0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x08, 0x01, 0x01, 0x01, 0x00,
++};
++
++/* 0x80 capture_start ENROLL payload (param_2 = 0x0c). Cf.
++ * python/verimark/enroll.py:build_capture_start_enroll_payload(). */
++static const uint8_t VERIMARK_CAPSTART_ENROLL[VERIMARK_CAPTURE_START_PAYLOAD_LEN] = {
++    0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x08, 0x01, 0x01, 0x01, 0x00,
++};
++
++/* 0x39 ENROLL_D — first-swipe init (header 172 ms = 0xac). Identical
++ * to ENROLL_E / WARM except for the timer header. */
++static const uint8_t VERIMARK_CFG_ENROLL_D[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0xac, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20,
++    0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00,
++};
++
++/* 0x39 ENROLL_E — enroll-mode prelude switch (header 1000 ms = 0x03e8).
++ * Identical to WARM except for the header. Used at the end of the
++ * 12-opcode enroll PRELUDE to flip the FSM from verify to enroll-ready. */
++static const uint8_t VERIMARK_CFG_ENROLL_E[VERIMARK_CAPTURE_CONFIG_PARAMS_LEN] = {
++    0xe8, 0x03, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x07, 0x7f, 0x00, 0x20,
++    0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x4b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    /* tail padding to reach 124 bytes total */
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00,
++};
++
++/* 0x86 event masks. All identical for mask_a and mask_b. */
++static const uint8_t VERIMARK_MASK_EVENTS_1_AND_2[VERIMARK_EVENT_MASK_LEN] = {
++    0x06, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
++};
++static const uint8_t VERIMARK_MASK_FRAME_READY_ARM[VERIMARK_EVENT_MASK_LEN] = {
++    0, 0, 0, 0x01, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
++};
++static const uint8_t VERIMARK_MASK_EVENT_2[VERIMARK_EVENT_MASK_LEN] = {
++    0x04, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
++};
++
++
++static void
++verimark_io_bind(FpiDeviceVerimark *self,
++                 VerimarkTransportIoCtx *io_ctx,
++                 VerimarkTransportIO *io)
++{
++    io_ctx->h = self->transport;
++    io_ctx->timeout_ms = 3000;
++    verimark_transport_io_bind(io, io_ctx);
++}
++
++
++/**
++ * Run the canonical preamble + per-attempt capture sequence + 0x99
++ * match call, with a polling loop on 0x87 to wait for the frame
++ * ready event. Returns TRUE on a positive verdict (match), FALSE
++ * otherwise. On a definitive failure (no finger / sensor error),
++ * sets `*out_err` and returns FALSE.
++ *
++ * On positive verdict, the 16-byte class-2 matched_tuid is copied
++ * into `out_matched_tuid` so callers (verify/identify) can resolve
++ * it back to the class-1 storage_handle that libfprint compares
++ * against.
++ */
++static gboolean
++verimark_run_verify_pipeline(FpiDeviceVerimark *self,
++                              gboolean *out_frame_ready,
++                              gboolean *out_match,
++                              uint8_t out_matched_tuid[VERIMARK_STORAGE_TUID_LEN],
++                              GError **out_err)
++{
++    *out_frame_ready = FALSE;
++    *out_match = FALSE;
++    if (out_matched_tuid)
++        memset(out_matched_tuid, 0, VERIMARK_STORAGE_TUID_LEN);
++    *out_err = NULL;
++
++    VerimarkTransportIoCtx io_ctx;
++    VerimarkTransportIO io;
++    verimark_io_bind(self, &io_ctx, &io);
++
++    uint16_t st = 0;
++
++    /* === Preamble === */
++    if (!verimark_capture_init_session(&self->session, &io, &st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "verify: 0x19 init transport failure");
++        return FALSE;
++    }
++    fp_dbg("verify: [preamble] 0x19 init           status=0x%04x", st);
++
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_EVENTS_1_AND_2,
++                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
++    fp_dbg("verify: [preamble] 0x86 events_1_2    status=0x%04x", st);
++
++    VerimarkEventReadResult ev = {0};
++    verimark_capture_event_read(&self->session, &io, 0, 32, &ev, &st);
++    fp_dbg("verify: [preamble] 0x87 cursor=0       status=0x%04x returned=%u total=%u",
++           st, ev.returned_count, ev.total_count);
++
++    verimark_capture_event_config(&self->session, &io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++    fp_dbg("verify: [preamble] 0x86 subscribe_all  status=0x%04x", st);
++
++    /* === Capture (single attempt for v1) === */
++    if (!verimark_capture_config(&self->session, &io, VERIMARK_CFG_RICH, &st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "verify: 0x39 RICH transport failure");
++        return FALSE;
++    }
++    fp_dbg("verify: [capture]  0x39 RICH           status=0x%04x", st);
++
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_FRAME_READY_ARM,
++                                   VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
++    fp_dbg("verify: [capture]  0x86 frame_ready    status=0x%04x", st);
++
++    /* Surface the "place finger" cue at INFO level too — the
++     * debug-only fp_dbg() wouldn't reach a user running fprintd or
++     * fp_device_verify_sync without G_MESSAGES_DEBUG. */
++    fp_info("verify: PLACE YOUR FINGER ON THE SENSOR NOW (timeout %d s)",
++            VERIMARK_VERIFY_TIMEOUT_S);
++    g_print(">>> PLACE YOUR FINGER ON THE SENSOR NOW <<< (timeout %d s)\n",
++            VERIMARK_VERIFY_TIMEOUT_S);
++
++    if (!verimark_capture_start(&self->session, &io,
++                                 VERIMARK_CAPSTART_VERIFY, &st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "verify: 0x80 capture_start transport failure");
++        return FALSE;
++    }
++
++    /* Polling loop for frame_ready. */
++    gint64 deadline_us = g_get_monotonic_time()
++                       + (gint64)VERIMARK_VERIFY_TIMEOUT_S * G_USEC_PER_SEC;
++    int poll_count = 0;
++    int last_logged_count = 0;
++    while (g_get_monotonic_time() < deadline_us) {
++        poll_count++;
++        VerimarkEventReadResult r = {0};
++        uint16_t poll_st = 0;
++        if (!verimark_capture_event_read(&self->session, &io, 0, 32, &r, &poll_st)) {
++            if (poll_count - last_logged_count >= 8) {
++                fp_dbg("verify: [poll #%d] 0x87 TRANSPORT FAIL", poll_count);
++                last_logged_count = poll_count;
++            }
++            g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
++            continue;
++        }
++        if (poll_st != 0x0000 && poll_count - last_logged_count >= 8) {
++            fp_dbg("verify: [poll #%d] 0x87 status=0x%04x total=%u",
++                   poll_count, poll_st, r.total_count);
++            last_logged_count = poll_count;
++        }
++        /* Always print every event we get — that's how we'll find the
++         * frame_ready signal if it lives on a different bit than 0x1000. */
++        for (size_t i = 0; i < r.returned_count; i++) {
++            const VerimarkSensorEvent *e = &r.events[i];
++            fp_dbg("verify: [poll #%d] EVENT type=0x%02x val0=0x%08x val1=0x%08x",
++                   poll_count, e->type,
++                   (unsigned)e->val0, (unsigned)e->val1);
++        }
++        if (verimark_capture_events_have_frame_ready(&r, NULL)) {
++            fp_dbg("verify: FRAME_READY event after %d poll(s)", poll_count);
++            *out_frame_ready = TRUE;
++            break;
++        }
++        g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
++    }
++    fp_dbg("verify: poll loop done — frame_ready=%d, polls=%d",
++           *out_frame_ready, poll_count);
++
++    /* Close the capture window regardless of frame_ready outcome. */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++    verimark_capture_status_poll(&self->session, &io, &st, &st);   /* 0x81 capture_stop */
++
++    if (!*out_frame_ready) {
++        *out_err = g_error_new(FP_DEVICE_RETRY,
++                               FP_DEVICE_RETRY_TOO_SHORT,
++                               "verify: no finger detected after %d s "
++                               "(%d polls)",
++                               VERIMARK_VERIFY_TIMEOUT_S, poll_count);
++        return FALSE;
++    }
++
++    /* 0x99 simplified match call. */
++    VerimarkMatchVerdict v = {0};
++    if (!verimark_match_simple(&self->session, &io, &v, &st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "verify: 0x99 match transport failure");
++        return FALSE;
++    }
++    if (st == 0x0000 && v.len >= 16) {
++        fp_dbg("verify: positive verdict (%zu bytes), matched_tuid=%02x%02x%02x"
++               "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
++               v.len,
++               v.bytes[0],  v.bytes[1],  v.bytes[2],  v.bytes[3],
++               v.bytes[4],  v.bytes[5],  v.bytes[6],  v.bytes[7],
++               v.bytes[8],  v.bytes[9],  v.bytes[10], v.bytes[11],
++               v.bytes[12], v.bytes[13], v.bytes[14], v.bytes[15]);
++        *out_match = TRUE;
++        if (out_matched_tuid)
++            memcpy(out_matched_tuid, v.bytes, VERIMARK_STORAGE_TUID_LEN);
++    } else {
++        fp_dbg("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
++        /* Fire 0x39 WARM to trigger the firmware's brief red-LED
++         * "no-match" feedback (cf. docs/phase9-led-red-finding.md).
++         * Even without a retry loop, this gives the user the visual
++         * cue that the touch was seen and rejected. */
++        verimark_capture_config(&self->session, &io, VERIMARK_CFG_WARM, &st);
++        fp_dbg("verify: [no-match] 0x39 WARM        status=0x%04x (red-LED feedback)", st);
++    }
++
++    /* === Postamble (best-effort cleanup) === */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_MIXED, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_EVENTS_1_AND_2,
++                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
++    verimark_capture_event_read(&self->session, &io, 2, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_EVENT_2,
++                                   VERIMARK_MASK_EVENT_2, 0, &st);
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++
++    return *out_match;
++}
++
+ 
+ static void verimark_verify(FpDevice *device)
+ {
++    G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     g_autoptr(GError) error = NULL;
++
+     if (!self->session_active) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                            "verify: TLS session not active "
+-                            "(sub1 pairing data missing in /var/lib/fprintd/verimark/)");
+-    } else {
+-        /* TODO Phase 7.5 : implement the verify SSM. The session is
+-         * ready ; we need to map fprintd's verify() onto the Tudor
+-         * opcodes for fingerprint capture + on-chip match. */
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                            "verify: not yet implemented (Phase 7.5)");
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "verify: TLS session not active");
++        fpi_device_verify_complete(device, error);
++        return;
+     }
+-    fpi_device_verify_complete(device, error);
++
++    gboolean frame_ready = FALSE, matched = FALSE;
++    uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
++    GError *pipeline_err = NULL;
++    verimark_run_verify_pipeline(self, &frame_ready, &matched,
++                                  matched_tuid, &pipeline_err);
++
++    /* If the sensor said positive verdict, resolve the matched_tuid
++     * (class-2) to the storage_handle (class-1) and compare against
++     * the FpPrint libfprint asked us to verify. With multiple
++     * enrollments this is the only way to know it's THIS finger and
++     * not just any enrolled finger. With a single enrollment both
++     * branches collapse to MATCH. */
++    if (matched) {
++        VerimarkTransportIoCtx io_ctx;
++        VerimarkTransportIO io;
++        verimark_io_bind(self, &io_ctx, &io);
++
++        uint8_t resolved_handle[VERIMARK_STORAGE_TUID_LEN] = {0};
++        uint16_t resolve_st = 0;
++        gboolean resolved = verimark_storage_resolve_template_to_handle(
++            &self->session, &io, matched_tuid,
++            resolved_handle, &resolve_st);
++
++        FpPrint *requested = NULL;
++        fpi_device_get_verify_data(device, &requested);
++        g_autoptr(GVariant) requested_tid_var = NULL;
++        const uint8_t *requested_tuid = NULL;
++        if (resolved && resolve_st == 0x0000 && requested
++            && verimark_extract_tuid_from_print(requested,
++                                                 &requested_tid_var,
++                                                 &requested_tuid)) {
++            if (memcmp(resolved_handle, requested_tuid,
++                       VERIMARK_STORAGE_TUID_LEN) != 0) {
++                /* Sensor matched ANOTHER enrollment, not the one
++                 * libfprint asked us to verify → downgrade to FAIL. */
++                fp_dbg("verify: sensor matched a different print "
++                       "(resolved storage_handle ≠ requested tuid)");
++                matched = FALSE;
++            } else {
++                fp_dbg("verify: matched the requested print "
++                       "(storage_handle confirmed)");
++            }
++        } else {
++            fp_dbg("verify: resolver unavailable (resolved=%d status=0x%04x) "
++                   "→ trusting sensor verdict", resolved, resolve_st);
++        }
++    }
++
++    if (matched) {
++        fpi_device_verify_report(device, FPI_MATCH_SUCCESS, NULL, NULL);
++        fpi_device_verify_complete(device, NULL);
++    } else if (frame_ready) {
++        /* Finger was seen but no enrollment matched → libfprint
++         * "fail" verdict, not an error. */
++        if (pipeline_err) g_clear_error(&pipeline_err);
++        fpi_device_verify_report(device, FPI_MATCH_FAIL, NULL, NULL);
++        fpi_device_verify_complete(device, NULL);
++    } else if (pipeline_err && pipeline_err->domain == FP_DEVICE_RETRY) {
++        /* Retry-class error (timeout / no finger) goes through report,
++         * not complete — libfprint rejects retry errors at the
++         * complete entrypoint (cf. goodixmoc fp_verify_ssm_done). */
++        fpi_device_verify_report(device, FPI_MATCH_ERROR, NULL,
++                                 g_steal_pointer(&pipeline_err));
++        fpi_device_verify_complete(device, NULL);
++    } else {
++        /* Genuine hard error (transport / protocol) — surface via
++         * complete with no prior report. */
++        if (!pipeline_err)
++            pipeline_err = g_error_new(FP_DEVICE_ERROR,
++                                       FP_DEVICE_ERROR_GENERAL,
++                                       "verify: unknown failure");
++        fpi_device_verify_complete(device, pipeline_err);
++    }
++}
++
++
++/* ---- enroll pipeline -----------------------------------------------------
++ *
++ * Canonical Linux enroll flow (cf. `python/verimark/enroll.py`) :
++ *
++ *   prelude    : 0x86 / 0x87 / 0x86 / 0x39 RICH / 0x86 / 0x80 verify-mode /
++ *                0x87 / 0x39 SPARSE / 0x86 / 0x81 / 0x99 / 0x39 ENROLL_E
++ *   begin      : 0x96 01
++ *   per swipe  : 0x39 RICH / 0x86 frame_ready_arm / 0x80 ENROLL-mode /
++ *                poll 0x87 / 0x39 SPARSE / 0x86 / 0x81 / 0x96 02 add_image
++ *   commit     : 0x96 03 (random tuid + zero SID)
++ *   db refresh : 0x9e 01
++ *   finish     : 0x96 04
++ *
++ * The on-chip engine requires 7 UNIQUE swipes (bitmask grows
++ * 0x01→0x03→0x07→…→0x7f). Duplicate / low-quality swipes leave the
++ * bitmask unchanged ; we loop up to `MAX_SWIPES` attempts. If we
++ * never reach 0x7f, the commit refuses with 0x0404.
++ * ------------------------------------------------------------------------- */
++
++#define VERIMARK_ENROLL_MAX_SWIPES         12
++#define VERIMARK_ENROLL_SWIPE_TIMEOUT_S    30
++#define VERIMARK_ENROLL_TARGET_BITMASK_7F  0x7fu
++#define VERIMARK_ENROLL_PROGRESS_STAGES    7
++
++
++/**
++ * 6-opcode pre-cycle drain emitted before each swipe attempt. Mirrors
++ * python `_drain_pre_cycle` ; cursors advance per UNIQUE swipe.
++ */
++static void
++verimark_enroll_drain_pre_cycle(FpiDeviceVerimark *self,
++                                 VerimarkTransportIO *io,
++                                 uint16_t cursor_a, uint16_t cursor_b)
++{
++    uint16_t st = 0;
++    VerimarkEventReadResult ev = {0};
++    verimark_capture_event_config(&self->session, io,
++                                   VERIMARK_MASK_EVENTS_1_AND_2,
++                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
++    verimark_capture_event_read(&self->session, io, cursor_a, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, io, NULL, NULL, 4, &st);
++    verimark_capture_event_config(&self->session, io,
++                                   VERIMARK_MASK_EVENT_2,
++                                   VERIMARK_MASK_EVENT_2, 0, &st);
++    verimark_capture_event_read(&self->session, io, cursor_b, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, io, NULL, NULL, 4, &st);
++}
++
++
++/**
++ * Per-swipe inner loop : run one full capture cycle and the
++ * subsequent `0x96 02 add_image` call. Returns TRUE if the cycle
++ * completed (regardless of accept / reject). On no-finger timeout,
++ * returns FALSE with `*out_timed_out = TRUE`.
++ *
++ * Matches python `one_capture_cycle` in full :
++ *   - 6-opcode pre-cycle drain (cursors advance per unique swipe)
++ *   - 0x39 WARM (loosen pre-filter)
++ *   - 0x39 D (first swipe init) or RICH (subsequent)
++ *   - 0x86 frame_ready_arm + 0x80 ENROLL-mode capture_start
++ *   - poll 0x87 with 0x39 RICH↔SPARSE keep-alive every 500 ms
++ *     (without this, the firmware disarms the FSM and the LED dies)
++ *   - 0x39 SPARSE + 0x86 subscribe_all + 0x81 cleanup
++ *   - 0x96 02 add_image
++ */
++#define VERIMARK_ENROLL_KEEPALIVE_PERIOD_MS 500
++
++static gboolean
++verimark_enroll_one_swipe(FpiDeviceVerimark *self,
++                           int swipe_idx,
++                           VerimarkEnrollAddImageResult *out_result,
++                           gboolean *out_timed_out,
++                           GError **out_err)
++{
++    *out_timed_out = FALSE;
++    *out_err = NULL;
++    memset(out_result, 0, sizeof(*out_result));
++
++    VerimarkTransportIoCtx io_ctx;
++    VerimarkTransportIO io;
++    verimark_io_bind(self, &io_ctx, &io);
++    uint16_t st = 0;
++
++    /* Drain the queue from the previous swipe / from BEGIN.
++     * Cursors : cursor_a = 2 + 3 * (idx - 1), cursor_b = cursor_a + 1. */
++    uint16_t cursor_a = (uint16_t)(2 + 3 * (swipe_idx - 1));
++    uint16_t cursor_b = (uint16_t)(cursor_a + 1);
++    verimark_enroll_drain_pre_cycle(self, &io, cursor_a, cursor_b);
++
++    /* WARM first — loosen the on-chip pre-filter so marginal poses
++     * get accepted. Without this the firmware drops the swipe silently. */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_WARM, &st);
++
++    /* 0x39 ENROLL_D for the FIRST swipe (init) ; RICH for subsequent
++     * swipes. Both turn the white LED on. */
++    const uint8_t *cfg = (swipe_idx == 1) ? VERIMARK_CFG_ENROLL_D
++                                          : VERIMARK_CFG_RICH;
++    verimark_capture_config(&self->session, &io, cfg, &st);
++
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_FRAME_READY_ARM,
++                                   VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
++
++    fp_info("enroll: swipe %d — PLACE FINGER ON SENSOR (timeout %d s, WARM mode)",
++            swipe_idx, VERIMARK_ENROLL_SWIPE_TIMEOUT_S);
++    g_print(">>> SWIPE %d — vary finger position slightly between swipes <<<\n",
++            swipe_idx);
++
++    if (!verimark_capture_start(&self->session, &io,
++                                 VERIMARK_CAPSTART_ENROLL, &st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "enroll: 0x80 capture_start failure");
++        return FALSE;
++    }
++
++    /* Poll for FRAME_READY OR (WARM-mode) any type=0x18 event, while
++     * interleaving a 0x39 RICH↔SPARSE keep-alive every 500 ms — without
++     * it the firmware disarms the FSM and the LED goes out. */
++    gint64 deadline_us = g_get_monotonic_time()
++                       + (gint64)VERIMARK_ENROLL_SWIPE_TIMEOUT_S * G_USEC_PER_SEC;
++    gint64 next_keepalive_us = g_get_monotonic_time()
++                       + (gint64)VERIMARK_ENROLL_KEEPALIVE_PERIOD_MS * 1000;
++    gboolean frame_ready = FALSE;
++    gboolean led_is_on = TRUE;
++    int poll_count = 0;
++
++    while (g_get_monotonic_time() < deadline_us) {
++        gint64 now = g_get_monotonic_time();
++        if (now >= next_keepalive_us) {
++            const uint8_t *cfg_alt = led_is_on ? VERIMARK_CFG_SPARSE
++                                               : VERIMARK_CFG_RICH;
++            verimark_capture_config(&self->session, &io, cfg_alt, &st);
++            led_is_on = !led_is_on;
++            next_keepalive_us = now
++                + (gint64)VERIMARK_ENROLL_KEEPALIVE_PERIOD_MS * 1000;
++        }
++        poll_count++;
++        VerimarkEventReadResult r = {0};
++        uint16_t poll_st = 0;
++        if (verimark_capture_event_read(&self->session, &io, 0, 32, &r,
++                                         &poll_st))
++        {
++            if (verimark_capture_events_have_frame_ready(&r, NULL)) {
++                fp_dbg("enroll: FRAME_READY after %d poll(s)", poll_count);
++                frame_ready = TRUE;
++            }
++            for (size_t i = 0; i < r.returned_count && !frame_ready; i++) {
++                if (r.events[i].type == 0x18) {
++                    fp_dbg("enroll: WARM_FRAME (type=0x18 val0=0x%08x) "
++                           "after %d poll(s)",
++                           (unsigned)r.events[i].val0, poll_count);
++                    frame_ready = TRUE;
++                }
++            }
++            if (frame_ready)
++                break;
++        }
++        g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
++    }
++
++    /* Close the capture window. */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   NULL, NULL, 4, &st);
++    verimark_capture_status_poll(&self->session, &io, &st, &st);
++
++    if (!frame_ready) {
++        *out_timed_out = TRUE;
++        return FALSE;
++    }
++
++    /* 0x96 02 add_image — sensor evaluates the captured swipe. */
++    uint16_t ai_st = 0;
++    if (!verimark_enroll_add_image(&self->session, &io, out_result, &ai_st)) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "enroll: 0x96 02 add_image transport failure");
++        return FALSE;
++    }
++    if (ai_st != 0x0000) {
++        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                               "enroll: 0x96 02 sensor status 0x%04x", ai_st);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++
++/**
++ * Run the 12-opcode PRELUDE that primes the enroll FSM. Side-effects
++ * only ; transport / status errors are logged but not fatal.
++ */
++static void
++verimark_enroll_prelude(FpiDeviceVerimark *self)
++{
++    VerimarkTransportIoCtx io_ctx;
++    VerimarkTransportIO io;
++    verimark_io_bind(self, &io_ctx, &io);
++    uint16_t st = 0;
++    VerimarkEventReadResult ev = {0};
++
++    /* Steps 1..3 — drain queue + arm subscribe-all. */
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_EVENTS_1_AND_2,
++                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
++    verimark_capture_event_read(&self->session, &io, 0, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, &io, NULL, NULL, 4, &st);
++
++    /* Steps 4..10 — one verify-style capture cycle (no finger expected). */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_RICH, &st);
++    verimark_capture_event_config(&self->session, &io,
++                                   VERIMARK_MASK_FRAME_READY_ARM,
++                                   VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
++    verimark_capture_start(&self->session, &io, VERIMARK_CAPSTART_VERIFY, &st);
++    verimark_capture_event_read(&self->session, &io, 0, 32, &ev, &st);
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
++    verimark_capture_event_config(&self->session, &io, NULL, NULL, 4, &st);
++    verimark_capture_status_poll(&self->session, &io, &st, &st);
++
++    /* Step 11 — 0x99 verify probe (response ignored, side-effect priming). */
++    VerimarkMatchVerdict v = {0};
++    verimark_match_simple(&self->session, &io, &v, &st);
++
++    /* Step 12 — 0x39 ENROLL_E mode-switch. */
++    verimark_capture_config(&self->session, &io, VERIMARK_CFG_ENROLL_E, &st);
++
++    fp_dbg("enroll: PRELUDE complete");
+ }
+ 
+ 
+ static void verimark_enroll(FpDevice *device)
+ {
++    G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+-    g_autoptr(GError) error = NULL;
++    /* Plain pointer — fpi_device_enroll_complete consumes the GError
++     * (steals the reference). Using g_autoptr here would double-free. */
++    GError *error = NULL;
++
+     if (!self->session_active) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                             "enroll: TLS session not active");
+-    } else {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                            "enroll: not yet implemented (Phase 7.5)");
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
+     }
+-    fpi_device_enroll_complete(device, NULL, error);
++
++    VerimarkTransportIoCtx io_ctx;
++    VerimarkTransportIO io;
++    verimark_io_bind(self, &io_ctx, &io);
++    uint16_t st = 0;
++
++    /* === Generate a random 16-byte tuid for the new template. === */
++    uint8_t new_tuid[VERIMARK_STORAGE_TUID_LEN];
++    if (!verimark_match_generate_nonce(new_tuid)) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "enroll: getentropy(16) failed");
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++    fp_dbg("enroll: new tuid = %02x%02x%02x%02x%02x%02x%02x%02x"
++           "%02x%02x%02x%02x%02x%02x%02x%02x",
++           new_tuid[0],  new_tuid[1],  new_tuid[2],  new_tuid[3],
++           new_tuid[4],  new_tuid[5],  new_tuid[6],  new_tuid[7],
++           new_tuid[8],  new_tuid[9],  new_tuid[10], new_tuid[11],
++           new_tuid[12], new_tuid[13], new_tuid[14], new_tuid[15]);
++
++    /* === 0x19 init + PRELUDE === */
++    verimark_capture_init_session(&self->session, &io, &st);
++    fp_dbg("enroll: 0x19 init status=0x%04x", st);
++    verimark_enroll_prelude(self);
++
++    /* === 0x96 01 BEGIN === */
++    if (!verimark_enroll_begin(&self->session, &io, &st)) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll: 0x96 01 begin transport failure");
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++    if (st != 0x0000) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll: 0x96 01 begin refused (status 0x%04x)", st);
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++    fp_info("enroll: BEGIN OK — sensor ready for swipes");
++
++    /* === Multi-swipe capture loop === */
++    uint16_t bitmask = 0;
++    int useful_swipes = 0;
++    int consecutive_timeouts = 0;
++    for (int attempt = 1; attempt <= VERIMARK_ENROLL_MAX_SWIPES; attempt++) {
++        fp_info("enroll: attempt %d/%d (useful=%d/7, bitmask=0x%02x)",
++                attempt, VERIMARK_ENROLL_MAX_SWIPES, useful_swipes, bitmask);
++
++        VerimarkEnrollAddImageResult r = {0};
++        gboolean timed_out = FALSE;
++        GError *swipe_err = NULL;
++        /* swipe_idx = number of UNIQUE swipes accepted so far + 1 ;
++         * this drives the per-cycle event-queue cursors. */
++        gboolean ok = verimark_enroll_one_swipe(self, useful_swipes + 1,
++                                                 &r, &timed_out, &swipe_err);
++
++        if (!ok && timed_out) {
++            consecutive_timeouts++;
++            fp_info("enroll: swipe timed out (consecutive=%d)",
++                    consecutive_timeouts);
++            if (consecutive_timeouts >= 3) {
++                if (swipe_err) g_clear_error(&swipe_err);
++                /* Non-retry error class — FP_DEVICE_RETRY is reserved
++                 * for fpi_device_enroll_progress, not enroll_complete. */
++                error = g_error_new(FP_DEVICE_ERROR,
++                                    FP_DEVICE_ERROR_GENERAL,
++                                    "enroll: 3 consecutive timeouts — "
++                                    "no finger detected on the sensor");
++                /* Best-effort cleanup. */
++                verimark_enroll_finish(&self->session, &io, &st);
++                fpi_device_enroll_complete(device, NULL, error);
++                return;
++            }
++            continue;
++        }
++        consecutive_timeouts = 0;
++
++        if (!ok) {
++            /* Hard sensor error. */
++            if (swipe_err) {
++                error = swipe_err;
++                swipe_err = NULL;
++            } else {
++                error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                    "enroll: swipe failed");
++            }
++            verimark_enroll_finish(&self->session, &io, &st);
++            fpi_device_enroll_complete(device, NULL, error);
++            return;
++        }
++
++        gboolean accepted = (r.verdict_char == VERIMARK_ENROLL_VERDICT_ACCEPTED);
++        gboolean bitmask_advanced = (r.progress_bitmask != bitmask);
++        fp_info("enroll: add_image bitmask=0x%02x verdict=%s swipe_idx=%u "
++                "cumulative=%u",
++                r.progress_bitmask,
++                accepted ? "'d' ACCEPTED" : "REJECTED",
++                (unsigned)r.swipe_index, (unsigned)r.cumulative);
++
++        /* Bitmask advancement is the real "accepted" signal — the
++         * verdict_char only flips to 'd' on the swipe that completes
++         * the template (typically the 7th). Earlier swipes advance
++         * the bitmask without 'd', and we must still report progress
++         * for them so fprintd's UI advances. */
++        if (bitmask_advanced) {
++            bitmask = r.progress_bitmask;
++            useful_swipes++;
++            fpi_device_enroll_progress(device, useful_swipes, NULL, NULL);
++            if (bitmask == VERIMARK_ENROLL_TARGET_BITMASK_7F) {
++                fp_info("enroll: template COMPLETE (bitmask 0x7f reached)");
++                break;
++            }
++        } else {
++            fp_info("enroll: swipe rejected (duplicate or low quality) — "
++                    "shift finger position slightly and retry");
++            /* Surface the rejection to fprintd's UI via a retry-class
++             * GError. fpi_device_enroll_progress consumes the error
++             * (steals the reference), so use a plain pointer. */
++            GError *retry_err = g_error_new(
++                FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL,
++                "swipe rejected — vary finger position");
++            fpi_device_enroll_progress(device, useful_swipes, NULL, retry_err);
++        }
++    }
++
++    /* === Commit gate === */
++    if (bitmask != VERIMARK_ENROLL_TARGET_BITMASK_7F) {
++        verimark_enroll_finish(&self->session, &io, &st);
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll: template incomplete after %d attempts "
++                            "(final bitmask 0x%02x, target 0x7f)",
++                            VERIMARK_ENROLL_MAX_SWIPES, bitmask);
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++
++    /* === 0x96 03 commit === */
++    fp_info("enroll: committing template");
++    uint16_t commit_st = 0;
++    if (!verimark_enroll_commit(&self->session, &io, new_tuid,
++                                 NULL /* SID = zeros */, &commit_st)) {
++        verimark_enroll_finish(&self->session, &io, &st);
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll: 0x96 03 commit transport failure");
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++    if (commit_st != 0x0000) {
++        verimark_enroll_finish(&self->session, &io, &st);
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "enroll: 0x96 03 commit refused (status 0x%04x)",
++                            commit_st);
++        fpi_device_enroll_complete(device, NULL, error);
++        return;
++    }
++
++    /* === 0x9e 01 DB refresh (informational ; status not enforced) === */
++    VerimarkStorageDbInfo dbi = {0};
++    verimark_storage_get_db_info(&self->session, &io, 0x01, &dbi, &st);
++    fp_info("enroll: DB after commit — class_1=%u class_2=%u class_3=%u",
++            dbi.count_class_1, dbi.count_class_2, dbi.count_class_3);
++
++    /* === 0x96 04 finish === */
++    verimark_enroll_finish(&self->session, &io, &st);
++    fp_info("enroll: FINISH 0x96 04 status=0x%04x", st);
++
++    /* === Attach the tuid to the user-supplied template and report success ===
++     * The libfprint convention (cf. goodixmoc) is to mutate the
++     * caller-supplied template, not allocate a new FpPrint. */
++    FpPrint *template = NULL;
++    fpi_device_get_enroll_data(device, &template);
++    if (template != NULL) {
++        GVariant *tid = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
++                                                   new_tuid,
++                                                   VERIMARK_STORAGE_TUID_LEN,
++                                                   1);
++        GVariant *data = g_variant_new("(@ay)", tid);
++        fpi_print_set_type(template, FPI_PRINT_RAW);
++        fpi_print_set_device_stored(template, TRUE);
++        g_object_set(template, "fpi-data", data, NULL);
++        fpi_device_enroll_complete(device, g_object_ref(template), NULL);
++    } else {
++        /* Defensive fallback : if libfprint didn't hand us a template
++         * (shouldn't happen on a real enroll() call), synthesize one. */
++        FpPrint *fallback = verimark_print_from_tuid(device, new_tuid);
++        g_object_ref_sink(fallback);
++        fpi_device_enroll_complete(device, fallback, NULL);
++    }
++    fp_info("enroll: complete — new template stored");
++}
++
++
++/**
++ * Search a libfprint identify gallery for the first FpPrint whose
++ * opaque tuid (= class-1 storage_handle) equals `needle`. Returns
++ * the print (borrowed reference, owned by the gallery), or NULL.
++ */
++static FpPrint *
++verimark_gallery_find_by_tuid(GPtrArray *gallery,
++                              const uint8_t needle[VERIMARK_STORAGE_TUID_LEN])
++{
++    if (!gallery || !needle)
++        return NULL;
++    for (guint i = 0; i < gallery->len; i++) {
++        FpPrint *p = (FpPrint *)g_ptr_array_index(gallery, i);
++        g_autoptr(GVariant) tid_var = NULL;
++        const uint8_t *tuid = NULL;
++        if (!verimark_extract_tuid_from_print(p, &tid_var, &tuid))
++            continue;
++        if (memcmp(tuid, needle, VERIMARK_STORAGE_TUID_LEN) == 0)
++            return p;
++    }
++    return NULL;
+ }
+ 
+ 
+ static void verimark_identify(FpDevice *device)
+ {
++    G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     g_autoptr(GError) error = NULL;
++
+     if (!self->session_active) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                             "identify: TLS session not active");
+-    } else {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                            "identify: not yet implemented (Phase 7.5)");
++        fpi_device_identify_complete(device, error);
++        return;
+     }
+-    fpi_device_identify_complete(device, error);
++
++    gboolean frame_ready = FALSE, matched = FALSE;
++    uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
++    GError *pipeline_err = NULL;
++    verimark_run_verify_pipeline(self, &frame_ready, &matched,
++                                  matched_tuid, &pipeline_err);
++
++    if (matched) {
++        /* Resolve matched_tuid (class-2) → storage_handle (class-1),
++         * then look that handle up in the gallery fprintd handed us. */
++        VerimarkTransportIoCtx io_ctx;
++        VerimarkTransportIO io;
++        verimark_io_bind(self, &io_ctx, &io);
++
++        uint8_t resolved_handle[VERIMARK_STORAGE_TUID_LEN] = {0};
++        uint16_t resolve_st = 0;
++        FpPrint *gallery_hit = NULL;
++
++        if (verimark_storage_resolve_template_to_handle(
++                &self->session, &io, matched_tuid,
++                resolved_handle, &resolve_st)
++            && resolve_st == 0x0000)
++        {
++            GPtrArray *gallery = NULL;
++            fpi_device_get_identify_data(device, &gallery);
++            gallery_hit = verimark_gallery_find_by_tuid(gallery,
++                                                        resolved_handle);
++            if (gallery_hit) {
++                fp_dbg("identify: gallery hit (storage_handle="
++                       "%02x%02x%02x%02x…)",
++                       resolved_handle[0], resolved_handle[1],
++                       resolved_handle[2], resolved_handle[3]);
++            } else {
++                fp_dbg("identify: resolved storage_handle not in gallery "
++                       "(sensor matched an enrollment unknown to fprintd)");
++            }
++        } else {
++            fp_dbg("identify: matched_tuid → storage_handle resolution "
++                   "failed (status 0x%04x)", resolve_st);
++        }
++
++        if (gallery_hit) {
++            fpi_device_identify_report(device, gallery_hit, NULL, NULL);
++            fpi_device_identify_complete(device, NULL);
++        } else {
++            /* Sensor matched something, but it's not in the gallery
++             * (or the resolver failed). Report no-match. */
++            fpi_device_identify_report(device, NULL, NULL, NULL);
++            fpi_device_identify_complete(device, NULL);
++        }
++    } else if (frame_ready) {
++        /* Finger seen, no enrollment matched. */
++        if (pipeline_err) g_clear_error(&pipeline_err);
++        fpi_device_identify_report(device, NULL, NULL, NULL);
++        fpi_device_identify_complete(device, NULL);
++    } else if (pipeline_err && pipeline_err->domain == FP_DEVICE_RETRY) {
++        fpi_device_identify_report(device, NULL, NULL,
++                                   g_steal_pointer(&pipeline_err));
++        fpi_device_identify_complete(device, NULL);
++    } else {
++        if (!pipeline_err)
++            pipeline_err = g_error_new(FP_DEVICE_ERROR,
++                                       FP_DEVICE_ERROR_GENERAL,
++                                       "identify: unknown failure");
++        fpi_device_identify_complete(device, pipeline_err);
++    }
++}
++
++
++/**
++ * Build an FpPrint that carries a single device-side tuid as opaque
++ * driver data. The libfprint convention for MoC drivers (cf.
++ * goodixmoc `fp_print_from_template`) : `fpi-data` is a GVariant
++ * tuple whose first element is a byte array containing the device-
++ * side identifier. The matching/delete paths read that identifier
++ * back to drive the wire opcode.
++ *
++ * Returns a floating reference ; the caller takes ownership via
++ * `g_ptr_array_add (… , g_object_ref_sink (print))`.
++ */
++static FpPrint *
++verimark_print_from_tuid(FpDevice *device,
++                         const uint8_t tuid[VERIMARK_STORAGE_TUID_LEN])
++{
++    FpPrint *print = fp_print_new(device);
++
++    GVariant *tid = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
++                                               tuid,
++                                               VERIMARK_STORAGE_TUID_LEN,
++                                               1);
++    GVariant *data = g_variant_new("(@ay)", tid);
++
++    fpi_print_set_type(print, FPI_PRINT_RAW);
++    fpi_print_set_device_stored(print, TRUE);
++    g_object_set(print, "fpi-data", data, NULL);
++
++    return print;
+ }
+ 
+ 
+ static void verimark_list(FpDevice *device)
+ {
+     /*
+-     * libfprint `list()` returns the prints currently enrolled on the
+-     * sensor. Reading the actual template data requires reading the host
+-     * partition (opcode 0x40), which lives inside the encrypted TLS
+-     * session. Until the TLS handshake is solved (see
+-     * ../../docs/phase5-tls-psk-linux.md), we can still **locate** the
+-     * host partition via the cleartext opcode 0x3E (get_storage_info)
+-     * and return an explicit error pointing at the missing piece.
++     * Enumerate the class-1 storage handles via opcode 0x9f (= the
++     * sensor-side fingerprint slots). Each handle becomes one FpPrint
++     * carrying the 16-byte tuid as opaque data. Mirrors what
++     * `python/verimark/storage.py:list_class_1()` does in the
++     * reference PoC.
+      *
+-     * This stub at least validates the storage_info parser on the wire
+-     * and gives fprintd a more informative failure than NOT_SUPPORTED.
++     * Requires an active TLS session ; sub1 must have been found by
++     * `find_sub1_path()` during open(). If not, surface a clear error
++     * so the user knows to drop a sub1 file at one of the locations
++     * documented in `find_sub1_path()` above.
+      */
+     G_DEBUG_HERE();
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     g_autoptr(GError) error = NULL;
+ 
+-    uint8_t resp_buf[256];
+-    const uint8_t *payload = NULL;
+-    size_t payload_len = 0;
++    if (!self->session_active) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "list: TLS session not active (sub1 pairing "
++                            "file not found — see find_sub1_path)");
++        fpi_device_list_complete(device, NULL, error);
++        return;
++    }
++
++    VerimarkTransportIoCtx io_ctx = {
++        .h = self->transport,
++        .timeout_ms = 3000,
++    };
++    VerimarkTransportIO io;
++    verimark_transport_io_bind(&io, &io_ctx);
++
++    VerimarkStorageObjectList list;
+     uint16_t status = 0;
+-    gboolean ok = send_simple_opcode(self, VERIMARK_OP_GET_STORAGE_INFO,
+-                                     resp_buf, sizeof(resp_buf),
+-                                     &payload, &payload_len, &status, &error);
+-    if (!ok) {
+-        fpi_device_list_complete(device, NULL, error);
+-        return;
+-    }
+-
+-    VerimarkStorageInfo info;
+-    if (!verimark_parse_storage_info(payload, payload_len, &info)) {
++    if (!verimark_storage_get_object_list(&self->session, &io,
++                                           /* class_byte = */ 0x01,
++                                           &list, &status)) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                            "list: storage_info parse failed "
+-                            "(payload %zu bytes)", payload_len);
++                            "list: get_object_list transport/crypto failure");
+         fpi_device_list_complete(device, NULL, error);
+         return;
+     }
+-
+-    const VerimarkStorageEntry *host =
+-        verimark_storage_find_host_partition(&info);
+-    if (host == NULL) {
++    if (status != 0x0000) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                            "list: no host partition (type=0x02) in "
+-                            "storage_info (%u entries)", info.entry_count);
++                            "list: 0x9f returned status 0x%04x", status);
+         fpi_device_list_complete(device, NULL, error);
+         return;
+     }
+ 
+-    fp_dbg("list: host partition located (b_1=0x%02x field_2=0x%04x "
+-           "field_4=0x%08x field_8=0x%08x), but template enumeration "
+-           "requires TLS session",
+-           host->b_1, host->field_2, host->field_4, host->field_8);
++    fp_dbg("list: %zu enrollment(s) reported by 0x9f class=1", list.count);
+ 
+-    error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                        "list: host partition located (%u storage entries), "
+-                        "but reading enrolled templates requires the TLS-PSK "
+-                        "session (Phase 5 blocker)", info.entry_count);
+-    fpi_device_list_complete(device, NULL, error);
++    GPtrArray *prints = g_ptr_array_new_with_free_func(g_object_unref);
++    for (size_t i = 0; i < list.count; i++) {
++        FpPrint *print = verimark_print_from_tuid(device, list.tuids[i]);
++        g_ptr_array_add(prints, g_object_ref_sink(print));
++    }
++
++    fpi_device_list_complete(device, prints, NULL);
++}
++
++
++/**
++ * Extract the 16-byte tuid carried by an FpPrint built by
++ * `verimark_print_from_tuid()`. Returns TRUE on success, with
++ * `*tuid_out` pointing into GVariant-owned memory (lifetime tied to
++ * `*tid_var_out`, which the caller must keep alive until done).
++ */
++static gboolean
++verimark_extract_tuid_from_print(FpPrint *print,
++                                 GVariant **tid_var_out,
++                                 const uint8_t **tuid_out)
++{
++    g_autoptr(GVariant) data = NULL;
++    g_object_get(print, "fpi-data", &data, NULL);
++    if (data == NULL)
++        return FALSE;
++    if (!g_variant_check_format_string(data, "(@ay)", FALSE))
++        return FALSE;
++
++    GVariant *tid_var = NULL;
++    g_variant_get(data, "(@ay)", &tid_var);
++    gsize tid_len = 0;
++    const guint8 *tid = g_variant_get_fixed_array(tid_var, &tid_len, 1);
++    if (tid_len != VERIMARK_STORAGE_TUID_LEN) {
++        g_variant_unref(tid_var);
++        return FALSE;
++    }
++    *tid_var_out = tid_var;
++    *tuid_out    = tid;
++    return TRUE;
+ }
+ 
+ 
+ static void verimark_delete(FpDevice *device)
+ {
+-    g_autoptr(GError) error = g_error_new(FP_DEVICE_ERROR,
+-                                          FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                                          "delete: requires partition-write API (TLS handshake required)");
+-    fpi_device_delete_complete(device, error);
++    G_DEBUG_HERE();
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    g_autoptr(GError) error = NULL;
++
++    if (!self->session_active) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                            "delete: TLS session not active");
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++
++    FpPrint *print = NULL;
++    fpi_device_get_delete_data(device, &print);
++    if (print == NULL) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                            "delete: no print supplied");
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++
++    g_autoptr(GVariant) tid_var = NULL;
++    const uint8_t *tuid = NULL;
++    if (!verimark_extract_tuid_from_print(print, &tid_var, &tuid)) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                            "delete: print has no valid 16-byte tuid in fpi-data");
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++
++    VerimarkTransportIoCtx io_ctx = {
++        .h = self->transport,
++        .timeout_ms = 3000,
++    };
++    VerimarkTransportIO io;
++    verimark_transport_io_bind(&io, &io_ctx);
++
++    uint16_t deleted = 0;
++    uint16_t status = 0;
++    if (!verimark_storage_delete_object(&self->session, &io,
++                                         /* class_byte = */ 0x01,
++                                         tuid, &deleted, &status)) {
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "delete: 0xa3 transport/crypto failure");
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++    if (status != 0x0000) {
++        /* 0x8306 = "no such object" (stale tuid, already gone). Treat it
++         * as a non-fatal proto error so the caller can recover. */
++        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                            "delete: 0xa3 returned status 0x%04x", status);
++        fpi_device_delete_complete(device, error);
++        return;
++    }
++
++    fp_dbg("delete: %u sensor objects removed (cascading across classes)",
++           (unsigned) deleted);
++    fpi_device_delete_complete(device, NULL);
+ }
+ 
+ 
+@@ -459,7 +1544,8 @@ static void fpi_device_verimark_class_init(FpiDeviceVerimarkClass *klass)
+     dev_class->type      = FP_DEVICE_TYPE_USB;
+     dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+     dev_class->id_table  = id_table;
+-    dev_class->nr_enroll_stages = 8;
++    /* 7 unique-quality swipes are required on-chip (bitmask 0x01..0x7f). */
++    dev_class->nr_enroll_stages = VERIMARK_ENROLL_PROGRESS_STAGES;
+     dev_class->features  = FP_DEVICE_FEATURE_CAPTURE
+                          | FP_DEVICE_FEATURE_IDENTIFY
+                          | FP_DEVICE_FEATURE_VERIFY

@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 08:53:44 +0100
+Subject: [PATCH 30/32] build: link Desktop crypto dependencies
+
+---
+ meson.build | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/meson.build b/meson.build
+index f1890f6..0766b2c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -255,6 +255,11 @@ foreach i : driver_helpers
+         libfprint_conf.set10('HAVE_UDEV', true)
+ 
+         optional_deps += gudev_dep
++    elif i == 'tudor_crypto'
++        optional_deps += dependency('gnutls')
++        optional_deps += dependency('nettle')
++        optional_deps += dependency('hogweed')
++        optional_deps += dependency('gmp')
+     endif
+ endforeach
+ 

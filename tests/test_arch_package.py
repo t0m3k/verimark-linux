@@ -381,21 +381,15 @@ class GeneratedMetadataTests(unittest.TestCase):
 
 
 class PackageSourceBoundaryTests(unittest.TestCase):
-    def test_active_patch_series_supports_both_verimark_devices(self):
+    def test_active_patch_series_supports_only_desktop_verimark(self):
         patches = [
             (PATCH_GENERATION / name).read_text()
             for name in PATCH_SERIES.read_text().splitlines()
         ]
 
         patch = "\n".join(patches)
-        for marker in (
-            "+usb:v047Dp00F2*",
-            "+usb:v047Dp8054*",
-            "0x00f2",
-            "0x8054",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, patch)
+        self.assertIn("+usb:v047Dp00F2*", patch)
+        self.assertIn("0x00f2", patch.lower())
 
     def test_package_metadata_has_no_maintainer_contact_and_matches_patch_digest(self):
         package_build = PACKAGE_BUILD.read_text()
@@ -491,7 +485,7 @@ class PackageSeriesValidationTests(unittest.TestCase):
             )
             checkout = build_directory / "src" / "libfprint"
             base = subprocess.run(
-                ["git", "-C", str(checkout), "rev-parse", "HEAD~62"],
+                ["git", "-C", str(checkout), "rev-parse", "HEAD~32"],
                 capture_output=True,
                 text=True,
                 check=False,
