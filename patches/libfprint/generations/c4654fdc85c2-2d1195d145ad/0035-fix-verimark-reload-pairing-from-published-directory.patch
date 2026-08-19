@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 11:30:00 +0100
+Subject: [PATCH 35/35] fix: reload VeriMark pairing after daemon restart
+
+Factory pairing publishes sub1.bin under /var/lib/fprint/verimark, but
+open() was looking under /var/lib/fprintd/verimark. Enrollment therefore
+worked until fprintd restarted, after which the driver could not restore
+the TLS session and reported no device-side prints.
+---
+ libfprint/drivers/verimark/verimark.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 0000000..0000000 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -251,25 +251,25 @@
+  * Locate the sub1 pairing file for this device. Search order :
+- *   1.  /var/lib/fprintd/verimark/sub1_<biometric_serial>.bin   (production,
++ *   1.  /var/lib/fprint/verimark/sub1_<biometric_serial>.bin   (production,
+  *       system-wide, biometric serial from opcode 0x01)
+- *   2.  /var/lib/fprintd/verimark/sub1.bin                       (single-device
++ *   2.  /var/lib/fprint/verimark/sub1.bin                       (single-device
+  *       legacy fallback)
+  *   3.  $XDG_CONFIG_HOME/verimark/sub1-<usb_iserial>.bin         (developer
+  *       convenience)
+  *   4.  $XDG_CONFIG_HOME/verimark/sub1.bin                       (developer
+  *       fallback)
+  *
+  * `$XDG_CONFIG_HOME` defaults to `$HOME/.config`.
+  *
+  * Returns a heap-allocated path (caller frees with g_free), or NULL.
+  */
+ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+ {
+     if (self->dev_info_valid) {
+         char serial[13];
+         verimark_format_serial(&self->dev_info, serial);
+-        gchar *p = g_strdup_printf("/var/lib/fprintd/verimark/sub1_%s.bin", serial);
++        gchar *p = g_strdup_printf("/var/lib/fprint/verimark/sub1_%s.bin", serial);
+         if (g_file_test(p, G_FILE_TEST_EXISTS)) return p;
+         g_free(p);
+     }
+-    gchar *fallback = g_strdup("/var/lib/fprintd/verimark/sub1.bin");
++    gchar *fallback = g_strdup("/var/lib/fprint/verimark/sub1.bin");
+     if (g_file_test(fallback, G_FILE_TEST_EXISTS)) return fallback;
+     g_free(fallback);
+--
+2.51.0

@@ -199,7 +199,7 @@ class PatchSeriesTests(unittest.TestCase):
             authors,
             [SCELLES_AUTHOR] * 24
             + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
-            + [CLEANUP_AUTHOR] * 8,
+            + [CLEANUP_AUTHOR] * 9,
         )
 
     def test_active_patches_exclude_prohibited_provenance_residue(self):
@@ -236,6 +236,17 @@ class PatchSeriesTests(unittest.TestCase):
             )
 
         self.assertIn("dev_class->temp_hot_seconds = -1;", source)
+
+    def test_verimark_reloads_pairing_from_the_published_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            source = read_text_tree(
+                checkout / "libfprint" / "drivers" / "verimark"
+            )
+
+        self.assertIn('/var/lib/fprint/verimark/sub1.bin', source)
+        self.assertNotIn('/var/lib/fprintd/verimark/sub1.bin', source)
 
     def test_factory_beta_never_bootstraps_during_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,7 +288,7 @@ class PatchSeriesTests(unittest.TestCase):
                 authors,
                 [SCELLES_AUTHOR] * 24
                 + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
-                + [CLEANUP_AUTHOR] * 8,
+                + [CLEANUP_AUTHOR] * 9,
             )
 
     def test_materialized_driver_has_only_implemented_features_for_desktop_id(self):
