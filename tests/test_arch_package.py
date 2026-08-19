@@ -175,7 +175,7 @@ def build_package_fixture(directory, extra_path=None, extra_content=b"fixture"):
         ".PKGINFO": (
             b"pkgname = libfprint-verimark\n"
             b"pkgbase = libfprint-verimark\n"
-            b"pkgver = 1.94.100.r1.gc4654fd-3\n"
+            b"pkgver = 1.94.100.r1.gc4654fd-4\n"
             b"pkgdesc = Synthetic libfprint package for safety tests\n"
             b"arch = x86_64\n"
         ),
@@ -376,7 +376,7 @@ class GeneratedMetadataTests(unittest.TestCase):
         self.assertEqual(len(package_paths), 1)
         self.assertTrue(
             Path(package_paths[0]).name.startswith(
-                "libfprint-verimark-1.94.100.r1.gc4654fd-3-x86_64.pkg.tar."
+                "libfprint-verimark-1.94.100.r1.gc4654fd-4-x86_64.pkg.tar."
             )
         )
 
@@ -597,7 +597,7 @@ class BuiltPackageTests(unittest.TestCase):
         identity = run_checked(self, "pacman", "-Qp", str(self.package)).strip()
 
         self.assertEqual(
-            identity, "libfprint-verimark 1.94.100.r1.gc4654fd-3"
+            identity, "libfprint-verimark 1.94.100.r1.gc4654fd-4"
         )
 
     def test_package_archive_provides_the_fprintd_abi_without_credentials(self):

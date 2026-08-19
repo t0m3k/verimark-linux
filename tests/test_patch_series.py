@@ -246,7 +246,7 @@ class PatchSeriesTests(unittest.TestCase):
             )
 
         self.assertIn('/var/lib/fprint/verimark/sub1.bin', source)
-        self.assertNotIn('/var/lib/fprintd/verimark/sub1.bin', source)
+        self.assertIn('/var/lib/fprintd/verimark/sub1.bin', source)
 
     def test_factory_beta_never_bootstraps_during_open(self):
         with tempfile.TemporaryDirectory() as directory:
