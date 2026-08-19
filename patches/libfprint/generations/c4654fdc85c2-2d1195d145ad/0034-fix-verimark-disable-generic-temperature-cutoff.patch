@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 11:15:00 +0100
+Subject: [PATCH 34/34] fix: disable generic VeriMark temperature cutoff
+
+The VeriMark Desktop does not expose a temperature model to libfprint.
+The generic three-minute cutoff therefore eventually disables the device
+while the lock screen keeps identify available across a long session.
+The driver already controls the device's active lifetime per operation, so
+use libfprint's explicit opt-out for devices that can run continuously.
+---
+ libfprint/drivers/verimark/verimark.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 0000000..0000000 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2753,4 +2753,5 @@ static void fpi_device_verimark_class_init(FpiDeviceVerimarkClass *klass)
+     dev_class->list     = verimark_list;
+     dev_class->delete   = verimark_delete;
+     dev_class->cancel   = verimark_cancel;
++    dev_class->temp_hot_seconds = -1;
+ }
+--
+2.51.0

@@ -31,3 +31,4 @@
 0031-fix-keep-standalone-desktop-tests-warning-clean.patch
 0032-fix-remove-stale-it-hwdb-metadata.patch
 0033-fix-make-pairing-publication-dirfd-safe.patch
+0034-fix-verimark-disable-generic-temperature-cutoff.patch

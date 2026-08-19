@@ -1,6 +1,6 @@
 pkgname=libfprint-verimark
 pkgver=1.94.100.r1.gc4654fd
-pkgrel=1
+pkgrel=2
 pkgdesc="Library for fingerprint readers with experimental Kensington VeriMark support"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
@@ -72,10 +72,11 @@ source=(
   "0031-fix-keep-standalone-desktop-tests-warning-clean.patch"
   "0032-fix-remove-stale-it-hwdb-metadata.patch"
   "0033-fix-make-pairing-publication-dirfd-safe.patch"
+  "0034-fix-verimark-disable-generic-temperature-cutoff.patch"
 )
 b2sums=(
   SKIP
-  ca2a9aae6451b5fd959b4e5d5cb0ace748f735cf43b91fc00951f5f1de8588307f97d4f4e1d5c3f41a5f3c4e0d746704e67187c0b5621fcd9f2d2d32cf4ba03c
+  6b8930223777c71df458038d29222f8263867415ab7a4e2a057ca79c1f58943e967df7dfdb565bf56bf5fffe57334a944678bd9ea9ec935db023dd12933cc00b
   bbe76807c896f34d453a332eeba055df51b26ffeb5cd1ae1239a63ede71592f6cd87feb45b9f0564e49feb4f3dce0697e97d5ba693d28dbd61fbf5c463dd2203
   1c746bd02494365cdc8ac602d2cd30f9333b1313d76e4a9fe192258f74b855161acaeec1734b1b3b40d86aeba4fa37c34130a8cc1e3a0a6b5c6b343e128f17da
   0493fe52c2e8257568291f36c68399bd89b5a14823aadaa3870d625114ede4afe17cd61e9c00c70a5b31712589e2de3b0fe645709cca5500d72278a85cd74ca8
@@ -109,6 +110,7 @@ b2sums=(
   55914841b531d5bfe08f6ca3ccee630e4a7cb0e7d864a1b55cbe75848c3f8dd52e16fb6cc1cbd80e770be4d59c0b56c7b76d0bc3a1aefe5be4a0c5889d467301
   fa7a1d4567450ef8dd42c307f2626d04259f0427365eb034a8cfd91195d1f4d54c3f07b3fb617e0fc9ac6a467bba76d408e780a97bf7e29e04cd7ece77e1cf22
   817f3ddf0253158dfa48e7cd64e687724f281c25ada5b0b2c45a9b0c5cf8a07c8f9c3a522af2f9bdac58516820ae1b35fa032dcb18ce0d059a59e337e031a93e
+  274a7ffc7eb8255699570347491f622bf2a74235f2525bc95e621c13660dc08ed268ebcf2b94b1eed58174ac53b318ca116f2304db13332aa69891cfad3de827
 )
 
 

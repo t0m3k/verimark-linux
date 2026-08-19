@@ -197,7 +197,9 @@ class PatchSeriesTests(unittest.TestCase):
 
         self.assertEqual(
             authors,
-            [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 7,
+            [SCELLES_AUTHOR] * 24
+            + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
+            + [CLEANUP_AUTHOR] * 8,
         )
 
     def test_active_patches_exclude_prohibited_provenance_residue(self):
@@ -224,6 +226,16 @@ class PatchSeriesTests(unittest.TestCase):
         for marker in ("0x8054", "+usb:v047Dp8054*"):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker.lower(), patch_text.lower())
+
+    def test_verimark_disables_generic_temperature_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "libfprint"
+            apply_series(self, checkout)
+            source = read_text_tree(
+                checkout / "libfprint" / "drivers" / "verimark"
+            )
+
+        self.assertIn("dev_class->temp_hot_seconds = -1;", source)
 
     def test_factory_beta_never_bootstraps_during_open(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -263,7 +275,9 @@ class PatchSeriesTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(
                 authors,
-                [SCELLES_AUTHOR] * 24 + [CLEANUP_AUTHOR, SCELLES_AUTHOR] + [CLEANUP_AUTHOR] * 7,
+                [SCELLES_AUTHOR] * 24
+                + [CLEANUP_AUTHOR, SCELLES_AUTHOR]
+                + [CLEANUP_AUTHOR] * 8,
             )
 
     def test_materialized_driver_has_only_implemented_features_for_desktop_id(self):
