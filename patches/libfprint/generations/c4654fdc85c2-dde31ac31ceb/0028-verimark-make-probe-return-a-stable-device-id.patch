@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 20:59:24 +0200
+Subject: [PATCH 28/62] verimark: make probe() return a stable device_id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The on-disk fprintd storage path
+`/var/lib/fprint/$user/verimark/$device_id` depends on what the driver
+returns from `fpi_device_probe_complete()`. The current code derived
+`device_id` from the biometric serial returned by opcode 0x01
+(GET_DEVICE_INFO), which requires the device to be opened, claimed,
+and have the init sequence + first opcode round-trip succeed.
+
+Any failure in that chain (USB busy because of a previous fprintd
+instance still tearing down, kernel raced our claim, sleep/resume race)
+caused `device_id` to be passed as NULL, which libfprint then defaulted
+to "0". The on-disk prints — written under the biometric serial when
+enroll worked — were no longer visible to subsequent verify operations,
+which now looked at `/var/lib/fprint/$user/verimark/0` instead.
+Visible runtime symptom : pam_fprintd called ListEnrolledFingers,
+fprintd returned an empty list, pam_fprintd silently skipped fingerprint
+auth in the gdm-fingerprint chain.
+
+Move `device_id` to the USB iSerial (string descriptor read via
+`g_usb_device_get_serial_number_index` + `g_usb_device_get_string_descriptor`).
+The bio-serial read stays as a best-effort secondary that populates
+`self->dev_info` for the optional `sub1_<bio_serial>.bin` lookup in
+open() — but its failure no longer makes `device_id` regress.
+
+If the USB iSerial isn't readable (some clones don't ship one), fall
+back to a deterministic `<vid>:<pid>` string. That collides across
+multiple physical devices of the same model but stays consistent across
+sessions and across plugging the device into a different USB port —
+unlike libfprint's "0" default which can change run-to-run.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/verimark.c | 121 ++++++++++++++------------
+ 1 file changed, 66 insertions(+), 55 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 9c858af..48e1faa 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -140,71 +140,82 @@ static void verimark_probe(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+ 
+-    /* probe() runs before open() — libfprint gives us access to the
+-     * GUsbDevice via fpi_device_get_usb_device(). We open it, claim
+-     * MI_01, run the init sequence, query get_device_info, then release
+-     * and close. Goal: return a unique device identifier (the serial)
+-     * so libfprint can distinguish multiple devices.
++    /* probe() returns a stable device identifier so libfprint can
++     * distinguish multiple devices AND so fprintd's per-device storage
++     * path stays consistent across sessions
++     * (`/var/lib/fprint/$user/verimark/$device_id`).
++     *
++     * Strategy : use the USB-level iSerial (descriptor `iSerialNumber`)
++     * as device_id. `g_usb_device_get_serial_number()` reads it from
++     * the libgusb cache populated at USB enumeration — no USB open,
++     * no claim, no device I/O. That makes probe deterministic and
++     * fast, with no race against a previously-claimed device. The
++     * iSerial is port-independent and unique per physical device.
++     *
++     * Also try a best-effort biometric-serial read via opcode 0x01
++     * so the optional `sub1_<bio_serial>.bin` pairing-file path keeps
++     * working — but this is NOT load-bearing for device_id. If the
++     * read fails (USB busy, kernel raced our claim, etc.), we still
++     * return a stable device_id from USB iSerial.
+      */
+     FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
+     GUsbDevice *usb = fpi_device_get_usb_device(device);
+-    /* Plain pointer — probe_complete steals the GError reference. */
+-    GError *error = NULL;
++    g_autofree char *device_id = NULL;
++    self->dev_info_valid = FALSE;
+ 
+-    if (!g_usb_device_open(usb, &error)) {
+-        fpi_device_probe_complete(device, NULL, NULL, error);
+-        return;
+-    }
+-    if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
++    /* Single open ; if it fails, we still return a usable device_id
++     * derived from USB descriptor metadata so fprintd's per-device
++     * storage path stays consistent. The bio-serial read (opcode 0x01)
++     * is a best-effort secondary that populates `self->dev_info` for
++     * the optional `sub1_<bio_serial>.bin` lookup in open(). */
++    GError *err = NULL;
++    if (g_usb_device_open(usb, &err)) {
++        /* USB iSerial (string descriptor) — needs open but no claim. */
++        guint8 iserial_idx = g_usb_device_get_serial_number_index(usb);
++        if (iserial_idx != 0) {
++            g_autofree gchar *iserial =
++                g_usb_device_get_string_descriptor(usb, iserial_idx, NULL);
++            if (iserial != NULL && *iserial != '\0')
++                device_id = g_strdup(iserial);
++        }
++
++        /* Best-effort bio-serial read for dev_info (sub1 lookup). */
++        if (g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, NULL)) {
++            self->transport = verimark_handle_new(usb);
++            uint8_t init_status = 0;
++            if (verimark_init_sequence(self->transport, &init_status, 2000)
++                  == VERIMARK_OK) {
++                uint8_t resp_buf[128];
++                const uint8_t *payload = NULL;
++                size_t payload_len = 0;
++                uint16_t status = 0;
++                if (send_simple_opcode(self, VERIMARK_OP_GET_DEVICE_INFO,
++                                        resp_buf, sizeof(resp_buf),
++                                        &payload, &payload_len, &status, NULL)) {
++                    self->dev_info_valid = verimark_parse_device_info(
++                        payload, payload_len, &self->dev_info);
++                }
++            }
++            verimark_handle_free(self->transport);
++            self->transport = NULL;
++            g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
++        }
+         g_usb_device_close(usb, NULL);
+-        fpi_device_probe_complete(device, NULL, NULL, error);
+-        return;
+     }
++    if (err) g_clear_error(&err);
+ 
+-    self->transport = verimark_handle_new(usb);
+-    uint8_t init_status = 0;
+-    VerimarkResult r = verimark_init_sequence(self->transport, &init_status, 2000);
+-    if (r != VERIMARK_OK) {
+-        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
+-        g_usb_device_close(usb, NULL);
+-        verimark_handle_free(self->transport);
+-        self->transport = NULL;
+-        g_set_error(&error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                    "init sequence failed (%d)", r);
+-        fpi_device_probe_complete(device, NULL, NULL, error);
+-        return;
++    /* If USB iSerial wasn't readable (open failed / no iSerial descriptor),
++     * fall back to vid:pid for a deterministic, port-independent ID.
++     * Without this, libfprint defaults to "0" which collides across
++     * sessions if the device is briefly unavailable. */
++    if (device_id == NULL) {
++        device_id = g_strdup_printf("%04x:%04x",
++                                     g_usb_device_get_vid(usb),
++                                     g_usb_device_get_pid(usb));
+     }
+ 
+-    uint8_t resp_buf[128];
+-    const uint8_t *payload = NULL;
+-    size_t payload_len = 0;
+-    uint16_t status = 0;
+-    gboolean ok = send_simple_opcode(self, VERIMARK_OP_GET_DEVICE_INFO,
+-                                     resp_buf, sizeof(resp_buf),
+-                                     &payload, &payload_len, &status, &error);
+-    if (!ok) {
+-        g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
+-        g_usb_device_close(usb, NULL);
+-        verimark_handle_free(self->transport);
+-        self->transport = NULL;
+-        fpi_device_probe_complete(device, NULL, NULL, error);
+-        return;
+-    }
+-
+-    self->dev_info_valid = verimark_parse_device_info(payload, payload_len,
+-                                                      &self->dev_info);
+-
+-    g_usb_device_release_interface(usb, VERIMARK_MI_BIO, 0, NULL);
+-    g_usb_device_close(usb, NULL);
+-    verimark_handle_free(self->transport);
+-    self->transport = NULL;
+-
+-    char serial[13] = "unknown";
+-    if (self->dev_info_valid)
+-        verimark_format_serial(&self->dev_info, serial);
+-
+     fpi_device_probe_complete(device,
+-                              g_strdup(serial),
++                              g_steal_pointer(&device_id),
+                               g_strdup("Kensington VeriMark DT"),
+                               NULL);
+ }

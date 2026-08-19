@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:16:13 +0200
+Subject: [PATCH 44/62] verimark: log VFY_S_AFTER_POLL and VFY_S_MATCH
+ transitions for IT diagnose
+
+Empty journalctl for verimark after the latest IT verify
+(no vfy_cb_match entry log fired) suggests the SSM exits before
+sending 0x99. Add fp_warn at VFY_S_AFTER_POLL (frame_ready / poll
+count / max-attempts branch) and VFY_S_MATCH (right before
+sending 0x99) so we can tell whether the firmware ever signals
+frame_ready, and whether the SSM is hitting max attempts then
+jumping to postamble.
+
+All TEMP.
+---
+ libfprint/drivers/verimark/verimark.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index ce2c9dd..33679ef 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1459,6 +1459,10 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+ 
+     /* ===== After-poll dispatch ========================================= */
+     case VFY_S_AFTER_POLL:
++        fp_warn("verify: AFTER_POLL attempt=%d frame_ready=%d polls=%d "
++                "false_detect=%d",
++                ctx->attempt, ctx->frame_ready_this_attempt,
++                ctx->poll_count, ctx->saw_false_detect);
+         if (ctx->frame_ready_this_attempt) {
+             fpi_ssm_jump_to_state(ssm, VFY_S_MATCH);
+             return;
+@@ -1466,6 +1470,9 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         /* No finger → next attempt or end. */
+         ctx->attempt++;
+         if (ctx->attempt > VERIMARK_VERIFY_MAX_ATTEMPTS) {
++            fp_warn("verify: AFTER_POLL → max attempts (%d) reached, "
++                    "going to POSTAMBLE",
++                    VERIMARK_VERIFY_MAX_ATTEMPTS);
+             fpi_ssm_jump_to_state(ssm, VFY_S_POST_CFG_MIXED);
+         } else {
+             fpi_ssm_jump_to_state(ssm, VFY_S_ATTEMPT_BEGIN);
+@@ -1474,6 +1481,8 @@ verify_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+ 
+     /* ===== Match + dispatch ============================================ */
+     case VFY_S_MATCH:
++        fp_warn("verify: MATCH state — sending 0x99 (attempt %d)",
++                ctx->attempt);
+         verimark_session_call_opcode_async(&self->session, self->transport,
+             3000, 0x99, VFY_MATCH_PAYLOAD, sizeof(VFY_MATCH_PAYLOAD),
+             cancel, vfy_cb_match, ssm);

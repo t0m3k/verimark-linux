@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 22:22:27 +0200
+Subject: [PATCH 60/62] verimark: use 0xA4 01 cleanup (not 80/81 config) for IT
+ post-delete GC
+
+---
+ libfprint/drivers/verimark/verimark.c | 54 ++++++++++++++++++---------
+ 1 file changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 80ff51c..ccc5b43 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3201,34 +3201,54 @@ static void verimark_delete(FpDevice *device)
+         fp_dbg("delete: IT 0xa3 OK (deleted %u sensor objects cascading "
+                "across classes)", (unsigned) it_count);
+ 
+-        /* Trigger partition GC (background-erase) to actually wipe the
+-         * deleted templates from the firmware's biometric store. Without
+-         * this, ghost templates linger and verify() returns positive
+-         * matches against TUIDs that no longer appear in `0x9f class=1`
+-         * — observed 2026-06-07 when subsequent verifies got
+-         * `verify: sensor matched a different print → downgrading` even
+-         * for the currently-enrolled finger. Windows mirrors this
+-         * (`_stiTudorDeleteEnrollment` calls `0xA3` then `0xA4 0x80`,
+-         * `0xA4 0x81`) ; cf. docs/it-verify-decode.md § "Flux haut-niveau
+-         * stiTudorDeleteEnrollment". GC failures are non-fatal — the
+-         * delete itself already succeeded ; we just log and continue. */
+-        for (uint8_t gc_byte = 0x80; gc_byte <= 0x81; gc_byte++) {
++        /* Trigger partition GC to actually wipe the deleted templates
++         * from the firmware's biometric store. Without this, ghost
++         * templates linger and verify() returns positive matches against
++         * TUIDs that no longer appear in `0x9f class=1` — observed
++         * runtime 2026-06-07 (driver log : `verify: sensor matched a
++         * different print → downgrading` after multiple enroll/delete
++         * cycles).
++         *
++         * Per RE of fcn.18009a5a0 (cf. docs/it-verify-decode.md § Delete) :
++         *   0xA4 0x01        = real cleanup GC (tudorCmdCleanup,
++         *                      "Number of erased slots: %d. New
++         *                      partition version: %d")
++         *   0xA4 0x80 / 0x81 = background-erase control (config flag
++         *                      only, doesn't actually erase ; Windows
++         *                      sets these as side-effect of its
++         *                      stiTudorDeleteEnrollment path)
++         *
++         * We send 0xA4 0x01 here (the actual cleanup) ; the 0x80/0x81
++         * config writes are skipped because (a) they don't free the
++         * orphan slots and (b) the firmware default config is what we
++         * want during driver-driven delete. GC failures are non-fatal —
++         * the delete itself already succeeded ; we log and continue. */
++        {
+             uint16_t gc_status = 0;
+             uint8_t *gc_payload = NULL;
+             size_t   gc_payload_len = 0;
+             GError  *gc_err = NULL;
+-            uint8_t  gc_req[1] = { gc_byte };
++            uint8_t  gc_req[1] = { 0x01 };
+             if (!verimark_call_opcode_sync(self, 0xA4,
+                                            gc_req, sizeof(gc_req),
+                                            /*timeout_ms*/ 3000,
+                                            &gc_status, &gc_payload,
+                                            &gc_payload_len, &gc_err)) {
+-                fp_warn("delete: 0xa4 GC %02x failed (non-fatal): %s",
+-                        gc_byte, gc_err ? gc_err->message : "(no msg)");
++                fp_warn("delete: 0xa4 01 cleanup GC failed (non-fatal): %s",
++                        gc_err ? gc_err->message : "(no msg)");
+                 if (gc_err) g_error_free(gc_err);
+             } else {
+-                fp_dbg("delete: 0xa4 GC %02x OK (status 0x%04x, %zu B payload)",
+-                       gc_byte, gc_status, gc_payload_len);
++                /* Response carries 2 LE u16 fields per the doc :
++                 * "Number of erased slots" + "New partition version". */
++                unsigned erased = 0;
++                unsigned partver = 0;
++                if (gc_payload_len >= 2)
++                    erased = (unsigned)(gc_payload[0] | (gc_payload[1] << 8));
++                if (gc_payload_len >= 4)
++                    partver = (unsigned)(gc_payload[2] | (gc_payload[3] << 8));
++                fp_dbg("delete: 0xa4 01 cleanup GC OK (status 0x%04x, "
++                       "erased=%u slots, partition_version=%u)",
++                       gc_status, erased, partver);
+             }
+             g_free(gc_payload);
+         }

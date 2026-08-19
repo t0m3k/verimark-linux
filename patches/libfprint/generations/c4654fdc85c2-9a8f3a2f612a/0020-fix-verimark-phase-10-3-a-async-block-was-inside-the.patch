@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 15:27:30 +0200
+Subject: [PATCH 20/32] fix(verimark): Phase 10.3.a async block was inside the
+ wrong #ifdef branch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The async transport block (ctrl_out_async / ctrl_in_async /
+transceive_async + finishers) was inserted between the #else stubs and
+the existing #endif of the original `#ifdef VERIMARK_HAVE_LIBGUSB / #else
+/ #endif` split. It therefore got compiled only when libgusb is NOT
+available — the opposite of what we want — and the libfprint link
+failed with "undefined reference to verimark_transceive_async" because
+the symbol wasn't in transport.c.o at all.
+
+Close the original block right after the last stub, then re-open a
+dedicated `#ifdef VERIMARK_HAVE_LIBGUSB` around the async section. No
+content change ; the existing trailing `#endif` now closes the new
+block.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/transport.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index 2eaa146..f5d322e 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -150,8 +150,11 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+     return VERIMARK_ERR_TRANSPORT;
+ }
+ 
++#endif /* VERIMARK_HAVE_LIBGUSB (closes the original sync impl / stubs split) */
++
+ 
+ /* === Phase 10.3.a — async transport (libgusb-backed) ================== */
++#ifdef VERIMARK_HAVE_LIBGUSB
+ 
+ /**
+  * Per-call context shared between the GTask and the

@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:39:01 +0200
+Subject: [PATCH 48/62] verimark: try 35-byte 0x96 03 commit on IT (DT prefix
+ shape, no SID)
+
+Status progression of the IT 0x96 03 commit by payload size :
+  1B    -> 0x0504  (data missing)
+  17B   -> 0x0104  (unknown_op family)
+  123B  -> 0x0404  (bad state, full DT layout)
+
+The DT 123-byte layout places the TUID at offset 18 preceded by
+a length marker 0x10 (=16) at offset 14. Hypothesis : the IT
+firmware reads the prefix the same way but expects no SID
+payload and no footer. Build [0x03][zeros 1..13][0x10 @ 14]
+[zeros 15..17][TUID @ 18..33][0x01 @ 34], total 35 bytes.
+---
+ libfprint/drivers/verimark/verimark.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 4c22873..940cd50 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2583,16 +2583,21 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         const gboolean is_it = (usb != NULL &&
+                                 g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
+         if (is_it) {
+-            /* 1-byte payload gave 0x0504 (vs 0x0404 from DT 123-byte) —
+-             * progress, but still rejected. Next hypothesis : the IT
+-             * commit just needs sub-cmd + TUID, no SID footer. Build
+-             * [0x03][TUID 16B] = 17 bytes. */
+-            uint8_t it_commit_payload[17];
+-            it_commit_payload[0] = 0x03;
+-            memcpy(it_commit_payload + 1, ctx->new_tuid,
++            /* Status progression : 1B -> 0x0504, 17B -> 0x0104,
++             * 123B (DT) -> 0x0404. The TUID position in the payload
++             * matters. The DT lays out [0x03][...zeros...][0x10 @ 14]
++             * [...zeros...][TUID @ 18][0x01 @ 34]... — TUID is preceded
++             * by a length marker (0x10 = 16). Try mirroring that
++             * prefix exactly through byte 34, dropping the SID/footer.
++             * 35 bytes total. */
++            uint8_t it_commit_payload[35] = {0};
++            it_commit_payload[0]  = 0x03;          /* sub-cmd commit */
++            it_commit_payload[14] = 0x10;          /* TUID length = 16 */
++            memcpy(it_commit_payload + 18, ctx->new_tuid,
+                    VERIMARK_STORAGE_TUID_LEN);
+-            fp_warn("verimark: IT enroll sending 0x96 03 with 17-byte payload "
+-                    "(sub-cmd + 16B TUID)");
++            it_commit_payload[34] = 0x01;          /* DT marker */
++            fp_warn("verimark: IT enroll sending 0x96 03 with 35-byte payload "
++                    "(DT prefix shape, no SID/footer)");
+             verimark_session_call_opcode_async(&self->session, self->transport,
+                 3000, 0x96, it_commit_payload, sizeof(it_commit_payload),
+                 cancel, enr_cb_commit, ssm);

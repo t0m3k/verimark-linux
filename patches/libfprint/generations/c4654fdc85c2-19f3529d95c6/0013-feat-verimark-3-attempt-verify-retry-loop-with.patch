@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 13:20:48 +0200
+Subject: [PATCH 13/31] feat(verimark): 3-attempt verify retry loop with
+ WARM-mode-on-retry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Port of the python verify retry loop (python/verimark/match.py:main).
+Attempt 1 uses the strict RICH config that requires high-quality
+touches ; attempts 2-3 prepend a 0x39 WARM that flips the firmware
+into "retry mode" where (a) the on-chip pre-filter is loosened so
+marginal touches get accepted, and (b) any type=0x18 event qualifies
+as frame_ready, not just ones with the 0x1000 bit.
+
+Also adds two latency improvements from the python reference :
+
+- 7-opcode inter-attempt drain (mirrors _inter_attempt_drain), with
+  cursors advancing by 4 per drain (2,3 ; 6,7 ; …).
+- RICH-mode early-exit on `saw_false_detect` : a type=0x18 event
+  without the FRAME_READY bit means the pre-filter has rejected the
+  touch and no further FRAME_READY will fire for this attempt.
+  Break the poll loop immediately and re-arm in WARM mode instead of
+  waiting the full 30 s timeout.
+
+Closes the long-standing reliability issue where the strict on-chip
+pre-filter rejects ~50% of touches in single-attempt mode (observed
+runtime ratio on WULFENIX). v1's "no-match on first attempt"
+behaviour was driven entirely by this : 0x99 returned 0x0905 because
+the captured frame was the marginal one the pre-filter would have
+rejected in attempt 2's WARM mode.
+
+Total worst-case latency : 3 × 30 s = 90 s (up from 30 s), but real
+attempts succeed in ~1–3 s and retries only fire on actual rejections.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 275 ++++++++++++++++----------
+ 1 file changed, 167 insertions(+), 108 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index c12ba77..2e9d27c 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -430,6 +430,7 @@ static FpPrint *verimark_print_from_tuid(FpDevice *device,
+ 
+ #define VERIMARK_VERIFY_POLL_INTERVAL_MS 250
+ #define VERIMARK_VERIFY_TIMEOUT_S        30
++#define VERIMARK_VERIFY_MAX_ATTEMPTS     3
+ 
+ 
+ /* Capture config templates — exact bytes from python/verimark/match.py
+@@ -590,6 +591,33 @@ verimark_io_bind(FpiDeviceVerimark *self,
+  * it back to the class-1 storage_handle that libfprint compares
+  * against.
+  */
++/**
++ * 7-opcode inter-attempt drain (between verify retries). Mirrors
++ * python `_inter_attempt_drain`. Cursors advance by 4 per drain.
++ */
++static void
++verimark_verify_drain_between_attempts(FpiDeviceVerimark *self,
++                                        VerimarkTransportIO *io,
++                                        uint16_t cursor_a, uint16_t cursor_b)
++{
++    uint16_t st = 0;
++    VerimarkEventReadResult ev = {0};
++    verimark_capture_config(&self->session, io, VERIMARK_CFG_WARM, &st);
++    verimark_capture_event_config(&self->session, io,
++                                   VERIMARK_MASK_EVENTS_1_AND_2,
++                                   VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
++    verimark_capture_event_read(&self->session, io, cursor_a, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++    verimark_capture_event_config(&self->session, io,
++                                   VERIMARK_MASK_EVENT_2,
++                                   VERIMARK_MASK_EVENT_2, 0, &st);
++    verimark_capture_event_read(&self->session, io, cursor_b, 32, &ev, &st);
++    verimark_capture_event_config(&self->session, io,
++                                   NULL, NULL, /*field_21=*/4, &st);
++}
++
++
+ static gboolean
+ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+                               gboolean *out_frame_ready,
+@@ -608,142 +636,165 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+     verimark_io_bind(self, &io_ctx, &io);
+ 
+     uint16_t st = 0;
++    VerimarkEventReadResult ev = {0};
+ 
+-    /* === Preamble === */
++    /* === Preamble (once) === */
+     if (!verimark_capture_init_session(&self->session, &io, &st)) {
+         *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                "verify: 0x19 init transport failure");
+         return FALSE;
+     }
+-    fp_dbg("verify: [preamble] 0x19 init           status=0x%04x", st);
+-
+     verimark_capture_event_config(&self->session, &io,
+                                    VERIMARK_MASK_EVENTS_1_AND_2,
+                                    VERIMARK_MASK_EVENTS_1_AND_2, 0, &st);
+-    fp_dbg("verify: [preamble] 0x86 events_1_2    status=0x%04x", st);
+-
+-    VerimarkEventReadResult ev = {0};
+     verimark_capture_event_read(&self->session, &io, 0, 32, &ev, &st);
+-    fp_dbg("verify: [preamble] 0x87 cursor=0       status=0x%04x returned=%u total=%u",
+-           st, ev.returned_count, ev.total_count);
+-
+     verimark_capture_event_config(&self->session, &io,
+                                    NULL, NULL, /*field_21=*/4, &st);
+-    fp_dbg("verify: [preamble] 0x86 subscribe_all  status=0x%04x", st);
+ 
+-    /* === Capture (single attempt for v1) === */
+-    if (!verimark_capture_config(&self->session, &io, VERIMARK_CFG_RICH, &st)) {
+-        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                               "verify: 0x39 RICH transport failure");
+-        return FALSE;
+-    }
+-    fp_dbg("verify: [capture]  0x39 RICH           status=0x%04x", st);
++    /* === Attempt loop ===
++     * Mirrors python verify main() flow : attempt 1 uses RICH (strict
++     * pre-filter, high quality required) ; attempts 2..N flip the
++     * firmware into "WARM mode" by emitting `0x39 WARM` before
++     * RICH — that loosens the pre-filter so marginal touches get
++     * accepted, AND any type=0x18 event qualifies as frame_ready
++     * (not just ones with the 0x1000 bit). Up to 3 attempts total. */
++    int attempt = 0;
++    int last_poll_count = 0;
++    for (attempt = 1; attempt <= VERIMARK_VERIFY_MAX_ATTEMPTS; attempt++) {
++        gboolean is_retry = (attempt > 1);
+ 
+-    verimark_capture_event_config(&self->session, &io,
+-                                   VERIMARK_MASK_FRAME_READY_ARM,
+-                                   VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
+-    fp_dbg("verify: [capture]  0x86 frame_ready    status=0x%04x", st);
++        /* Inter-attempt drain (cursor-based, per python). */
++        if (is_retry) {
++            uint16_t cursor_a = (uint16_t)(2 + (attempt - 2) * 4);
++            uint16_t cursor_b = (uint16_t)(cursor_a + 2);
++            verimark_verify_drain_between_attempts(self, &io,
++                                                    cursor_a, cursor_b);
++            g_usleep(500 * 1000);   /* 0.5 s — let user lift finger */
++        }
+ 
+-    /* Surface the "place finger" cue at INFO level too — the
+-     * debug-only fp_dbg() wouldn't reach a user running fprintd or
+-     * fp_device_verify_sync without G_MESSAGES_DEBUG. */
+-    fp_warn("verify: PLACE YOUR FINGER ON THE SENSOR NOW (timeout %d s)",
+-            VERIMARK_VERIFY_TIMEOUT_S);
+-    g_print(">>> PLACE YOUR FINGER ON THE SENSOR NOW <<< (timeout %d s)\n",
+-            VERIMARK_VERIFY_TIMEOUT_S);
++        /* WARM-mode kickoff (only on retries) — loosens on-chip
++         * pre-filter and primes the matcher's retry path. */
++        if (is_retry) {
++            verimark_capture_config(&self->session, &io,
++                                     VERIMARK_CFG_WARM, &st);
++        }
++        verimark_capture_config(&self->session, &io, VERIMARK_CFG_RICH, &st);
++        verimark_capture_event_config(&self->session, &io,
++                                       VERIMARK_MASK_FRAME_READY_ARM,
++                                       VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
+ 
+-    if (!verimark_capture_start(&self->session, &io,
+-                                 VERIMARK_CAPSTART_VERIFY, &st)) {
+-        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                               "verify: 0x80 capture_start transport failure");
+-        return FALSE;
+-    }
++        if (attempt == 1) {
++            fp_warn("verify: attempt %d/%d — PLACE YOUR FINGER (timeout %d s)",
++                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS,
++                    VERIMARK_VERIFY_TIMEOUT_S);
++            g_print(">>> PLACE YOUR FINGER ON THE SENSOR NOW <<< (timeout %d s)\n",
++                    VERIMARK_VERIFY_TIMEOUT_S);
++        } else {
++            fp_warn("verify: attempt %d/%d — RETRY (WARM mode, looser pre-filter)",
++                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
++            g_print(">>> RETRY — touch again (attempt %d/%d) <<<\n",
++                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
++        }
+ 
+-    /* Polling loop for frame_ready. */
+-    gint64 deadline_us = g_get_monotonic_time()
+-                       + (gint64)VERIMARK_VERIFY_TIMEOUT_S * G_USEC_PER_SEC;
+-    int poll_count = 0;
+-    int last_logged_count = 0;
+-    while (g_get_monotonic_time() < deadline_us) {
+-        poll_count++;
+-        VerimarkEventReadResult r = {0};
+-        uint16_t poll_st = 0;
+-        if (!verimark_capture_event_read(&self->session, &io, 0, 32, &r, &poll_st)) {
+-            if (poll_count - last_logged_count >= 8) {
+-                fp_dbg("verify: [poll #%d] 0x87 TRANSPORT FAIL", poll_count);
+-                last_logged_count = poll_count;
++        if (!verimark_capture_start(&self->session, &io,
++                                     VERIMARK_CAPSTART_VERIFY, &st)) {
++            *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                   "verify: 0x80 capture_start transport failure");
++            return FALSE;
++        }
++
++        /* Poll for FRAME_READY (or any type=0x18 in WARM mode).
++         * Track `saw_false_detect` : a type=0x18 event without the
++         * 0x1000 bit means the on-chip pre-filter REJECTED the touch.
++         * In RICH mode no further FRAME_READY will come for this
++         * attempt — exit the poll loop immediately and trigger retry. */
++        gint64 deadline_us = g_get_monotonic_time()
++                           + (gint64)VERIMARK_VERIFY_TIMEOUT_S * G_USEC_PER_SEC;
++        gboolean frame_ready_this_attempt = FALSE;
++        gboolean saw_false_detect = FALSE;
++        int poll_count = 0;
++        while (g_get_monotonic_time() < deadline_us) {
++            poll_count++;
++            VerimarkEventReadResult r = {0};
++            uint16_t poll_st = 0;
++            if (!verimark_capture_event_read(&self->session, &io,
++                                              0, 32, &r, &poll_st)) {
++                g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
++                continue;
+             }
++            for (size_t i = 0; i < r.returned_count && !frame_ready_this_attempt; i++) {
++                const VerimarkSensorEvent *e = &r.events[i];
++                gboolean has_fr_bit =
++                    (e->val0 | e->val1) & VERIMARK_EVENT_FRAME_READY_BIT;
++                gboolean is_warm_frame = (is_retry && e->type == 0x18
++                                          && !has_fr_bit);
++                if (has_fr_bit || is_warm_frame) {
++                    frame_ready_this_attempt = TRUE;
++                    break;
++                }
++                if (!is_retry && e->type == 0x18 && !has_fr_bit)
++                    saw_false_detect = TRUE;
++            }
++            if (frame_ready_this_attempt)
++                break;
++            /* Early exit on RICH-mode false-detect — no FRAME_READY
++             * will fire for this attempt, save the timeout wait. */
++            if (saw_false_detect && !is_retry)
++                break;
+             g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+-            continue;
+         }
+-        if (poll_st != 0x0000 && poll_count - last_logged_count >= 8) {
+-            fp_dbg("verify: [poll #%d] 0x87 status=0x%04x total=%u",
+-                   poll_count, poll_st, r.total_count);
+-            last_logged_count = poll_count;
+-        }
+-        /* Always print every event we get — that's how we'll find the
+-         * frame_ready signal if it lives on a different bit than 0x1000. */
+-        for (size_t i = 0; i < r.returned_count; i++) {
+-            const VerimarkSensorEvent *e = &r.events[i];
+-            fp_dbg("verify: [poll #%d] EVENT type=0x%02x val0=0x%08x val1=0x%08x",
+-                   poll_count, e->type,
+-                   (unsigned)e->val0, (unsigned)e->val1);
+-        }
+-        if (verimark_capture_events_have_frame_ready(&r, NULL)) {
+-            fp_dbg("verify: FRAME_READY event after %d poll(s)", poll_count);
++        last_poll_count = poll_count;
++        fp_warn("verify: attempt %d poll done — frame_ready=%d polls=%d "
++                "false_detect=%d",
++                attempt, frame_ready_this_attempt, poll_count,
++                saw_false_detect);
++
++        /* Close the capture window for this attempt. */
++        verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
++        verimark_capture_event_config(&self->session, &io,
++                                       NULL, NULL, /*field_21=*/4, &st);
++        verimark_capture_status_poll(&self->session, &io, &st, &st);
++
++        if (frame_ready_this_attempt && !*out_frame_ready)
+             *out_frame_ready = TRUE;
++
++        if (!frame_ready_this_attempt) {
++            /* Either timeout or false-detect early exit — try again. */
++            if (attempt < VERIMARK_VERIFY_MAX_ATTEMPTS) {
++                fp_warn("verify: no frame_ready on attempt %d, retrying",
++                        attempt);
++                continue;
++            }
+             break;
+         }
+-        g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+-    }
+-    fp_warn("verify: poll loop done — frame_ready=%d, polls=%d",
+-            *out_frame_ready, poll_count);
+ 
+-    /* Close the capture window regardless of frame_ready outcome. */
+-    verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
+-    verimark_capture_event_config(&self->session, &io,
+-                                   NULL, NULL, /*field_21=*/4, &st);
+-    verimark_capture_status_poll(&self->session, &io, &st, &st);   /* 0x81 capture_stop */
++        /* Touch was accepted → run 0x99 match. */
++        VerimarkMatchVerdict v = {0};
++        uint16_t v_st = 0;
++        if (!verimark_match_simple(&self->session, &io, &v, &v_st)) {
++            *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                   "verify: 0x99 match transport failure");
++            return FALSE;
++        }
++        if (v_st == 0x0000 && v.len >= 16) {
++            fp_warn("verify: positive verdict on attempt %d (%zu bytes)",
++                    attempt, v.len);
++            *out_match = TRUE;
++            if (out_matched_tuid)
++                memcpy(out_matched_tuid, v.bytes,
++                       VERIMARK_STORAGE_TUID_LEN);
++            break;   /* MATCH — done */
++        }
+ 
+-    if (!*out_frame_ready) {
+-        *out_err = g_error_new(FP_DEVICE_RETRY,
+-                               FP_DEVICE_RETRY_TOO_SHORT,
+-                               "verify: no finger detected after %d s "
+-                               "(%d polls)",
+-                               VERIMARK_VERIFY_TIMEOUT_S, poll_count);
+-        return FALSE;
+-    }
+-
+-    /* 0x99 simplified match call. */
+-    VerimarkMatchVerdict v = {0};
+-    if (!verimark_match_simple(&self->session, &io, &v, &st)) {
+-        *out_err = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                               "verify: 0x99 match transport failure");
+-        return FALSE;
+-    }
+-    if (st == 0x0000 && v.len >= 16) {
+-        fp_warn("verify: positive verdict (%zu bytes)", v.len);
+-        fp_dbg("verify: positive verdict (%zu bytes), matched_tuid=%02x%02x%02x"
+-               "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+-               v.len,
+-               v.bytes[0],  v.bytes[1],  v.bytes[2],  v.bytes[3],
+-               v.bytes[4],  v.bytes[5],  v.bytes[6],  v.bytes[7],
+-               v.bytes[8],  v.bytes[9],  v.bytes[10], v.bytes[11],
+-               v.bytes[12], v.bytes[13], v.bytes[14], v.bytes[15]);
+-        *out_match = TRUE;
+-        if (out_matched_tuid)
+-            memcpy(out_matched_tuid, v.bytes, VERIMARK_STORAGE_TUID_LEN);
+-    } else {
+-        fp_warn("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
+-        /* Fire 0x39 WARM to trigger the firmware's brief red-LED
+-         * "no-match" feedback (cf. docs/phase9-led-red-finding.md).
+-         * Even without a retry loop, this gives the user the visual
+-         * cue that the touch was seen and rejected. */
++        fp_warn("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
++                attempt, v_st, v.len);
++        /* WARM trigger after a no-match for the firmware's brief
++         * red-LED feedback (cf. phase9-led-red-finding.md). */
+         verimark_capture_config(&self->session, &io, VERIMARK_CFG_WARM, &st);
+-        fp_dbg("verify: [no-match] 0x39 WARM        status=0x%04x (red-LED feedback)", st);
++        /* Don't break — try again on next iteration. */
+     }
+ 
+-    /* === Postamble (best-effort cleanup) === */
++    /* === Postamble (always — even on success / failure) === */
+     verimark_capture_config(&self->session, &io, VERIMARK_CFG_MIXED, &st);
+     verimark_capture_event_config(&self->session, &io,
+                                    VERIMARK_MASK_EVENTS_1_AND_2,
+@@ -758,6 +809,14 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+     verimark_capture_event_config(&self->session, &io,
+                                    NULL, NULL, /*field_21=*/4, &st);
+ 
++    if (!*out_frame_ready) {
++        *out_err = g_error_new(FP_DEVICE_RETRY,
++                               FP_DEVICE_RETRY_TOO_SHORT,
++                               "verify: no finger detected after %d attempts "
++                               "(last poll count %d)",
++                               VERIMARK_VERIFY_MAX_ATTEMPTS, last_poll_count);
++        return FALSE;
++    }
+     return *out_match;
+ }
+ 

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 12:58:37 +0200
+Subject: [PATCH 41/62] verimark: temporarily log 0x99 no-match at WARN level
+ for IT diagnose
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fp_info doesn't reach journalctl with the default fprintd config —
+the diagnostic log added in the previous commit stayed invisible.
+Bump to fp_warn so we can observe the firmware status word and
+the first 8 payload bytes on the next verify-no-match attempt.
+
+To revert once the IT match verdict is decoded.
+---
+ libfprint/drivers/verimark/verimark.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 09a91c5..29c04d9 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1191,10 +1191,11 @@ vfy_cb_match(GObject *src, GAsyncResult *res, gpointer ud)
+         fp_info("verify: positive verdict on attempt %d (%zu bytes)",
+                 ctx->attempt, payload_len);
+     } else {
+-        /* Logged at info level so the firmware status/payload shape is
+-         * visible without a debug rebuild — useful for finding IT-
+-         * specific match-on-chip codes (similar to enroll's 0x8006). */
+-        fp_info("verify: attempt %d no-match (status 0x%04x, %zu bytes, "
++        /* Temporarily logged at WARN level so the firmware status/
++         * payload shape always reaches journalctl during IT diagnose
++         * (info/dbg get filtered out by default fprintd config). Once
++         * the IT match verdict is decoded, downgrade back to info. */
++        fp_warn("verify: attempt %d no-match (status 0x%04x, %zu bytes, "
+                 "first 8 = %02x %02x %02x %02x %02x %02x %02x %02x)",
+                 ctx->attempt, status, payload_len,
+                 payload && payload_len >= 1 ? payload[0] : 0,

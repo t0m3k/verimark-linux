@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 16:38:43 +0200
+Subject: [PATCH 53/62] verimark: implement IT delete via 0xA4 with ANSI-381
+ sub-factor selector
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RE of fcn.18009a5a0 (delete builder) + its 3 callers in
+synaWudfBioUsb123.dll :
+
+- 0x180098eaa : mov dl, 0x01 → tudorCmdCleanup path
+- 0x1800938a2 : mov dl, 0x80 → host-side special marker (categorical)
+- 0x1800939e0 : mov dl, 0x81 → host-side special marker (stiTudorDeleteTemplate)
+
+Inside 0x9a5a0 the byte is written to buffer[1] verbatim
+(0x9a6f2 : mov [rax], cl). The 0x80/0x81 only branch the host-side
+post-processing — no firmware-side semantic change to the wire byte.
+
+So the wire byte is the WinBio ANSI-381 finger position code, which
+maps 1:1 to libfprint's FpFinger enum :
+
+    FP_FINGER_RIGHT_THUMB   → 0x01
+    FP_FINGER_RIGHT_INDEX   → 0x02
+    FP_FINGER_RIGHT_MIDDLE  → 0x03
+    FP_FINGER_RIGHT_RING    → 0x04
+    FP_FINGER_RIGHT_LITTLE  → 0x05
+    FP_FINGER_LEFT_THUMB    → 0x06
+    FP_FINGER_LEFT_INDEX    → 0x07
+    FP_FINGER_LEFT_MIDDLE   → 0x08
+    FP_FINGER_LEFT_RING     → 0x09
+    FP_FINGER_LEFT_LITTLE   → 0x0A
+
+verimark_delete : the IT branch extracts FpFinger from the print
+metadata, derives the sub-factor byte, and sends 0xA4 with that
+single byte via verimark_session_call_opcode. A defensive guard
+refuses the host-side special markers 0x80 / 0x81 in case a future
+switch path produces one. Status non-zero is surfaced verbatim
+to the caller for diagnose.
+---
+ libfprint/drivers/verimark/verimark.c | 97 +++++++++++++++++++++++----
+ 1 file changed, 83 insertions(+), 14 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index dc086fc..5546701 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2997,22 +2997,91 @@ static void verimark_delete(FpDevice *device)
+         return;
+     }
+ 
+-    /* The IT uses opcode 0xa4 with a 1-byte "sub-factor selector"
+-     * payload (no TUID) — see docs/it-verify-decode.md § "Delete".
+-     * Values 0x80 / 0x81 are special (delete-all categories). The
+-     * mapping from FpFinger to sub-factor byte hasn't been runtime-
+-     * captured yet, and sending a wrong byte risks wiping ALL
+-     * templates on the firmware. Until that work is done we just
+-     * decline cleanly so the host-side print list stays consistent
+-     * (caller can wipe /var/lib/fprint/<user> manually to reset). */
++    /* The IT uses opcode 0xa4 with a 1-byte sub-factor selector
++     * (WinBio ANSI-381 finger position code), NOT the DT's
++     * [0xa3][class][TUID] structure. RE of fcn.18009a5a0 + its 3
++     * callers in synaWudfBioUsb123.dll (commit decoded 2026-06-07) :
++     *
++     *   caller @ 0x180098eaa : mov dl, 0x01 → tudorCmdCleanup variant
++     *   caller @ 0x1800938a2 : mov dl, 0x80 → special (categorical)
++     *   caller @ 0x1800939e0 : mov dl, 0x81 → stiTudorDeleteTemplate variant
++     *
++     * Inside the builder, the byte is written to buffer[1] verbatim
++     * (0x18009a6f2 : mov [rax], cl). 0x80 and 0x81 only branch the
++     * post-processing on the host side (no firmware-side semantic
++     * change for the wire byte itself). So the actual sub-factor is
++     * the ANSI-381 code 0x01..0x0A, matching libfprint's FpFinger
++     * enum 1:1. Refuse 0x80/0x81 specifically because those are the
++     * host-side special markers and we never want to send them by
++     * accident — they may signal "delete all" semantics from a
++     * different code path.
++     *
++     * See docs/it-verify-decode.md § "Delete (0xA4)". */
+     GUsbDevice *usb = fpi_device_get_usb_device(device);
+     if (usb != NULL && g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
+-        error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+-                            "delete: IT sensor uses opcode 0xa4 with a "
+-                            "sub-factor selector that hasn't been decoded "
+-                            "yet — to remove the host-side print, delete "
+-                            "/var/lib/fprint/<user>/ then re-enroll");
+-        fpi_device_delete_complete(device, error);
++        FpFinger finger = fp_print_get_finger(print);
++        uint8_t sub_factor;
++        switch (finger) {
++        case FP_FINGER_RIGHT_THUMB:   sub_factor = 0x01; break;
++        case FP_FINGER_RIGHT_INDEX:   sub_factor = 0x02; break;
++        case FP_FINGER_RIGHT_MIDDLE:  sub_factor = 0x03; break;
++        case FP_FINGER_RIGHT_RING:    sub_factor = 0x04; break;
++        case FP_FINGER_RIGHT_LITTLE:  sub_factor = 0x05; break;
++        case FP_FINGER_LEFT_THUMB:    sub_factor = 0x06; break;
++        case FP_FINGER_LEFT_INDEX:    sub_factor = 0x07; break;
++        case FP_FINGER_LEFT_MIDDLE:   sub_factor = 0x08; break;
++        case FP_FINGER_LEFT_RING:     sub_factor = 0x09; break;
++        case FP_FINGER_LEFT_LITTLE:   sub_factor = 0x0A; break;
++        default:
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                                "delete: IT requires a specific FpFinger "
++                                "value (got %d) to derive the ANSI-381 "
++                                "sub-factor byte", (int)finger);
++            fpi_device_delete_complete(device, error);
++            return;
++        }
++        /* Defensive guard : the WinBio finger codes 0x01..0x0A can
++         * never collide with the special host-side markers 0x80 /
++         * 0x81, but assert it just in case the switch grows. */
++        if (sub_factor == 0x80 || sub_factor == 0x81) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: sub-factor 0x%02x is a host-side "
++                                "special marker, refusing to send",
++                                sub_factor);
++            fpi_device_delete_complete(device, error);
++            return;
++        }
++        VerimarkTransportIoCtx it_io_ctx = {
++            .h = self->transport,
++            .timeout_ms = 3000,
++        };
++        VerimarkTransportIO it_io;
++        verimark_transport_io_bind(&it_io, &it_io_ctx);
++        uint8_t  resp[64];
++        uint16_t it_status = 0;
++        const uint8_t *it_payload = NULL;
++        size_t          it_payload_len = 0;
++        if (!verimark_session_call_opcode(&self->session, &it_io,
++                                           /*opcode*/ 0xA4,
++                                           /*payload*/ &sub_factor, 1,
++                                           resp, sizeof(resp),
++                                           &it_status, &it_payload,
++                                           &it_payload_len)) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 transport/crypto failure");
++            fpi_device_delete_complete(device, error);
++            return;
++        }
++        if (it_status != 0x0000) {
++            error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                                "delete: 0xa4 status 0x%04x (sub-factor 0x%02x)",
++                                it_status, sub_factor);
++            fpi_device_delete_complete(device, error);
++            return;
++        }
++        fp_dbg("delete: IT 0xa4 sub-factor 0x%02x OK (status 0x0000, %zu B payload)",
++               sub_factor, it_payload_len);
++        fpi_device_delete_complete(device, NULL);
+         return;
+     }
+ 

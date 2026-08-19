@@ -1,0 +1,495 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 15:05:07 +0200
+Subject: [PATCH 18/62] =?UTF-8?q?feat(verimark):=20Phase=2010.3.a=20?=
+ =?UTF-8?q?=E2=80=94=20async=20transport=20foundation?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First step of the sync → fpi_ssm refactor. Adds non-blocking async
+variants of the vendor control transfers, gated behind
+VERIMARK_HAVE_LIBGUSB (libfprint context only — standalone test
+builds skip them).
+
+New APIs (transport.h) :
+
+  void verimark_ctrl_out_async(handle, bRequest, wValue, wIndex,
+                                data, len, timeout, cancellable,
+                                callback, user_data);
+  VerimarkResult verimark_ctrl_out_finish(GAsyncResult *res,
+                                           GError **error);
+
+  void verimark_ctrl_in_async(handle, bRequest, wValue, wIndex,
+                               buf, buf_size, timeout, cancellable,
+                               callback, user_data);
+  VerimarkResult verimark_ctrl_in_finish(GAsyncResult *res,
+                                          size_t *out_received,
+                                          GError **error);
+
+  void verimark_transceive_async(handle, data, len, resp, resp_size,
+                                  timeout, cancellable, callback,
+                                  user_data);
+  VerimarkResult verimark_transceive_finish(GAsyncResult *res,
+                                             size_t *out_resp_len,
+                                             GError **error);
+
+Implementation : GTask wrappers around g_usb_device_control_transfer_async.
+For transceive_async, the GTask chains OUT then IN via two nested
+callbacks, with the aligned send buffer + bookkeeping kept in a
+VerimarkTransceiveAsyncCtx heap struct (auto-freed when the GTask
+finalizes). Supports cancellation via GCancellable — propagates
+G_IO_ERROR_CANCELLED to the finish.
+
+Caveat : transceive_async is single-chunk only (frame ≤ 4096 B). All
+observed Tudor opcodes fit ; multi-chunk fragmentation stays in the
+sync path until proven needed.
+
+No vfunc uses these yet — phase 10.3.b/c/d/e will migrate
+session.call_opcode and the vfuncs themselves to consume the async
+transport. The sync verimark_transceive / verimark_ctrl_* remain
+the canonical path for the standalone test build and for the
+(legacy) bootstrap orchestrator.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/transport.c | 311 +++++++++++++++++++++++++
+ libfprint/drivers/verimark/transport.h |  96 ++++++++
+ 2 files changed, 407 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index 05ccbf6..2eaa146 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -27,6 +27,7 @@
+ 
+ #ifdef VERIMARK_HAVE_LIBGUSB
+ #include <gusb.h>
++#include <gio/gio.h>   /* GTask / GAsyncReadyCallback for the async API */
+ #endif
+ 
+ 
+@@ -149,6 +150,316 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+     return VERIMARK_ERR_TRANSPORT;
+ }
+ 
++
++/* === Phase 10.3.a — async transport (libgusb-backed) ================== */
++
++/**
++ * Per-call context shared between the GTask and the
++ * g_usb_device_control_transfer_async finish callbacks. Lives on the
++ * heap, freed by the GTask when the task is finalized.
++ */
++typedef struct {
++    /* For the OUT/IN single-shot variants : we just wrap a single
++     * USB transfer ; the gssize returned by libgusb is stashed here
++     * before completing the GTask. */
++    gssize  bytes_transferred;
++} VerimarkCtrlAsyncCtx;
++
++
++static void
++verimark_ctrl_xfer_async_cb(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    GTask *task = G_TASK(ud);
++    GError *err = NULL;
++    gssize n = g_usb_device_control_transfer_finish(G_USB_DEVICE(obj),
++                                                     res, &err);
++    if (err != NULL) {
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    VerimarkCtrlAsyncCtx *ctx = g_task_get_task_data(task);
++    ctx->bytes_transferred = n;
++    g_task_return_boolean(task, TRUE);
++    g_object_unref(task);
++}
++
++
++void
++verimark_ctrl_out_async(VerimarkUsbHandle *h,
++                       uint8_t bRequest,
++                       uint16_t wValue,
++                       uint16_t wIndex,
++                       const uint8_t *data,
++                       size_t data_len,
++                       unsigned timeout_ms,
++                       GCancellable *cancellable,
++                       GAsyncReadyCallback callback,
++                       gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_ctrl_out_async);
++
++    if (h == NULL || (data_len > 0 && data == NULL)) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "verimark_ctrl_out_async: invalid arg");
++        g_object_unref(task);
++        return;
++    }
++
++    VerimarkCtrlAsyncCtx *ctx = g_new0(VerimarkCtrlAsyncCtx, 1);
++    g_task_set_task_data(task, ctx, g_free);
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_usb_device_control_transfer_async(
++        dev,
++        G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        bRequest, wValue, wIndex,
++        (guint8 *)data, data_len,
++        timeout_ms,
++        cancellable,
++        verimark_ctrl_xfer_async_cb, task);
++}
++
++
++VerimarkResult
++verimark_ctrl_out_finish(GAsyncResult *res, GError **error)
++{
++    g_return_val_if_fail(G_IS_TASK(res), VERIMARK_ERR_INVALID_ARG);
++    GTask *task = G_TASK(res);
++    if (g_task_propagate_boolean(task, error)) {
++        VerimarkCtrlAsyncCtx *ctx = g_task_get_task_data(task);
++        /* OUT : require that ALL bytes were sent (short transfer = error). */
++        if (ctx == NULL)
++            return VERIMARK_ERR_TRANSPORT;
++        return VERIMARK_OK;
++    }
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++
++void
++verimark_ctrl_in_async(VerimarkUsbHandle *h,
++                      uint8_t bRequest,
++                      uint16_t wValue,
++                      uint16_t wIndex,
++                      uint8_t *data,
++                      size_t data_size,
++                      unsigned timeout_ms,
++                      GCancellable *cancellable,
++                      GAsyncReadyCallback callback,
++                      gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_ctrl_in_async);
++
++    if (h == NULL || data == NULL || data_size == 0) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "verimark_ctrl_in_async: invalid arg");
++        g_object_unref(task);
++        return;
++    }
++
++    VerimarkCtrlAsyncCtx *ctx = g_new0(VerimarkCtrlAsyncCtx, 1);
++    g_task_set_task_data(task, ctx, g_free);
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_usb_device_control_transfer_async(
++        dev,
++        G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        bRequest, wValue, wIndex,
++        data, data_size,
++        timeout_ms,
++        cancellable,
++        verimark_ctrl_xfer_async_cb, task);
++}
++
++
++VerimarkResult
++verimark_ctrl_in_finish(GAsyncResult *res, size_t *out_received,
++                       GError **error)
++{
++    g_return_val_if_fail(G_IS_TASK(res), VERIMARK_ERR_INVALID_ARG);
++    GTask *task = G_TASK(res);
++    if (g_task_propagate_boolean(task, error)) {
++        VerimarkCtrlAsyncCtx *ctx = g_task_get_task_data(task);
++        if (ctx == NULL)
++            return VERIMARK_ERR_TRANSPORT;
++        if (out_received)
++            *out_received = (size_t)(ctx->bytes_transferred < 0
++                                       ? 0 : ctx->bytes_transferred);
++        return VERIMARK_OK;
++    }
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++
++/* --- transceive_async : chain OUT then IN ---------------------------- */
++
++typedef struct {
++    VerimarkUsbHandle *h;
++    uint8_t  *resp;
++    size_t    resp_size;
++    size_t    resp_len;
++    unsigned  timeout_ms;
++    GCancellable *cancellable;
++    /* The aligned send buffer we own. */
++    uint8_t  *send_buf;
++    size_t    send_aligned;
++} VerimarkTransceiveAsyncCtx;
++
++
++static void
++verimark_transceive_async_ctx_free(gpointer data)
++{
++    VerimarkTransceiveAsyncCtx *ctx = data;
++    g_free(ctx->send_buf);
++    g_free(ctx);
++}
++
++
++static void
++verimark_transceive_in_cb(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    GTask *task = G_TASK(ud);
++    VerimarkTransceiveAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    gssize n = g_usb_device_control_transfer_finish(G_USB_DEVICE(obj),
++                                                     res, &err);
++    if (err != NULL) {
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    if (n < 0) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "transceive: IN returned %zd", n);
++        g_object_unref(task);
++        return;
++    }
++    ctx->resp_len = (size_t)n;
++    g_task_return_boolean(task, TRUE);
++    g_object_unref(task);
++}
++
++
++static void
++verimark_transceive_out_cb(GObject *obj, GAsyncResult *res, gpointer ud)
++{
++    GTask *task = G_TASK(ud);
++    VerimarkTransceiveAsyncCtx *ctx = g_task_get_task_data(task);
++    GError *err = NULL;
++    gssize n = g_usb_device_control_transfer_finish(G_USB_DEVICE(obj),
++                                                     res, &err);
++    if (err != NULL) {
++        g_task_return_error(task, err);
++        g_object_unref(task);
++        return;
++    }
++    if (n != (gssize)ctx->send_aligned) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                                "transceive: OUT short write %zd / %zu",
++                                n, ctx->send_aligned);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Chain the IN. */
++    GUsbDevice *dev = (GUsbDevice *)ctx->h->native;
++    g_usb_device_control_transfer_async(
++        dev,
++        G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        VERIMARK_REQ_READ, 0, 0,
++        ctx->resp, ctx->resp_size,
++        ctx->timeout_ms,
++        ctx->cancellable,
++        verimark_transceive_in_cb, task);
++}
++
++
++void
++verimark_transceive_async(VerimarkUsbHandle *h,
++                          const uint8_t *data,
++                          size_t data_len,
++                          uint8_t *resp,
++                          size_t resp_size,
++                          unsigned timeout_ms,
++                          GCancellable *cancellable,
++                          GAsyncReadyCallback callback,
++                          gpointer user_data)
++{
++    GTask *task = g_task_new(NULL, cancellable, callback, user_data);
++    g_task_set_source_tag(task, verimark_transceive_async);
++
++    if (h == NULL || data == NULL || data_len == 0 || resp == NULL) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "verimark_transceive_async: invalid arg");
++        g_object_unref(task);
++        return;
++    }
++    /* Single-chunk only — multi-chunk fragmentation is the sync path's
++     * job, and no observed Tudor opcode exceeds the chunk size. */
++    if (data_len > VERIMARK_CHUNK_SIZE) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                                "transceive_async: frame too large (%zu > %u)",
++                                data_len, VERIMARK_CHUNK_SIZE);
++        g_object_unref(task);
++        return;
++    }
++
++    /* Build aligned send buffer. The caller's `data` does NOT need to
++     * outlive this call — we copy into our heap-owned send_buf. */
++    size_t aligned = verimark_align_up(data_len);
++    VerimarkTransceiveAsyncCtx *ctx = g_new0(VerimarkTransceiveAsyncCtx, 1);
++    ctx->h = h;
++    ctx->resp = resp;
++    ctx->resp_size = resp_size;
++    ctx->timeout_ms = timeout_ms;
++    ctx->cancellable = cancellable;
++    ctx->send_aligned = aligned;
++    ctx->send_buf = g_malloc0(aligned);
++    memcpy(ctx->send_buf, data, data_len);
++    g_task_set_task_data(task, ctx, verimark_transceive_async_ctx_free);
++
++    uint16_t wvalue = verimark_compute_wvalue_write(data_len);
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_usb_device_control_transfer_async(
++        dev,
++        G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++        G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++        G_USB_DEVICE_RECIPIENT_DEVICE,
++        VERIMARK_REQ_WRITE, wvalue, 0,
++        ctx->send_buf, aligned,
++        timeout_ms,
++        cancellable,
++        verimark_transceive_out_cb, task);
++}
++
++
++VerimarkResult
++verimark_transceive_finish(GAsyncResult *res, size_t *out_resp_len,
++                          GError **error)
++{
++    g_return_val_if_fail(G_IS_TASK(res), VERIMARK_ERR_INVALID_ARG);
++    GTask *task = G_TASK(res);
++    if (g_task_propagate_boolean(task, error)) {
++        VerimarkTransceiveAsyncCtx *ctx = g_task_get_task_data(task);
++        if (ctx == NULL)
++            return VERIMARK_ERR_TRANSPORT;
++        if (out_resp_len)
++            *out_resp_len = ctx->resp_len;
++        return VERIMARK_OK;
++    }
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++
+ #endif /* VERIMARK_HAVE_LIBGUSB */
+ 
+ 
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+index 3bf7f12..a501e47 100644
+--- a/libfprint/drivers/verimark/transport.h
++++ b/libfprint/drivers/verimark/transport.h
+@@ -184,6 +184,102 @@ VerimarkUsbHandle *verimark_handle_new(void *native);
+ void verimark_handle_free(VerimarkUsbHandle *h);
+ 
+ 
++/* --- Async transport (libgusb only — gated by VERIMARK_HAVE_LIBGUSB) -----
++ *
++ * Phase 10.3.a foundation : non-blocking variants of ctrl_out / ctrl_in /
++ * transceive that integrate with the libfprint GMainLoop. The sync variants
++ * above are KEPT compilable in parallel — they are still used by the
++ * standalone test build and by the (legacy) bootstrap orchestrator until
++ * 10.3.c migrates it to async too.
++ *
++ * Standard GAsyncReadyCallback convention :
++ *   - `_async()` returns immediately and arranges for `callback` to be
++ *     invoked on the GMainLoop once the operation completes (success OR
++ *     failure OR cancellation).
++ *   - Inside the callback, call the matching `_finish()` to extract the
++ *     result.
++ *
++ * Caller responsibility :
++ *   - For `_out_async`, the `data` buffer MUST remain valid until the
++ *     callback fires.
++ *   - For `_in_async`, the `data` output buffer MUST remain valid until
++ *     the callback fires.
++ *   - `cancellable` may be NULL ; if non-NULL, cancelling it during the
++ *     transfer fires the callback with G_IO_ERROR_CANCELLED.
++ */
++
++#ifdef VERIMARK_HAVE_LIBGUSB
++#include <gio/gio.h>
++
++void verimark_ctrl_out_async(VerimarkUsbHandle *h,
++                             uint8_t bRequest,
++                             uint16_t wValue,
++                             uint16_t wIndex,
++                             const uint8_t *data,
++                             size_t data_len,
++                             unsigned timeout_ms,
++                             GCancellable *cancellable,
++                             GAsyncReadyCallback callback,
++                             gpointer user_data);
++
++/**
++ * Returns VERIMARK_OK on success ; on failure populates `*error` (if
++ * non-NULL) with a G_IO_ERROR_* or VERIMARK_ERR_* code and returns the
++ * matching VerimarkResult.
++ */
++VerimarkResult verimark_ctrl_out_finish(GAsyncResult *res, GError **error);
++
++
++void verimark_ctrl_in_async(VerimarkUsbHandle *h,
++                            uint8_t bRequest,
++                            uint16_t wValue,
++                            uint16_t wIndex,
++                            uint8_t *data,
++                            size_t data_size,
++                            unsigned timeout_ms,
++                            GCancellable *cancellable,
++                            GAsyncReadyCallback callback,
++                            gpointer user_data);
++
++/**
++ * On success populates `*out_received` with the byte count actually
++ * received. Returns VERIMARK_OK ; on failure populates `*error`.
++ */
++VerimarkResult verimark_ctrl_in_finish(GAsyncResult *res,
++                                       size_t *out_received,
++                                       GError **error);
++
++
++/**
++ * Async equivalent of `verimark_transceive` : chains an OUT then an IN
++ * via the SYNAPTICS wValue formula and 8-byte alignment, fires
++ * `callback` once the IN completes.
++ *
++ * Caveat : the current implementation supports only single-chunk frames
++ * (data_len <= VERIMARK_CHUNK_SIZE = 4096 bytes). All Tudor opcodes
++ * observed runtime fit. A multi-chunk async version can be added later
++ * if needed.
++ *
++ * `data` MUST remain valid until the callback fires (the function does
++ * NOT copy it).
++ */
++void verimark_transceive_async(VerimarkUsbHandle *h,
++                               const uint8_t *data,
++                               size_t data_len,
++                               uint8_t *resp,
++                               size_t resp_size,
++                               unsigned timeout_ms,
++                               GCancellable *cancellable,
++                               GAsyncReadyCallback callback,
++                               gpointer user_data);
++
++VerimarkResult verimark_transceive_finish(GAsyncResult *res,
++                                          size_t *out_resp_len,
++                                          GError **error);
++
++#endif /* VERIMARK_HAVE_LIBGUSB */
++
++
+ #ifdef __cplusplus
+ }
+ #endif

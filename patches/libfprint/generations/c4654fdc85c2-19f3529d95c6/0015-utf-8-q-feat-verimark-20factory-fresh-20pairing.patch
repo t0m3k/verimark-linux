@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 14:01:44 +0200
+Subject: [PATCH 15/31] =?UTF-8?q?feat(verimark):=20factory-fresh=20pairing?=
+ =?UTF-8?q?=20bootstrap=20=E2=80=94=20step=202=20(crypto+orchestrator+hook?=
+ =?UTF-8?q?)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 10.5 step 2 : add the crypto half + USB orchestrator to bootstrap.{h,c}
+and hook auto-bootstrap into verimark_open() behind an explicit opt-in.
+
+New APIs (gated `#ifndef VERIMARK_STANDALONE` so the standalone test
+suite stays crypto-free) :
+
+- verimark_bootstrap_generate_keypair() — getentropy(32) + ecc_p256_derive_pubkey
+- verimark_bootstrap_pair()             — end-to-end orchestrator :
+    1. keygen
+    2. wire_cert with placeholder sig
+    3. ECDSA-P256 sign cert[0..142] via verimark_ecdsa_p256_sha256_sign
+    4. rebuild wire_cert with real DER sig
+    5. send 0x93 || wire_cert (401 B OUT) via verimark_transceive
+    6. parse 802 B response
+    7. build 1284 B sub1 TLV
+
+Result codes distinguish entropy / crypto / transport / response-size /
+refused (sensor already paired, status != 0x0000).
+
+Open() integration : when find_sub1_path() returns NULL, try bootstrap
+behind two opt-in guards :
+  - env var       VERIMARK_ALLOW_BOOTSTRAP=1
+  - marker file   /var/lib/fprint/verimark/.allow_bootstrap
+
+On success the sub1 is written atomically (tmp + rename) to
+/var/lib/fprint/verimark/sub1.bin, owned root:root mode 0600. The
+warning log advises deleting the marker after first bootstrap so
+subsequent opens can't accidentally re-pair.
+
+DESTRUCTIVE on the sensor — overwrites any existing pairing slot —
+hence the explicit opt-in. Sensor-side TOFU model means subsequent
+0x93 attempts against an already-paired sensor return a non-zero
+status which we surface in the log without retrying.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/bootstrap.c | 168 +++++++++++++++++++++++++
+ libfprint/drivers/verimark/bootstrap.h |  69 ++++++++++
+ libfprint/drivers/verimark/verimark.c  |  90 ++++++++++++-
+ 3 files changed, 326 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/verimark/bootstrap.c b/libfprint/drivers/verimark/bootstrap.c
+index d2e96fb..7b568ed 100644
+--- a/libfprint/drivers/verimark/bootstrap.c
++++ b/libfprint/drivers/verimark/bootstrap.c
+@@ -6,9 +6,23 @@
+  * orchestrator that wraps the 0x93 USB exchange.
+  */
+ 
++/* getentropy(3) requires _DEFAULT_SOURCE under -std=c11. Must be
++ * defined BEFORE any system header. */
++#define _DEFAULT_SOURCE 1
++
+ #include "bootstrap.h"
+ 
+ #include <string.h>
++#include <unistd.h>     /* getentropy */
++
++/* The crypto + transport halves of this module are only built into the
++ * fork (which has gnutls + transport.h available). The standalone
++ * test build skips them via the VERIMARK_STANDALONE define so the
++ * pure builders above stay unit-testable without crypto deps. */
++#ifndef VERIMARK_STANDALONE
++#include "crypto.h"
++#include "transport.h"
++#endif
+ 
+ 
+ /* --- Little-endian writers --------------------------------------------- */
+@@ -287,3 +301,157 @@ bool verimark_bootstrap_serialize_sub1(
+     memset(priv_le, 0, sizeof(priv_le));
+     return true;
+ }
++
++
++/* ===================================================================== */
++/* Step 2 : crypto + transport. Skipped in standalone test builds.       */
++/* ===================================================================== */
++
++#ifndef VERIMARK_STANDALONE
++
++
++/* --- P-256 keypair generation ----------------------------------------- */
++
++bool verimark_bootstrap_generate_keypair(
++    uint8_t out_priv_be[VERIMARK_BOOTSTRAP_P256_PRIV_LEN],
++    uint8_t out_pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    uint8_t out_pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN])
++{
++    if (!out_priv_be || !out_pubkey_x_be || !out_pubkey_y_be)
++        return false;
++
++    /* Loop until derive_pubkey succeeds. getentropy returns uniformly
++     * over 2^256 ; the probability that priv >= N or priv == 0 is
++     * negligible (~1 in 2^128) but we still retry for correctness. */
++    for (int retry = 0; retry < 8; retry++) {
++        if (getentropy(out_priv_be, VERIMARK_BOOTSTRAP_P256_PRIV_LEN) != 0)
++            return false;
++        if (verimark_ecc_p256_derive_pubkey(out_priv_be,
++                                            out_pubkey_x_be,
++                                            out_pubkey_y_be)
++            == VERIMARK_CRYPTO_OK)
++            return true;
++    }
++    return false;
++}
++
++
++/* --- 0x93 wire transaction -------------------------------------------- */
++
++#define BOOTSTRAP_PAIR_OPCODE 0x93u
++
++VerimarkBootstrapResult
++verimark_bootstrap_pair(VerimarkUsbHandle *transport,
++                        uint16_t sensor_id_short,
++                        unsigned timeout_ms,
++                        uint8_t out_sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE],
++                        uint16_t *out_status)
++{
++    if (!transport || !out_sub1)
++        return VERIMARK_BOOTSTRAP_ERR_INVALID_ARG;
++    if (out_status)
++        *out_status = 0xffff;
++
++    /* === 1. Generate keypair ========================================= */
++    uint8_t priv_be[VERIMARK_BOOTSTRAP_P256_PRIV_LEN];
++    uint8_t pub_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN];
++    uint8_t pub_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN];
++    if (!verimark_bootstrap_generate_keypair(priv_be, pub_x_be, pub_y_be))
++        return VERIMARK_BOOTSTRAP_ERR_ENTROPY;
++
++    /* === 2. Build wire cert with placeholder sig + real sig ========== */
++    /* Use a 1-byte placeholder signature so the wire-format cert
++     * builder can compute the layout. Bytes [0..142] include magic +
++     * sensor_id + pubkey coords + the sig-tag header — all stable
++     * before the actual signature bytes — so signing this slice
++     * yields the same result whether the placeholder is 1 byte or 70. */
++    static const uint8_t placeholder_sig[1] = { 0x00 };
++    uint8_t wire_cert[VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    if (!verimark_bootstrap_build_wire_cert(sensor_id_short,
++                                             pub_x_be, pub_y_be,
++                                             placeholder_sig, 1,
++                                             wire_cert, sizeof(wire_cert))) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_CRYPTO;
++    }
++
++    /* Sign wire_cert[0..142] = SHA-256 then ECDSA-P256. */
++    uint8_t der_sig[80];
++    size_t der_sig_len = 0;
++    if (verimark_ecdsa_p256_sha256_sign(priv_be,
++                                         wire_cert, 142,
++                                         der_sig, sizeof(der_sig),
++                                         &der_sig_len)
++        != VERIMARK_CRYPTO_OK)
++    {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_CRYPTO;
++    }
++
++    /* Rebuild wire_cert with the real signature. */
++    if (!verimark_bootstrap_build_wire_cert(sensor_id_short,
++                                             pub_x_be, pub_y_be,
++                                             der_sig, der_sig_len,
++                                             wire_cert, sizeof(wire_cert))) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_CRYPTO;
++    }
++
++    /* === 3. Send 0x93 || wire_cert (401 B OUT) ======================= */
++    uint8_t out_buf[1 + VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE];
++    out_buf[0] = BOOTSTRAP_PAIR_OPCODE;
++    memcpy(out_buf + 1, wire_cert, VERIMARK_BOOTSTRAP_CLIENT_CERT_SIZE);
++
++    uint8_t resp_buf[VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE + 64];
++    size_t resp_len = 0;
++    VerimarkResult tr = verimark_transceive(transport,
++                                            out_buf, sizeof(out_buf),
++                                            resp_buf, sizeof(resp_buf),
++                                            &resp_len, timeout_ms);
++    if (tr != VERIMARK_OK) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_TRANSPORT;
++    }
++    if (resp_len != VERIMARK_BOOTSTRAP_PAIR_RESPONSE_SIZE) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_RESPONSE_SIZE;
++    }
++
++    /* === 4. Parse response =========================================== */
++    VerimarkBootstrapPairResponse parsed;
++    uint16_t status = 0xffff;
++    bool ok = verimark_bootstrap_parse_pair_response(
++        resp_buf, resp_len, &parsed, &status);
++    if (out_status)
++        *out_status = status;
++    if (!ok) {
++        memset(priv_be, 0, sizeof(priv_be));
++        /* Non-zero status = sensor refused (typically already paired). */
++        return (status != 0x0000) ? VERIMARK_BOOTSTRAP_ERR_REFUSED
++                                  : VERIMARK_BOOTSTRAP_ERR_RESPONSE_SIZE;
++    }
++
++    /* === 5. Build sub1 TLV =========================================== */
++    uint8_t p256_blob[VERIMARK_BOOTSTRAP_P256_PARAMS_SIZE];
++    if (!verimark_bootstrap_build_p256_params_blob(p256_blob,
++                                                    sizeof(p256_blob))) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_CRYPTO;
++    }
++    if (!verimark_bootstrap_serialize_sub1(parsed.client_cert_storage,
++                                            priv_be,
++                                            parsed.server_cert,
++                                            p256_blob,
++                                            out_sub1,
++                                            VERIMARK_BOOTSTRAP_SUB1_SIZE)) {
++        memset(priv_be, 0, sizeof(priv_be));
++        return VERIMARK_BOOTSTRAP_ERR_INVALID_ARG;
++    }
++
++    /* Wipe the private scalar from memory. */
++    memset(priv_be, 0, sizeof(priv_be));
++    return VERIMARK_BOOTSTRAP_OK;
++}
++
++
++#endif /* !VERIMARK_STANDALONE */
+diff --git a/libfprint/drivers/verimark/bootstrap.h b/libfprint/drivers/verimark/bootstrap.h
+index cec79e7..a9fa034 100644
+--- a/libfprint/drivers/verimark/bootstrap.h
++++ b/libfprint/drivers/verimark/bootstrap.h
+@@ -181,6 +181,75 @@ bool verimark_bootstrap_serialize_sub1(
+     uint8_t *out, size_t out_size);
+ 
+ 
++/* --- Crypto wrappers (Step 2, behind VERIMARK_BOOTSTRAP_HAVE_CRYPTO) --- */
++
++/**
++ * Generate a fresh P-256 keypair host-side : draw 32 bytes from
++ * getentropy(3), interpret as a big-endian private scalar, derive
++ * the matching public point via k*G on secp256r1.
++ *
++ * The private scalar IS validated against 1 <= k < N-1 by retrying
++ * (getentropy is uniform over 256 bits ; the rejection probability is
++ * negligible, but we still loop to stay safe).
++ *
++ * Returns FALSE if entropy is unavailable (no Linux system in practice).
++ */
++bool verimark_bootstrap_generate_keypair(
++    uint8_t out_priv_be[VERIMARK_BOOTSTRAP_P256_PRIV_LEN],
++    uint8_t out_pubkey_x_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN],
++    uint8_t out_pubkey_y_be[VERIMARK_BOOTSTRAP_P256_COORD_LEN]);
++
++
++/* --- Transport / orchestrator (Step 2) -------------------------------- */
++
++/* Forward declaration so callers can pass a handle without pulling all
++ * of transport.h in. */
++typedef struct VerimarkUsbHandle VerimarkUsbHandle;
++
++
++typedef enum {
++    VERIMARK_BOOTSTRAP_OK = 0,
++    VERIMARK_BOOTSTRAP_ERR_ENTROPY,        /* getentropy failed */
++    VERIMARK_BOOTSTRAP_ERR_CRYPTO,         /* sign / derive_pubkey failed */
++    VERIMARK_BOOTSTRAP_ERR_TRANSPORT,      /* USB write/read failure */
++    VERIMARK_BOOTSTRAP_ERR_RESPONSE_SIZE,  /* response not 802 bytes */
++    VERIMARK_BOOTSTRAP_ERR_REFUSED,        /* sensor returned non-zero status */
++    VERIMARK_BOOTSTRAP_ERR_INVALID_ARG,
++} VerimarkBootstrapResult;
++
++
++/**
++ * End-to-end factory-fresh pairing — DESTRUCTIVE on the sensor.
++ *
++ * Steps :
++ *   1. Generate fresh P-256 keypair host-side.
++ *   2. Build wire_cert with a placeholder signature so the sign-input
++ *      bytes are stable, then sign cert[0..142] and rebuild with the
++ *      real DER signature.
++ *   3. Send `0x93 || wire_cert` (401 B OUT) via the vendor transport
++ *      and read the 802 B response.
++ *   4. Parse the response (status header + storage_cert + server_cert).
++ *   5. Build the full 1284 B sub1 TLV blob.
++ *
++ * Pre-condition : the USB device must already be claimed and the init
++ * sequence (verimark_init_sequence) must have run. The TLS session is
++ * NOT involved — this is pre-handshake.
++ *
++ * `out_sub1` is the persisted blob (write to /var/lib/fprint/verimark/
++ * sub1.bin atomically before declaring success).
++ *
++ * `out_status` is populated regardless of return code so the caller
++ * can distinguish "sensor refused (already paired)" from "transport
++ * failure".
++ */
++VerimarkBootstrapResult
++verimark_bootstrap_pair(VerimarkUsbHandle *transport,
++                        uint16_t sensor_id_short,
++                        unsigned timeout_ms,
++                        uint8_t out_sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE],
++                        uint16_t *out_status);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 2e9d27c..6b7810a 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -38,6 +38,7 @@
+ #include "capture.h"
+ #include "match.h"
+ #include "enroll.h"
++#include "bootstrap.h"
+ 
+ #define FP_COMPONENT "verimark"
+ #include "fpi-log.h"
+@@ -258,6 +259,89 @@ static gchar *find_sub1_path(FpiDeviceVerimark *self)
+ }
+ 
+ 
++/**
++ * Bootstrap a factory-fresh sensor : run the 0x93 DoPairBasic
++ * exchange, persist the resulting sub1 blob atomically, and return
++ * the path it was written to. Returns NULL on any failure (entropy,
++ * crypto, transport, sensor refusal) — caller falls back to cleartext
++ * mode without a fatal error.
++ *
++ * GUARDED by either :
++ *   - environment variable VERIMARK_ALLOW_BOOTSTRAP=1
++ *   - marker file        /var/lib/fprint/verimark/.allow_bootstrap
++ *
++ * Bootstrap is DESTRUCTIVE (rewrites the sensor's pairing slot) so we
++ * require explicit opt-in. Once a sub1 exists the marker can be
++ * deleted ; the file is not read again.
++ */
++static gchar *
++verimark_try_bootstrap(FpiDeviceVerimark *self)
++{
++    const gchar *env = g_getenv("VERIMARK_ALLOW_BOOTSTRAP");
++    gboolean env_ok  = (env && g_strcmp0(env, "1") == 0);
++    gboolean file_ok = g_file_test("/var/lib/fprint/verimark/.allow_bootstrap",
++                                    G_FILE_TEST_EXISTS);
++    if (!env_ok && !file_ok) {
++        fp_warn("verimark: bootstrap skipped — set "
++                "VERIMARK_ALLOW_BOOTSTRAP=1 or create "
++                "/var/lib/fprint/verimark/.allow_bootstrap to opt in");
++        return NULL;
++    }
++
++    fp_warn("verimark: bootstrap ENABLED — running 0x93 DoPairBasic "
++            "(DESTRUCTIVE)");
++
++    uint8_t sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE];
++    uint16_t status = 0xffff;
++    VerimarkBootstrapResult r = verimark_bootstrap_pair(
++        self->transport,
++        VERIMARK_BOOTSTRAP_DEFAULT_SENSOR_ID_SHORT,
++        /*timeout_ms=*/ 5000,
++        sub1, &status);
++    if (r != VERIMARK_BOOTSTRAP_OK) {
++        fp_warn("verimark: bootstrap failed (code=%d, status=0x%04x) — "
++                "sensor may already be paired ; falling back to cleartext",
++                r, status);
++        memset(sub1, 0, sizeof(sub1));
++        return NULL;
++    }
++
++    /* Atomic write : tmp + rename. */
++    const gchar *system_dir = "/var/lib/fprint/verimark";
++    if (g_mkdir_with_parents(system_dir, 0700) != 0) {
++        fp_warn("verimark: bootstrap mkdir(%s) failed", system_dir);
++        memset(sub1, 0, sizeof(sub1));
++        return NULL;
++    }
++    g_autofree gchar *tmp_path  = g_strdup_printf("%s/sub1.bin.tmp", system_dir);
++    g_autofree gchar *final_path = g_strdup_printf("%s/sub1.bin", system_dir);
++
++    GError *werr = NULL;
++    if (!g_file_set_contents(tmp_path, (const gchar *)sub1,
++                              VERIMARK_BOOTSTRAP_SUB1_SIZE, &werr)) {
++        fp_warn("verimark: bootstrap write %s failed: %s", tmp_path,
++                werr ? werr->message : "?");
++        if (werr) g_error_free(werr);
++        memset(sub1, 0, sizeof(sub1));
++        return NULL;
++    }
++    g_chmod(tmp_path, 0600);
++    if (g_rename(tmp_path, final_path) != 0) {
++        fp_warn("verimark: bootstrap rename(%s → %s) failed",
++                tmp_path, final_path);
++        memset(sub1, 0, sizeof(sub1));
++        return NULL;
++    }
++
++    fp_warn("verimark: bootstrap SUCCEEDED — sub1 written to %s "
++            "(1284 B). You can now `rm "
++            "/var/lib/fprint/verimark/.allow_bootstrap` to lock pairing.",
++            final_path);
++    memset(sub1, 0, sizeof(sub1));
++    return g_strdup(final_path);
++}
++
++
+ static void verimark_open(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+@@ -299,7 +383,11 @@ static void verimark_open(FpDevice *device)
+      * succeeds so probe-level introspection keeps working. */
+     g_autofree gchar *sub1_path = find_sub1_path(self);
+     if (!sub1_path) {
+-        fp_warn("verimark: no sub1 found in /var/lib/fprintd/verimark/ ; "
++        /* Factory-fresh sensor — try bootstrap (gated by env / marker). */
++        sub1_path = verimark_try_bootstrap(self);
++    }
++    if (!sub1_path) {
++        fp_warn("verimark: no sub1 found in /var/lib/fprint/verimark/ ; "
+                 "device opens in cleartext-only mode (no TLS session)");
+         fpi_device_open_complete(device, NULL);
+         return;

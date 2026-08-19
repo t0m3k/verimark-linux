@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 17:22:55 +0200
+Subject: [PATCH 25/62] =?UTF-8?q?feat(verimark):=20Phase=2010.3.g=20?=
+ =?UTF-8?q?=E2=80=94=20async=20open()=20handshake=20wiring?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wire `verimark_handshake_perform_async()` (Phase 10.3.c) into the
+`verimark_open()` vfunc. The GMainLoop now stays unblocked during
+the two USB round-trips of the TLS handshake (~30-50 ms : CH→SH,
+flight2→server_resp).
+
+Architecture :
+- Sync prelude in open() : USB reset + 300 ms settle + claim_interface
+  + init_sequence (2 ctrl transfers ~10 ms) + sub1 file load +
+  optional bootstrap. Total ~50-100 ms, dominated by the intentional
+  300 ms reset settle — not a GMainLoop concern.
+- Heap-owned `VerimarkOpenCtx` with deep-copied `VerimarkPairingData`
+  (SECRET, zeroed on free).
+- Async handshake fired with the ctx as user_data. Callback
+  `verimark_open_handshake_done` :
+  - On HANDSHAKE_OK : set `session_active = TRUE`, wipe ctx, call
+    `fpi_device_open_complete`.
+  - On HANDSHAKE_ERR_SERVER_ALERT (and `!attempted_recovery`) : send
+    plaintext close_notify (7 bytes sync — no keys needed per
+    RFC 5246 §7.2.1) + drain, set `attempted_recovery = TRUE`, re-fire
+    `verimark_handshake_perform_async`. The recovery write/drain
+    stays sync : two tiny control transfers (~5 ms each) don't
+    justify another async chain.
+  - On any other failure : log, leave `session_active = FALSE`, call
+    `open_complete` with NULL error (consistent with the sync code).
+
+No fpi_ssm here : just a single async chain with at most one retry.
+The retry-recovery loop is gated by `attempted_recovery` so we can't
+infinitely re-fire on persistent TLS Alerts.
+
+Caveat : the bootstrap path (factory-fresh pairing generation) is
+left sync. It's a rare branch (only on first-time setup with no sub1
+file) and the keypair generation + signing dominates wall time anyway.
+
+Builds clean (zero warnings) against libfprint 1.94.10 / libgusb
+0.4.9 on NixOS. 11 standalone TDD suites stay green.
+
+Runtime validation pending : nixos-rebuild + fprintd-list + fprintd-
+verify should all succeed with the same UX as before, just with
+the GMainLoop responsive during open() instead of blocking ~50 ms.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/verimark.c | 169 +++++++++++++++++++-------
+ 1 file changed, 123 insertions(+), 46 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 3bfc339..8c98f93 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -356,6 +356,109 @@ verimark_try_bootstrap(FpiDeviceVerimark *self)
+ }
+ 
+ 
++/* ========================================================================
++ * Phase 10.3.g — async open()
++ * ========================================================================
++ *
++ * Wires `verimark_handshake_perform_async()` (Phase 10.3.c) into the
++ * open() vfunc. The handshake's two USB round-trips (ClientHello→ServerHello,
++ * flight2→server_resp) no longer block the GMainLoop. Stale-state
++ * recovery (plaintext close_notify + drain + retry handshake) is also
++ * chained through the same callback, gated by a `attempted_recovery`
++ * flag to prevent infinite retry loops.
++ *
++ * The non-handshake parts of open() stay sync : USB reset (kernel call,
++ * fast), claim_interface, init sequence (2 small USB transfers), sub1
++ * file load, and the optional bootstrap path. Total ~50-100 ms across
++ * those, dominated by the intentional 300 ms reset settle. The big win
++ * is the handshake itself (~30-50 ms of USB I/O that used to block).
++ */
++
++typedef struct {
++    FpiDeviceVerimark   *self;
++    VerimarkPairingData  pairing;          /* heap-owned ; SECRET — wiped on free */
++    gboolean             attempted_recovery;
++} VerimarkOpenCtx;
++
++
++static void
++verimark_open_ctx_free(VerimarkOpenCtx *ctx)
++{
++    if (ctx == NULL)
++        return;
++    verimark_pairing_data_zero(&ctx->pairing);
++    g_free(ctx);
++}
++
++
++static void
++verimark_open_handshake_done(GObject *src, GAsyncResult *res, gpointer ud)
++{
++    (void)src;
++    VerimarkOpenCtx *ctx = ud;
++    FpDevice *device = FP_DEVICE(ctx->self);
++    GError *err = NULL;
++    VerimarkHandshakeResult hr = verimark_handshake_perform_finish(
++        res, &ctx->self->session, &err);
++
++    /* Stale TLS state recovery (Python-style, mirror match.py
++     * `_try_clear_stale_tls_state`). If the sensor's reply to our
++     * ClientHello is a TLS Alert instead of a ServerHello, it still
++     * thinks the previous session is alive — typically because the
++     * previous Linux process exited without sending close_notify.
++     *
++     * Send a plaintext close_notify (7 bytes, no keys needed — RFC 5246
++     * §7.2.1 allows this since we don't have session keys yet) to make
++     * the sensor drop its session state, then retry the handshake once.
++     *
++     * The recovery write/drain stays sync : it's two tiny control
++     * transfers (~5 ms each) and doesn't justify another async chain.
++     * The retry handshake itself goes through `_async` again, so the
++     * GMainLoop unblocks for the heavy stage. */
++    if (hr == VERIMARK_HANDSHAKE_ERR_SERVER_ALERT && !ctx->attempted_recovery) {
++        fp_warn("verimark: handshake got TLS Alert ; clearing stale state + retry");
++        if (err) g_clear_error(&err);
++
++        VerimarkTransportIoCtx io_ctx = { .h = ctx->self->transport, .timeout_ms = 3000 };
++        VerimarkTransportIO io;
++        verimark_transport_io_bind(&io, &io_ctx);
++        static const uint8_t plain_close_notify[7] = {
++            0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00
++        };
++        io.write(io.ctx, plain_close_notify,
++                 sizeof(plain_close_notify), /*is_handshake=*/true);
++        uint8_t drain[64];
++        size_t drain_len = 0;
++        io.read(io.ctx, drain, sizeof(drain), &drain_len);
++        verimark_session_zero(&ctx->self->session);
++
++        ctx->attempted_recovery = TRUE;
++        verimark_handshake_perform_async(
++            ctx->self->transport, /*timeout_ms*/ 5000,
++            &ctx->pairing, /*repro_or_null*/ NULL,
++            /*cancellable*/ NULL,
++            verimark_open_handshake_done, ctx);
++        return;
++    }
++
++    if (hr == VERIMARK_HANDSHAKE_OK) {
++        if (ctx->attempted_recovery)
++            fp_info("verimark: stale-state recovery succeeded");
++        ctx->self->session_active = TRUE;
++        fp_dbg("verimark: TLS session established");
++    } else {
++        fp_warn("verimark: TLS handshake failed (%d) ; AppData commands disabled",
++                (int)hr);
++        verimark_session_zero(&ctx->self->session);
++        ctx->self->session_active = FALSE;
++        if (err) g_clear_error(&err);
++    }
++
++    verimark_open_ctx_free(ctx);
++    fpi_device_open_complete(device, NULL);
++}
++
++
+ static void verimark_open(FpDevice *device)
+ {
+     G_DEBUG_HERE();
+@@ -407,58 +510,32 @@ static void verimark_open(FpDevice *device)
+         return;
+     }
+ 
+-    VerimarkPairingData pairing;
+-    if (!verimark_pairing_load_from_file(sub1_path, &pairing)) {
++    /* Load pairing into a stack-local first, then deep-copy into the
++     * heap-owned `ctx->pairing`. The async handshake itself ALSO does
++     * a deep copy, but we need a copy that survives across the optional
++     * stale-state recovery retry (where we re-fire `_async` with the
++     * same pairing). The local copy is zeroed below as soon as the
++     * heap copy is made. */
++    VerimarkPairingData stack_pairing;
++    if (!verimark_pairing_load_from_file(sub1_path, &stack_pairing)) {
+         fp_warn("verimark: failed to load sub1 from %s", sub1_path);
+         fpi_device_open_complete(device, NULL);
+         return;
+     }
+ 
+-    /* Bind transport_io vtable around our USB handle. */
+-    VerimarkTransportIoCtx io_ctx = { .h = self->transport, .timeout_ms = 3000 };
+-    VerimarkTransportIO io;
+-    verimark_transport_io_bind(&io, &io_ctx);
++    VerimarkOpenCtx *ctx = g_new0(VerimarkOpenCtx, 1);
++    ctx->self = self;
++    ctx->pairing = stack_pairing;     /* deep copy (struct value) */
++    ctx->attempted_recovery = FALSE;
++    verimark_pairing_data_zero(&stack_pairing);
+ 
+-    VerimarkHandshakeResult hr = verimark_handshake_perform(
+-        &io, &pairing, /* repro = */ NULL, &self->session);
+-
+-    /* Stale TLS state recovery (Python-style, cf. match.py
+-     * _try_clear_stale_tls_state). If the sensor's reply to our
+-     * ClientHello is a TLS Alert instead of a ServerHello, it still
+-     * thinks the previous session is alive — typically because the
+-     * previous Linux process exited without sending close_notify.
+-     * Send a plaintext close_notify (7 bytes, no keys needed — RFC 5246
+-     * §7.2.1 allows this since we don't have keys yet) to make the
+-     * sensor drop its session state, then retry the handshake once. */
+-    if (hr == VERIMARK_HANDSHAKE_ERR_SERVER_ALERT) {
+-        fp_warn("verimark: handshake got TLS Alert ; clearing stale state + retry");
+-        static const uint8_t plain_close_notify[7] = {
+-            0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00
+-        };
+-        io.write(io.ctx, plain_close_notify,
+-                 sizeof(plain_close_notify), /*is_handshake=*/true);
+-        uint8_t drain[64];
+-        size_t drain_len = 0;
+-        io.read(io.ctx, drain, sizeof(drain), &drain_len);
+-        verimark_session_zero(&self->session);
+-        hr = verimark_handshake_perform(&io, &pairing, NULL, &self->session);
+-        if (hr == VERIMARK_HANDSHAKE_OK)
+-            fp_info("verimark: stale-state recovery succeeded");
+-    }
+-
+-    /* Wipe the heap copy of pairing immediately. */
+-    verimark_pairing_data_zero(&pairing);
+-
+-    if (hr != VERIMARK_HANDSHAKE_OK) {
+-        fp_warn("verimark: TLS handshake failed (%d) ; AppData commands disabled",
+-                hr);
+-        verimark_session_zero(&self->session);
+-        self->session_active = FALSE;
+-    } else {
+-        self->session_active = TRUE;
+-        fp_dbg("verimark: TLS session established");
+-    }
+-    fpi_device_open_complete(device, NULL);
++    /* Fire the async handshake. The callback will set session_active,
++     * wipe ctx, and call fpi_device_open_complete. */
++    verimark_handshake_perform_async(
++        self->transport, /*timeout_ms*/ 5000,
++        &ctx->pairing, /*repro_or_null*/ NULL,
++        /*cancellable*/ NULL,
++        verimark_open_handshake_done, ctx);
+ }
+ 
+ 

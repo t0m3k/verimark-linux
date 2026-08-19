@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 13:12:17 +0200
+Subject: [PATCH 12/32] fix(verimark): USB-level reset at open() to recover
+ from stuck state
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirrors python/verimark/match.py:reset_dev() which calls dev.reset()
+followed by a 0.3 s sleep at the start of every operation. Without it,
+the C driver inherits any kernel USB driver / sensor firmware state
+left by a previous fprintd that was SIGKILL-ed mid-control-transfer —
+new control transfers then queue without ever completing, and verify
+hangs silently inside the polling loop (the kernel never returns
+LIBUSB_ERROR_TIMEOUT because the URB is still pending).
+
+Runtime symptom on WULFENIX: after a verify or enroll was interrupted
+(Ctrl+C, KDE settings hand-off, etc.), the next fprintd-verify keeps
+the white LED on but the FRAME_READY event never reaches us, and the
+30 s deadline never fires either — the entire driver thread is blocked
+inside the first USB read of the first 0x87 event_read.
+
+g_usb_device_reset is best-effort: failures (no permission, device
+gone) are silently ignored and the downstream claim_interface call
+reports the real error.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index dc7c66c..c12ba77 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -266,6 +266,17 @@ static void verimark_open(FpDevice *device)
+     /* Plain pointer — open_complete steals the GError reference. */
+     GError *error = NULL;
+ 
++    /* USB-level reset before claiming. Mirrors python/verimark/match.py
++     * reset_dev() which does the same. Crucial for robustness across
++     * interrupted previous sessions : if a prior fprintd was SIGKILLed
++     * mid-USB-transfer, the kernel USB driver and/or sensor firmware
++     * can be left in a state where new control transfers queue without
++     * ever completing. A reset clears both ends. Best-effort — if the
++     * reset fails (no permission, device gone), continue and let the
++     * downstream claim_interface report the real error. */
++    g_usb_device_reset(usb, NULL);
++    g_usleep(300 * 1000);   /* 0.3s — same as python reset_dev() */
++
+     if (!g_usb_device_claim_interface(usb, VERIMARK_MI_BIO, 0, &error)) {
+         fpi_device_open_complete(device, error);
+         return;

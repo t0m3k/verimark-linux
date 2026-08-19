@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 11:52:51 +0200
+Subject: [PATCH 07/32] fix(verimark): set enroll_date on list() prints
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Continuation of the fprintd NULL-field crash hunt. fprintd's
+`delete_enrolled_fingers` (called at enroll start when an existing
+print is found for the same finger) logs the print's metadata via
+`g_warning ("Error deleting print from device: %s", err->message)`
+plus other diagnostics that touch every FpPrint field. Backfill
+the enroll-date too — a NULL GDate trips the same strlen-on-NULL
+fault as the username/description fields fixed earlier.
+
+The synthetic date is today; the value is purely a display hint, not
+identity. fprintd overrides it when the print is loaded from disk
+after a real enroll.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 4f28662..d879f3e 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -45,6 +45,7 @@
+ #include <gusb.h>
+ #include <gio/gio.h>
+ #include <string.h>
++#include <time.h>
+ 
+ 
+ struct _FpiDeviceVerimark {
+@@ -1406,6 +1407,15 @@ verimark_print_from_tuid(FpDevice *device,
+     fp_print_set_username(print, "verimark");
+     fp_print_set_description(print, "Kensington VeriMark DT (device-side enrollment)");
+     fp_print_set_finger(print, FP_FINGER_UNKNOWN);
++    /* fprintd logs the enroll-date too — a NULL GDate trips the same
++     * strlen-on-NULL crash. Use today's date as a synthetic stamp ;
++     * the value is only used as a display hint, not as identity. */
++    {
++        GDate *today = g_date_new();
++        g_date_set_time_t(today, time(NULL));
++        fp_print_set_enroll_date(print, today);
++        g_date_free(today);
++    }
+ 
+     return print;
+ }

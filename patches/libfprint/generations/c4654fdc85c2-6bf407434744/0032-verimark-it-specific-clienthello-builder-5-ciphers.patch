@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 08:55:46 +0200
+Subject: [PATCH 32/62] verimark: IT-specific ClientHello builder (5 ciphers,
+ no 0x00a9)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The IT firmware rejects ClientHellos containing cipher 0x00a9 with
+a fatal illegal_parameter Alert. The DT builder
+verimark_tls_build_client_hello advertises 6 ciphers including
+0x00a9 — fine for the DT, not for the IT.
+
+verimark_tls_build_client_hello_it builds the 78-byte IT variant :
+same shape as the DT version, with 5 ciphers (c0 05 c0 2e 00 3d
+00 8d 00 a8) instead of 6. Layout differences :
+
+  record length  0x0049  vs DT 0x004b
+  HS length      0x0045  vs DT 0x0047
+  cs_len         0x000a  vs DT 0x000c
+
+Verbatim against the 2026-06-06 pcap structure (frame 4172 — the
+ClientHello sent by the Windows driver during the captured fresh
+pairing) — runtime-validated end-to-end 2026-06-07 via
+tools/verimark-it/handshake_attempt.py --probe-appdata.
+
+Tests added in test_tls.c (3 new, 18 total green) :
+- build_client_hello_it_byte_by_byte
+- build_client_hello_it_buffer_too_small
+- build_client_hello_it_diff_with_dt (asserts the 5 cipher bytes
+  and that the byte immediately after is comp_meth_len = 0x00, not
+  the dropped 0xa9)
+
+Test vector TV_HS_CLIENT_HELLO_IT_RECORD added to test_vectors.h
+(78 bytes, derived from the DT vector with the 5-cipher layout and
+the same fixed test client_random for reproducibility).
+---
+ libfprint/drivers/verimark/tests/test_tls.c   | 49 +++++++++++++++++++
+ .../drivers/verimark/tests/test_vectors.h     | 12 +++++
+ libfprint/drivers/verimark/tls.c              | 42 ++++++++++++++++
+ libfprint/drivers/verimark/tls.h              | 19 +++++++
+ 4 files changed, 122 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/tests/test_tls.c b/libfprint/drivers/verimark/tests/test_tls.c
+index 64bf67e..7d20cf1 100644
+--- a/libfprint/drivers/verimark/tests/test_tls.c
++++ b/libfprint/drivers/verimark/tests/test_tls.c
+@@ -139,6 +139,52 @@ TEST(build_client_hello_buffer_too_small)
+     return 0;
+ }
+ 
++TEST(build_client_hello_it_byte_by_byte)
++{
++    uint8_t out[128];
++    size_t n = verimark_tls_build_client_hello_it(TV_HS_FIXED_CLIENT_RANDOM,
++                                                  out, sizeof(out));
++    ASSERT_EQ(n, TV_HS_CLIENT_HELLO_IT_RECORD_LEN);
++    ASSERT_MEM_EQ(out, TV_HS_CLIENT_HELLO_IT_RECORD, n);
++    return 0;
++}
++
++TEST(build_client_hello_it_buffer_too_small)
++{
++    uint8_t out[40];
++    size_t n = verimark_tls_build_client_hello_it(TV_HS_FIXED_CLIENT_RANDOM,
++                                                  out, sizeof(out));
++    ASSERT_EQ(n, 0);
++    return 0;
++}
++
++TEST(build_client_hello_it_diff_with_dt)
++{
++    /* The IT and DT records differ only in cs_len (1 byte) + the
++     * presence of cipher 0x00a9 (2 bytes) — total 78 vs 80 bytes. */
++    uint8_t dt[128], it[128];
++    size_t dn = verimark_tls_build_client_hello(TV_HS_FIXED_CLIENT_RANDOM,
++                                                 dt, sizeof(dt));
++    size_t in = verimark_tls_build_client_hello_it(TV_HS_FIXED_CLIENT_RANDOM,
++                                                    it, sizeof(it));
++    ASSERT_EQ(dn, 80);
++    ASSERT_EQ(in, 78);
++    /* Bytes 0..52 are identical except for the length fields at
++     * offsets 3-4 (record), 7-8 (HS) — both shrink by 2 in IT. */
++    /* Verify the IT record does NOT contain the bytes 00 a9 at the
++     * cipher suites offset (offset 53..62 are 5 ciphers = 10 bytes). */
++    /* cipher_suites start at offset 53 (after 5-byte record hdr + 4-byte HS
++     * hdr + 2-byte version + 32-byte random + 1+7 sid + 2-byte cs_len). */
++    static const uint8_t expected_it_ciphers[10] = {
++        0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d, 0x00, 0x8d, 0x00, 0xa8,
++    };
++    ASSERT_MEM_EQ(it + 53, expected_it_ciphers, 10);
++    /* The byte immediately after must NOT be 0xa9 (the dropped cipher)
++     * — it must be the comp_meth_len = 0x00. */
++    ASSERT_EQ(it[63], 0x00);
++    return 0;
++}
++
+ 
+ /* ---- Certificate body builder + wrap as HS msg --------------------------- */
+ 
+@@ -303,6 +349,9 @@ int main(void)
+     RUN(parse_record_body_truncated);
+     RUN(build_client_hello_byte_by_byte);
+     RUN(build_client_hello_buffer_too_small);
++    RUN(build_client_hello_it_byte_by_byte);
++    RUN(build_client_hello_it_buffer_too_small);
++    RUN(build_client_hello_it_diff_with_dt);
+     RUN(build_certificate_body_then_wrap);
+     RUN(build_cke_body_then_wrap);
+     RUN(build_cv_body_then_wrap);
+diff --git a/libfprint/drivers/verimark/tests/test_vectors.h b/libfprint/drivers/verimark/tests/test_vectors.h
+index 8ebceee..7b5ba42 100644
+--- a/libfprint/drivers/verimark/tests/test_vectors.h
++++ b/libfprint/drivers/verimark/tests/test_vectors.h
+@@ -169,6 +169,18 @@ static const uint8_t TV_HS_CLIENT_HELLO_RECORD[80] = {
+     0xa9, 0x00, 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
+ };
+ static const size_t TV_HS_CLIENT_HELLO_RECORD_LEN = 80;
++/* IT variant of the ClientHello (78 octets) — same shape with 5 ciphers
++ * (no 0x00a9) instead of 6. Lengths in the record/HS/cs headers shrink
++ * by 2 bytes. Verbatim from the 2026-06-06 pcap structure with the
++ * fixed test random for reproducibility. */
++static const uint8_t TV_HS_CLIENT_HELLO_IT_RECORD[78] = {
++    0x16, 0x03, 0x03, 0x00, 0x49, 0x01, 0x00, 0x00, 0x45, 0x03, 0x03, 0xeb, 0xfb, 0x32, 0x2e, 0x0d,
++    0xd0, 0x6e, 0xbe, 0x9f, 0x93, 0x22, 0xc1, 0xb8, 0xc6, 0x51, 0x8d, 0x87, 0x50, 0x6a, 0xed, 0xd5,
++    0x1b, 0x83, 0x27, 0xfd, 0xf5, 0xb0, 0xd3, 0x71, 0xd6, 0xb7, 0x12, 0x07, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x0a, 0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d, 0x00, 0x8d, 0x00, 0xa8, 0x00,
++    0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
++};
++static const size_t TV_HS_CLIENT_HELLO_IT_RECORD_LEN = 78;
+ /* Certificate HS msg : type 0x0b + len 3 + body (chain_len + cert_len + magic 0d d0 + cert) */
+ static const uint8_t TV_HS_CERTIFICATE_MSG[412] = {
+     0x0b, 0x00, 0x01, 0x98, 0x00, 0x01, 0x90, 0x00, 0x01, 0x90, 0x0d, 0xd0, 0xa5, 0xa2, 0xab, 0xb0,
+diff --git a/libfprint/drivers/verimark/tls.c b/libfprint/drivers/verimark/tls.c
+index f28dc9d..86f1ead 100644
+--- a/libfprint/drivers/verimark/tls.c
++++ b/libfprint/drivers/verimark/tls.c
+@@ -132,6 +132,48 @@ size_t verimark_tls_build_client_hello(const uint8_t random_32[32],
+ }
+ 
+ 
++size_t verimark_tls_build_client_hello_it(const uint8_t random_32[32],
++                                          uint8_t *out, size_t out_size)
++{
++    /* IT-specific ClientHello layout :
++     *   [5]   TLS record hdr  : 16 03 03 00 49   (len = 73)
++     *   [4]   HS hdr          : 01 00 00 45      (ClientHello, len 69)
++     *   [2]   version         : 03 03
++     *   [32]  random
++     *   [1]   session_id_len  : 07
++     *   [7]   session_id      : 00 × 7
++     *   [2]   cs_len          : 00 0a
++     *   [10]  cipher_suites   : c0 05 c0 2e 00 3d 00 8d 00 a8   (no 00 a9)
++     *   [1]   comp_meth_len   : 00
++     *   [2]   ext_list_len    : 00 0a
++     *   [6]   ext supported_groups : 00 04 00 02 00 17
++     *   [6]   ext ec_point_formats : 00 0b 00 02 01 00
++     */
++    if (!out || !random_32) return 0;
++    if (out_size < 78) return 0;
++    static const uint8_t head[] = {
++        0x16, 0x03, 0x03, 0x00, 0x49,            /* record hdr */
++        0x01, 0x00, 0x00, 0x45,                  /* HS hdr */
++        0x03, 0x03,                               /* version */
++    };
++    static const uint8_t tail[] = {
++        0x07,                                                /* sid_len */
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            /* sid */
++        0x00, 0x0a,                                          /* cs_len (5 cs) */
++        0xc0, 0x05, 0xc0, 0x2e, 0x00, 0x3d,                   /* cs (5 ciphers, */
++        0x00, 0x8d, 0x00, 0xa8,                               /*  no 00 a9)     */
++        0x00,                                                /* comp_meth_len */
++        0x00, 0x0a,                                          /* ext_list_len */
++        0x00, 0x04, 0x00, 0x02, 0x00, 0x17,                   /* ext supported_groups */
++        0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,                   /* ext ec_point_formats */
++    };
++    memcpy(out, head, sizeof(head));
++    memcpy(out + sizeof(head), random_32, 32);
++    memcpy(out + sizeof(head) + 32, tail, sizeof(tail));
++    return 78;
++}
++
++
+ /* ---- Certificate body --------------------------------------------------- */
+ 
+ size_t verimark_tls_build_certificate_body(const uint8_t client_cert_400[400],
+diff --git a/libfprint/drivers/verimark/tls.h b/libfprint/drivers/verimark/tls.h
+index 796db77..8603e80 100644
+--- a/libfprint/drivers/verimark/tls.h
++++ b/libfprint/drivers/verimark/tls.h
+@@ -94,6 +94,25 @@ size_t verimark_tls_build_client_hello(const uint8_t random_32[32],
+                                        uint8_t *out, size_t out_size);
+ 
+ 
++/* Build the IT-specific ClientHello (78 octets) — same structure as the DT
++ * builder above, but with **5 ciphers** instead of 6 (cipher 0x00a9 is
++ * removed). The IT firmware rejects ClientHellos containing 0x00a9 with
++ * a fatal illegal_parameter Alert ; the exact 5-cipher set is verbatim
++ * from the 2026-06-06 pcap. Layout differences from the DT builder :
++ *   record length    0x0049 (= 73)  vs DT 0x004b (= 75)
++ *   HS length        0x0045 (= 69)  vs DT 0x0047 (= 71)
++ *   cs_len           0x000a         vs DT 0x000c
++ *   cipher suites    c005 c02e 003d 008d 00a8  (no 00a9)
++ *
++ * Returns 78 on success, 0 on buffer too small.
++ *
++ * The caller is responsible for prepending the 4-byte transport prefix
++ * (VERIMARK_IT_HS_PREFIX) before writing to BULK EP01 OUT.
++ */
++size_t verimark_tls_build_client_hello_it(const uint8_t random_32[32],
++                                          uint8_t *out, size_t out_size);
++
++
+ /* Build the Certificate body (NOT the full HS message) :
+  *   `[chain_len 3 BE = 400][cert#0_len 3 BE = 400][magic 0d d0][cert_400]`
+  *

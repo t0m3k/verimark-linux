@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly EXPECTED_BASE_COMMIT="c4654fdc85c25afdd9115bec2f95a44145ae3b94"
+readonly REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly DRIVER_WORKTREE="${REPOSITORY_ROOT}/.driver-worktrees/libfprint"
+readonly PATCH_ROOT="${REPOSITORY_ROOT}/patches/libfprint"
+readonly GENERATIONS="${PATCH_ROOT}/generations"
+readonly CURRENT="${PATCH_ROOT}/current"
+readonly PREVIOUS="${PATCH_ROOT}/previous"
+
+temporary_directory=""
+current_candidate=""
+previous_candidate=""
+
+cleanup() {
+  local status=$?
+
+  if [[ -n "${temporary_directory}" && -d "${temporary_directory}" ]]; then
+    rm -rf -- "${temporary_directory}"
+  fi
+  if [[ -n "${current_candidate}" && -L "${current_candidate}" ]]; then
+    rm -- "${current_candidate}"
+  fi
+  if [[ -n "${previous_candidate}" && -L "${previous_candidate}" ]]; then
+    rm -- "${previous_candidate}"
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+
+fail() {
+  printf '%s\n' "error: $*" >&2
+  exit 1
+}
+
+validate_generation() {
+  local generation=$1 series patch_name patch_path count=0
+  declare -A seen=()
+  local -a patch_names=()
+
+  series="${generation}/series"
+  [[ -f "${series}" && ! -L "${series}" ]] || \
+    fail "patch series must be a regular non-symlink file"
+  while IFS= read -r patch_name || [[ -n "${patch_name}" ]]; do
+    [[ -n "${patch_name}" ]] || fail "blank patch-series entry"
+    [[ "${patch_name}" =~ ^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$ ]] || \
+      fail "invalid patch-series entry: ${patch_name}"
+    [[ -z "${seen[${patch_name}]+present}" ]] || \
+      fail "duplicate patch-series entry: ${patch_name}"
+    seen["${patch_name}"]=1
+    patch_path="${generation}/${patch_name}"
+    [[ -f "${patch_path}" && ! -L "${patch_path}" ]] || \
+      fail "patch entry must be a regular non-symlink file: ${patch_name}"
+    patch_names+=("${patch_name}")
+    count=$((count + 1))
+  done < "${series}"
+  [[ ${count} -gt 0 ]] || fail "patch series is empty"
+  for patch_name in "${patch_names[@]}"; do
+    patch_path="${generation}/${patch_name}"
+    grep -Eq '^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$' "${patch_path}" || \
+      fail "patch entry is missing a mail header: ${patch_name}"
+    grep -Eq '^From: .+ <[^>]+>$' "${patch_path}" || \
+      fail "patch entry is missing mail authorship: ${patch_name}"
+  done
+}
+
+if [[ $# -ne 2 ]]; then
+  fail "usage: $0 BASE_COMMIT DRIVER_REF"
+fi
+
+base_argument=$1
+driver_ref=$2
+
+[[ -d "${DRIVER_WORKTREE}/.git" || -f "${DRIVER_WORKTREE}/.git" ]] || \
+  fail "missing driver checkout: ${DRIVER_WORKTREE}"
+
+resolved_base=$(git -C "${DRIVER_WORKTREE}" rev-parse --verify \
+  "${base_argument}^{commit}") || fail "could not resolve base commit: ${base_argument}"
+[[ "${resolved_base}" == "${EXPECTED_BASE_COMMIT}" ]] || \
+  fail "base commit must resolve to ${EXPECTED_BASE_COMMIT}"
+
+resolved_ref=$(git -C "${DRIVER_WORKTREE}" rev-parse --verify \
+  "${driver_ref}^{commit}") || fail "could not resolve driver ref: ${driver_ref}"
+
+if [[ -n $(git -C "${DRIVER_WORKTREE}" status --porcelain --untracked-files=all) ]]; then
+  fail "driver checkout is dirty"
+fi
+
+git -C "${DRIVER_WORKTREE}" merge-base --is-ancestor \
+  "${resolved_base}" "${resolved_ref}" || \
+  fail "driver ref is not based on ${EXPECTED_BASE_COMMIT}"
+
+if [[ -n $(git -C "${DRIVER_WORKTREE}" rev-list --merges \
+  "${resolved_base}..${resolved_ref}") ]]; then
+  fail "driver range contains merge commits"
+fi
+
+mkdir -p "${GENERATIONS}"
+temporary_directory=$(mktemp -d "${GENERATIONS}/.pending.XXXXXX")
+mkdir "${temporary_directory}/raw"
+
+git -C "${DRIVER_WORKTREE}" format-patch \
+  --zero-commit \
+  --no-signature \
+  --numbered-files \
+  --output-directory "${temporary_directory}/raw" \
+  "${resolved_base}..${resolved_ref}"
+
+mapfile -t raw_patches < <(find "${temporary_directory}/raw" -maxdepth 1 \
+  -type f -printf '%f\n' | sort -V)
+[[ ${#raw_patches[@]} -gt 0 ]] || fail "driver range contains no commits"
+
+for index in "${!raw_patches[@]}"; do
+  raw_patch="${temporary_directory}/raw/${raw_patches[index]}"
+  subject=$(sed -n 's/^Subject: //p' "${raw_patch}" | head -n 1 | \
+    sed -E 's/^\[PATCH[^]]*\][[:space:]]*//')
+  slug=$(printf '%s' "${subject}" | tr '[:upper:]' '[:lower:]' | \
+    sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  [[ -n "${slug}" ]] || fail "could not derive patch filename from subject"
+  printf -v patch_name '%04d-%s.patch' "$((index + 1))" "${slug}"
+  mv "${raw_patch}" "${temporary_directory}/${patch_name}"
+  printf '%s\n' "${patch_name}" >> "${temporary_directory}/series"
+done
+rmdir "${temporary_directory}/raw"
+
+validate_generation "${temporary_directory}"
+chmod 0755 "${temporary_directory}"
+chmod 0644 "${temporary_directory}/series" "${temporary_directory}"/*.patch
+
+generation_name="${EXPECTED_BASE_COMMIT:0:12}-${resolved_ref:0:12}"
+generation="${GENERATIONS}/${generation_name}"
+[[ ! -e "${generation}" && ! -L "${generation}" ]] || \
+  fail "patch generation already exists: ${generation_name}"
+mv "${temporary_directory}" "${generation}"
+temporary_directory=""
+
+old_target=""
+if [[ -L "${CURRENT}" ]]; then
+  old_target=$(readlink "${CURRENT}")
+  [[ "${old_target}" == generations/* ]] || \
+    fail "existing current symlink has an invalid target"
+  [[ -d "${PATCH_ROOT}/${old_target}" ]] || \
+    fail "existing current symlink target is missing"
+elif [[ -e "${CURRENT}" ]]; then
+  fail "current patch generation is not a symlink"
+fi
+
+new_target="generations/${generation_name}"
+current_candidate="${PATCH_ROOT}/.current.$$.next"
+ln -s "${new_target}" "${current_candidate}"
+
+if [[ -n "${old_target}" && "${old_target}" != "${new_target}" ]]; then
+  previous_candidate="${PATCH_ROOT}/.previous.$$.next"
+  ln -s "${old_target}" "${previous_candidate}"
+fi
+
+mv -Tf "${current_candidate}" "${CURRENT}"
+current_candidate=""
+
+if [[ -n "${previous_candidate}" ]]; then
+  mv -Tf "${previous_candidate}" "${PREVIOUS}"
+  previous_candidate=""
+fi

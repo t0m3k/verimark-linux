@@ -1,0 +1,266 @@
+pkgname=libfprint-verimark
+pkgver=1.94.100.r1.gc4654fd
+pkgrel=1
+pkgdesc="Library for fingerprint readers with experimental Kensington VeriMark support"
+url="https://fprint.freedesktop.org/"
+arch=(x86_64)
+license=(LGPL-2.1-or-later)
+options=(!debug)
+depends=(
+  libgcc
+  glib2
+  glibc
+  libgudev
+  libgusb
+  openssl
+  pixman
+  gnutls
+  nettle
+  gmp
+)
+makedepends=(
+  git
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python-cairo
+  python-gobject
+  systemd
+)
+checkdepends=(
+  cairo
+  umockdev
+)
+provides=(libfprint libfprint-2.so)
+conflicts=(libfprint)
+groups=(fprint)
+_commit=c4654fdc85c25afdd9115bec2f95a44145ae3b94
+source=(
+  "libfprint::git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=$_commit"
+  "series::../../patches/libfprint/series"
+  "0001-feat-verimark-add-kensington-verimark-dt-driver.patch::../../patches/libfprint/current/0001-feat-verimark-add-kensington-verimark-dt-driver.patch"
+  "0002-feat-verimark-wire-all-8-vfuncs.patch::../../patches/libfprint/current/0002-feat-verimark-wire-all-8-vfuncs.patch"
+  "0003-test-verimark-ship-the-standalone-tdd-test-suite-and.patch::../../patches/libfprint/current/0003-test-verimark-ship-the-standalone-tdd-test-suite-and.patch"
+  "0004-fix-verimark-close-notify-on-close-gerror-ownership.patch::../../patches/libfprint/current/0004-fix-verimark-close-notify-on-close-gerror-ownership.patch"
+  "0005-fix-verimark-set-non-null-username-description-on.patch::../../patches/libfprint/current/0005-fix-verimark-set-non-null-username-description-on.patch"
+  "0006-fix-verimark-backfill-description-username-on.patch::../../patches/libfprint/current/0006-fix-verimark-backfill-description-username-on.patch"
+  "0007-fix-verimark-set-enroll-date-on-list-prints.patch::../../patches/libfprint/current/0007-fix-verimark-set-enroll-date-on-list-prints.patch"
+  "0008-fix-verimark-enroll-uses-the-device-assigned.patch::../../patches/libfprint/current/0008-fix-verimark-enroll-uses-the-device-assigned.patch"
+  "0009-chore-verimark-bump-verify-exit-logs-to-fp-info-for.patch::../../patches/libfprint/current/0009-chore-verimark-bump-verify-exit-logs-to-fp-info-for.patch"
+  "0010-chore-verimark-use-fp-warn-for-verify-diagnostic.patch::../../patches/libfprint/current/0010-chore-verimark-use-fp-warn-for-verify-diagnostic.patch"
+  "0011-fix-verimark-drop-close-side-tls-close-notify.patch::../../patches/libfprint/current/0011-fix-verimark-drop-close-side-tls-close-notify.patch"
+  "0012-fix-verimark-usb-level-reset-at-open-to-recover.patch::../../patches/libfprint/current/0012-fix-verimark-usb-level-reset-at-open-to-recover.patch"
+  "0013-feat-verimark-3-attempt-verify-retry-loop-with.patch::../../patches/libfprint/current/0013-feat-verimark-3-attempt-verify-retry-loop-with.patch"
+  "0014-utf-8-q-feat-verimark-20factory-fresh-20pairing.patch::../../patches/libfprint/current/0014-utf-8-q-feat-verimark-20factory-fresh-20pairing.patch"
+  "0015-utf-8-q-feat-verimark-20factory-fresh-20pairing.patch::../../patches/libfprint/current/0015-utf-8-q-feat-verimark-20factory-fresh-20pairing.patch"
+  "0016-fix-verimark-include-glib-gstdio-h-for-g-chmod.patch::../../patches/libfprint/current/0016-fix-verimark-include-glib-gstdio-h-for-g-chmod.patch"
+  "0017-chore-verimark-clean-up-logging-for-upstream-review.patch::../../patches/libfprint/current/0017-chore-verimark-clean-up-logging-for-upstream-review.patch"
+  "0018-utf-8-q-feat-verimark-20phase-2010-3-a-20.patch::../../patches/libfprint/current/0018-utf-8-q-feat-verimark-20phase-2010-3-a-20.patch"
+  "0019-utf-8-q-feat-verimark-20phase-2010-3-b-20.patch::../../patches/libfprint/current/0019-utf-8-q-feat-verimark-20phase-2010-3-b-20.patch"
+  "0020-fix-verimark-phase-10-3-a-async-block-was-inside-the.patch::../../patches/libfprint/current/0020-fix-verimark-phase-10-3-a-async-block-was-inside-the.patch"
+  "0021-utf-8-q-feat-verimark-20phase-2010-3-c-20.patch::../../patches/libfprint/current/0021-utf-8-q-feat-verimark-20phase-2010-3-c-20.patch"
+  "0022-utf-8-q-feat-verimark-20phase-2010-3-d-20.patch::../../patches/libfprint/current/0022-utf-8-q-feat-verimark-20phase-2010-3-d-20.patch"
+  "0023-utf-8-q-feat-verimark-20phase-2010-3-e-20.patch::../../patches/libfprint/current/0023-utf-8-q-feat-verimark-20phase-2010-3-e-20.patch"
+  "0024-utf-8-q-feat-verimark-20phase-2010-3-f-20.patch::../../patches/libfprint/current/0024-utf-8-q-feat-verimark-20phase-2010-3-f-20.patch"
+  "0025-fix-harden-desktop-factory-pairing.patch::../../patches/libfprint/current/0025-fix-harden-desktop-factory-pairing.patch"
+  "0026-verimark-sanitize-source-comments-for-upstream.patch::../../patches/libfprint/current/0026-verimark-sanitize-source-comments-for-upstream.patch"
+  "0027-test-sanitize-desktop-storage-fixtures.patch::../../patches/libfprint/current/0027-test-sanitize-desktop-storage-fixtures.patch"
+  "0028-fix-use-portable-credential-mode-check.patch::../../patches/libfprint/current/0028-fix-use-portable-credential-mode-check.patch"
+  "0029-fix-avoid-duplicate-gnu-source-definition.patch::../../patches/libfprint/current/0029-fix-avoid-duplicate-gnu-source-definition.patch"
+  "0030-build-link-desktop-crypto-dependencies.patch::../../patches/libfprint/current/0030-build-link-desktop-crypto-dependencies.patch"
+  "0031-fix-keep-standalone-desktop-tests-warning-clean.patch::../../patches/libfprint/current/0031-fix-keep-standalone-desktop-tests-warning-clean.patch"
+  "0032-fix-remove-stale-it-hwdb-metadata.patch::../../patches/libfprint/current/0032-fix-remove-stale-it-hwdb-metadata.patch"
+  "0033-fix-make-pairing-publication-dirfd-safe.patch::../../patches/libfprint/current/0033-fix-make-pairing-publication-dirfd-safe.patch"
+)
+b2sums=(
+  SKIP
+  ca2a9aae6451b5fd959b4e5d5cb0ace748f735cf43b91fc00951f5f1de8588307f97d4f4e1d5c3f41a5f3c4e0d746704e67187c0b5621fcd9f2d2d32cf4ba03c
+  bbe76807c896f34d453a332eeba055df51b26ffeb5cd1ae1239a63ede71592f6cd87feb45b9f0564e49feb4f3dce0697e97d5ba693d28dbd61fbf5c463dd2203
+  1c746bd02494365cdc8ac602d2cd30f9333b1313d76e4a9fe192258f74b855161acaeec1734b1b3b40d86aeba4fa37c34130a8cc1e3a0a6b5c6b343e128f17da
+  0493fe52c2e8257568291f36c68399bd89b5a14823aadaa3870d625114ede4afe17cd61e9c00c70a5b31712589e2de3b0fe645709cca5500d72278a85cd74ca8
+  9c22da186ac48db9078521f3b73f01acad05b31dcdef91f977714693d82760d1178419cfa8f19b0030d75f3d47f8d8abf7c3e93b3a54a5a59a49c73ef3ea01c3
+  fbc0bc079c51a76fa319d280d402a4ca592893e33e398b2bf6a7c8a8ecfbaf3fe4ad8772eddf92638accf5f7915fcb9a2d4d3531bceb1b3bfc514b66176b80b3
+  372cb5d9a8249e8e0753aa1edf394103d19486f6b2f3e6477bbc99067592cb37995c83d4ea8b446f5d6882e39fe045f9f986e6f5c1fcbcf0640141cc2fb59d39
+  dafb929b7c352572027e580725a802dbc48c2aeb9b24b747b45e8ea4ea79c39f30e9516298d6183adab3ff55ff9579ec80c76b0c493e788c8ee710006f38966e
+  451360f5a5a1e2b7592f95b2bfedcafbea183531bcded0ef1b949371a12d5d46eeaddff394638ce3072a10ac08076949e20999035651a27f2120f9d7f6d6ba73
+  8d229e58285ec8cece8f4b7ada17c33a092485b19d77bb45a5ec165535d5de3bbb0db5a88ed50db3f576f15cec5ac15db09b798fa11607d18b1a39f4c82d8e23
+  22b76746d602d858376074b6837ad6e4aba48439fe92a05dcced2b5f6943bb65962021deb9992cfce56c4a1702f28e6b1117b40b56150e78def6d1ca20a1c7a5
+  4ac57bb6558af3fef40004b46a871f5526a5251c132514ce16e750d3c451f0b6844b08c2b25ee53a157f3417ea750f58abb727dba4024f0e8b919d4c4a5bc8c2
+  8941e434e1bb30f31721fdaedf899b2b0b779c2e468909e683cd9f9e18e1a87981ed9d134edf139f35e37c4f8168cb55afb5b33c8cbce522809f27767fc5ddb7
+  e32d858dcd7de2940ac6f032d26b22903cb1fe04e33bb879338eb483578758600d2251d2d0d4c172f8d5930604d874b2a1501852529f87d321d304b41be9448e
+  359391810925b1244bd5ba7329b4c3365ccbd103015b62627d5ba33a7a2cb3633abb07f963267f78f595aadd8e092fce8be5ae7e80b06959cca3265d4bb6569b
+  a4a63423d92d8f4e14e998a8e09974043f100527611800e6f81b713c3c838fac642c977f09a40e8738fe920402d30dc3ccc21d4968d16e08990617e32cfe6399
+  6049843d156a7fb6e20f71676ea3643dd515156c5d2121969d5804f875b5864c0b8ee53864959c87b2d6efa805abff58126189eba8f6e28ee29d06c3d487c3e7
+  565d45267a2a6f513934ba7c01520282e2390c90ac25ce7b12499fe809d2fb7fb63fe139457f58471884315e3e3ddd92ff4943a99b95988e0f4531f2ea3557e6
+  e8a4f5e277c3730d8021b2f3061e868f639f6d04658d7b94f18bd83f4d7c55bbe9f0a456ae737661d33369f332c79929e3d03a1db92e27020d98996614aa53f3
+  6f3695e92f4426ce1fb322c886e63f8ad47d305a24ff908f24da0ef61e06ebedcbb3a2c969fcd977f48c12bd2dd479f9aa152721cef7e27e75b2b2e375540c27
+  f79799acc9fd8403de842b450a48a9d231e9e8537444368d41a5aa6b70efbec1be040df8e381a65fc594f45d2e98b1713e5fb67c18b0826326001881089ede64
+  56f310ede2b4b343ddf2477578ce41aa4b85a99e939d7fd471ac376ffec020683a9a7671d02a223c9e29919366806d84e6edf63d5c4841c77b2306cf7f2e52b5
+  4569f3a8d1c28782010ddb75580308705b4dfacf96b32c1ae84426718a8d014fc8161b712ae97e2fcbcd1d253b03876e12176921095ad05bf6936fe1dd5d579d
+  ad2c95ee29e5212c822fe6729b89f0e66db98d6d73c3b8c264fd7762c722093591da53233d040bd8f1b36a7c37d319959d56fec9fba635fbf4e78194b0b68e36
+  e65a6d6e3d4d55508f5e88666a094c6f88fb35cbff2e0a339c9051621621d1336990da6702ed70d3ccb67668bb7c6f54f22845f023559ff8c77d10263729ecc8
+  d989a0d245828ed7d522f0682b4ca01cf8cf2005803a6d3ebc779b28f4116a672949198c4a9a4a970414619671762e86b3eeae3ee3082373a25a5104bb6e6726
+  98c55e19ff685c917a1e38818286c6ec31e2f74f4a7fb27c58929a1b0501da1ff54b713a5dab45f8ec0fe9189a50aef07ca6bb76fe484b39e89029fc46f689e0
+  543a5db771960199faa00c206563c3082b795cde162b123f2dd5415f83b5d49605c2b2415677049bde9b9676dc10eff4f0c99b7d3bbf16145d4c8e4b960fd264
+  c4e9adbfde3a7472770f00beeb943b8bc574884cc41ce8069aa1383de1d37ad60e1f93646582aa154612977207170702caf743a3c297266cbb0abb43317f786d
+  6cb33c1204266e816501480c97e6ed9635106367f2fca8a835cc667dc3e66534ada657c2dab8e29143294dd84c81d24462bec440e27676e80d6e038af32a8e49
+  dc733111c14c9bee178451ee208de6c584ef5a59c0686ae7757067c34db950b8544a84364913b38e6fc73cf0a90cb26b62336d873b8e865d64fb4059c1e5fbaf
+  55914841b531d5bfe08f6ca3ccee630e4a7cb0e7d864a1b55cbe75848c3f8dd52e16fb6cc1cbd80e770be4d59c0b56c7b76d0bc3a1aefe5be4a0c5889d467301
+  fa7a1d4567450ef8dd42c307f2626d04259f0427365eb034a8cfd91195d1f4d54c3f07b3fb617e0fc9ac6a467bba76d408e780a97bf7e29e04cd7ece77e1cf22
+  817f3ddf0253158dfa48e7cd64e687724f281c25ada5b0b2c45a9b0c5cf8a07c8f9c3a522af2f9bdac58516820ae1b35fa032dcb18ce0d059a59e337e031a93e
+)
+
+
+_validate_patch_series() {
+  local series_file=$1
+  local patch_directory=$2
+  local patch_name patch_path count=0
+  local -a patch_names=()
+  declare -A seen=()
+
+  if [[ ! -f $series_file || -L $series_file ]]; then
+    error "libfprint patch series must be a regular non-symlink file"
+    return 1
+  fi
+
+  while IFS= read -r patch_name || [[ -n $patch_name ]]; do
+    if [[ -z $patch_name ]]; then
+      error "blank libfprint patch-series entry"
+      return 1
+    fi
+    if [[ ! $patch_name =~ ^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$ ]]; then
+      error "invalid libfprint patch-series entry: $patch_name"
+      return 1
+    fi
+    if [[ -n ${seen[$patch_name]+present} ]]; then
+      error "duplicate libfprint patch-series entry: $patch_name"
+      return 1
+    fi
+    seen["$patch_name"]=1
+    patch_path="$patch_directory/$patch_name"
+    if [[ ! -f $patch_path || -L $patch_path ]]; then
+      error "libfprint patch entry must be a regular non-symlink file: $patch_name"
+      return 1
+    fi
+    patch_names+=("$patch_name")
+    count=$((count + 1))
+  done < "$series_file"
+
+  if (( count == 0 )); then
+    error "libfprint patch series is empty"
+    return 1
+  fi
+
+  for patch_name in "${patch_names[@]}"; do
+    patch_path="$patch_directory/$patch_name"
+    if ! grep -Eq '^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$' "$patch_path"; then
+      error "libfprint patch entry is missing a mail header: $patch_name"
+      return 1
+    fi
+    if ! grep -Eq '^From: .+ <[^>]+>$' "$patch_path"; then
+      error "libfprint patch entry is missing mail authorship: $patch_name"
+      return 1
+    fi
+  done
+}
+
+_source_filename() {
+  local entry=$1
+
+  if [[ $entry == *::* ]]; then
+    printf '%s\n' "${entry%%::*}"
+  else
+    printf '%s\n' "${entry##*/}"
+  fi
+}
+
+_stage_patch_series() {
+  local source_directory=$1
+  local patch_directory=$2
+  local source_index source_name source_path destination expected actual
+
+  if [[ -e $patch_directory || -L $patch_directory ]]; then
+    error "private libfprint patch stage already exists"
+    return 1
+  fi
+  install -d -m 0755 "$patch_directory" || return 1
+
+  for ((source_index = 1; source_index < ${#source[@]}; source_index++)); do
+    source_name=$(_source_filename "${source[source_index]}") || return 1
+    if [[ $source_name != series \
+          && ! $source_name =~ ^[0-9]{4}-[a-z0-9][a-z0-9-]*\.patch$ ]]; then
+      error "invalid configured libfprint patch source: $source_name"
+      return 1
+    fi
+    expected=${b2sums[source_index]}
+    if [[ ! $expected =~ ^[0-9a-f]{128}$ ]]; then
+      error "missing configured checksum for libfprint patch source: $source_name"
+      return 1
+    fi
+    source_path="$source_directory/$source_name"
+    destination="$patch_directory/$source_name"
+    if [[ ! -f $source_path ]]; then
+      error "missing makepkg-staged libfprint patch source: $source_name"
+      return 1
+    fi
+
+    # makepkg deliberately stages local sources as symlinks. Dereference each
+    # checksum-identified input once into a private regular-file directory;
+    # validation and git-am never follow a source-stage symlink afterwards.
+    install -m 0644 -- "$source_path" "$destination" || return 1
+    if [[ ! -f $destination || -L $destination ]]; then
+      error "private libfprint patch source is not a regular file: $source_name"
+      return 1
+    fi
+    actual=$(b2sum -- "$destination") || return 1
+    actual=${actual%% *}
+    if [[ $actual != "$expected" ]]; then
+      error "libfprint patch source checksum mismatch: $source_name"
+      return 1
+    fi
+  done
+
+  _validate_patch_series "$patch_directory/series" "$patch_directory"
+}
+
+prepare() {
+  local patch_directory="${srcdir}/.verimark-patches"
+
+  _stage_patch_series "$srcdir" "$patch_directory" || return 1
+  cd libfprint
+  if [[ $(git rev-parse HEAD) != "$_commit" ]]; then
+    error "resolved source does not match pinned commit $_commit"
+    return 1
+  fi
+
+  while IFS= read -r patch_name || [[ -n $patch_name ]]; do
+    GIT_COMMITTER_NAME="VeriMark Package Materializer" \
+      GIT_COMMITTER_EMAIL="materializer@invalid" \
+      git am --keep-cr "${patch_directory}/${patch_name}"
+  done < "${patch_directory}/series"
+}
+
+build() {
+  local meson_options=(
+    -D drivers=all
+    -D installed-tests=false
+  )
+
+  arch-meson libfprint build "${meson_options[@]}"
+  meson compile -C build
+
+  arch-meson libfprint/libfprint/drivers/verimark build-verimark-tests --werror
+  meson compile -C build-verimark-tests
+}
+
+check() {
+  meson test -C build --print-errorlogs
+  meson test -C build-verimark-tests --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:

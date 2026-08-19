@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 22:13:39 +0200
+Subject: [PATCH 59/62] verimark: trigger 0xA4 GC after IT 0xA3 delete to wipe
+ ghost templates
+
+---
+ libfprint/drivers/verimark/verimark.c | 33 +++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 0c52afa..80ff51c 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3200,6 +3200,39 @@ static void verimark_delete(FpDevice *device)
+         }
+         fp_dbg("delete: IT 0xa3 OK (deleted %u sensor objects cascading "
+                "across classes)", (unsigned) it_count);
++
++        /* Trigger partition GC (background-erase) to actually wipe the
++         * deleted templates from the firmware's biometric store. Without
++         * this, ghost templates linger and verify() returns positive
++         * matches against TUIDs that no longer appear in `0x9f class=1`
++         * — observed 2026-06-07 when subsequent verifies got
++         * `verify: sensor matched a different print → downgrading` even
++         * for the currently-enrolled finger. Windows mirrors this
++         * (`_stiTudorDeleteEnrollment` calls `0xA3` then `0xA4 0x80`,
++         * `0xA4 0x81`) ; cf. docs/it-verify-decode.md § "Flux haut-niveau
++         * stiTudorDeleteEnrollment". GC failures are non-fatal — the
++         * delete itself already succeeded ; we just log and continue. */
++        for (uint8_t gc_byte = 0x80; gc_byte <= 0x81; gc_byte++) {
++            uint16_t gc_status = 0;
++            uint8_t *gc_payload = NULL;
++            size_t   gc_payload_len = 0;
++            GError  *gc_err = NULL;
++            uint8_t  gc_req[1] = { gc_byte };
++            if (!verimark_call_opcode_sync(self, 0xA4,
++                                           gc_req, sizeof(gc_req),
++                                           /*timeout_ms*/ 3000,
++                                           &gc_status, &gc_payload,
++                                           &gc_payload_len, &gc_err)) {
++                fp_warn("delete: 0xa4 GC %02x failed (non-fatal): %s",
++                        gc_byte, gc_err ? gc_err->message : "(no msg)");
++                if (gc_err) g_error_free(gc_err);
++            } else {
++                fp_dbg("delete: 0xa4 GC %02x OK (status 0x%04x, %zu B payload)",
++                       gc_byte, gc_status, gc_payload_len);
++            }
++            g_free(gc_payload);
++        }
++
+         fpi_device_delete_complete(device, NULL);
+         return;
+     }

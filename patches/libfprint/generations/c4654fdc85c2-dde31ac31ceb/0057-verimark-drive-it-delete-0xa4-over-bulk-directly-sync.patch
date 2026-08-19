@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 17:18:10 +0200
+Subject: [PATCH 57/62] verimark: drive IT delete 0xA4 over BULK directly (sync
+ vtable was CONTROL-only)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause of the 'delete: 0xa4 USB OUT write failed (record 31 B)'
+runtime error : verimark_transport_io_bind() only wires the CONTROL
+transport (DT path). The IT auto-route to BULK lives exclusively in
+the ASYNC transceive path (verimark_transceive_async,
+transport.c:492). The sync vtable does NOT route by PID, so binding
+it on an IT device makes every OUT send the encrypted record over EP0
+control transfers — which the IT firmware refuses, producing the OUT
+write error observed.
+
+IT verify / enroll / list / identify work because they all go through
+verimark_session_call_opcode_async() → verimark_transceive_async()
+→ the BULK auto-route. delete is the only IT-side caller that uses
+the SYNC verimark_session_call_opcode() (because delete is fast and
+doesn't run in an SSM), so it tripped the missing route.
+
+Fix: in the IT branch of verimark_delete(), drive USB directly via
+verimark_bulk_out / verimark_bulk_in on
+VERIMARK_IT_EP_BULK_OUT (0x01) / VERIMARK_IT_EP_BULK_IN (0x81),
+bypassing the broken sync vtable. The encrypted record (31 B for the
+2-byte plaintext [0xA4][sub_factor]) is sent raw over EP01 OUT, and
+the encrypted response is read from EP81 IN, then decrypted via
+verimark_session_decrypt_appdata as before.
+
+A longer-term cleanup would teach verimark_transport_io_bind() to
+PID-route too, but doing it here keeps the change small and
+surgical to delete. DT delete is unaffected — it doesn't enter the
+IT branch.
+---
+ libfprint/drivers/verimark/verimark.c | 54 +++++++++++++++++----------
+ 1 file changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index ab9b9cd..a05819f 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -3051,21 +3051,29 @@ static void verimark_delete(FpDevice *device)
+             fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+-        VerimarkTransportIoCtx it_io_ctx = {
+-            .h = self->transport,
+-            .timeout_ms = 3000,
+-        };
+-        VerimarkTransportIO it_io;
+-        verimark_transport_io_bind(&it_io, &it_io_ctx);
+         /* Per RE of fcn.18009a5a0 + doc (it-verify-decode.md § Delete) :
+          *   mov edx, 1            ; taille payload = 1
+          *   buffer[1] = <byte>    ; sous-facteur ANSI-381
+          * → on-wire plaintext = [0xA4][sub_factor] = 2 bytes total.
+          *
+-         * Inline the call here (instead of verimark_session_call_opcode)
+-         * so we can disambiguate the failure step : write vs read vs
+-         * decrypt vs short response. The opaque "transport/crypto failure"
+-         * black box hid which step was failing at runtime. */
++         * Drive the USB directly via verimark_bulk_out / verimark_bulk_in
++         * on EP01 OUT / EP81 IN, bypassing verimark_transport_io_bind
++         * which is the CONTROL-transport sync vtable (DT path). The
++         * IT auto-route to BULK lives only in the ASYNC transceive path
++         * (verimark_transceive_async, line ~492 of transport.c) ; the
++         * sync vtable does NOT route by PID, so using it on an IT
++         * device makes the firmware refuse the OUT write with the
++         * symptom observed at runtime 2026-06-07 :
++         *
++         *   "delete: 0xa4 USB OUT write failed (record 31 B, ...)"
++         *
++         * The doc IT verify/enroll work because they go through
++         * `_call_opcode_async()` ; delete is sync and used the wrong
++         * vtable.
++         *
++         * On the wire (raw BULK, no framing prefix on AppData) :
++         *   OUT EP01 : [TLS record] (record_len = 5 hdr + 8 nonce + 2 plain + 16 tag = 31 B)
++         *   IN  EP81 : [TLS record] (status + optional payload, decrypted) */
+         uint8_t req_record[64];
+         size_t req_record_len = verimark_session_encrypt_appdata(
+             &self->session, 0xA4, &sub_factor, 1,
+@@ -3078,22 +3086,30 @@ static void verimark_delete(FpDevice *device)
+             fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+-        if (!it_io.write(it_io.ctx, req_record, req_record_len,
+-                         /*is_handshake*/ false)) {
++        VerimarkResult br = verimark_bulk_out(self->transport,
++                                              VERIMARK_IT_EP_BULK_OUT,
++                                              req_record, req_record_len,
++                                              /*timeout_ms*/ 3000);
++        if (br != VERIMARK_OK) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                                "delete: 0xa4 USB OUT write failed "
+-                                "(record %zu B, sub-factor 0x%02x)",
+-                                req_record_len, sub_factor);
++                                "delete: 0xa4 BULK OUT EP01 failed "
++                                "(VerimarkResult=%d, record %zu B, sub-factor 0x%02x)",
++                                (int)br, req_record_len, sub_factor);
+             fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+         uint8_t resp_record[4096];
+         size_t resp_record_len = 0;
+-        if (!it_io.read(it_io.ctx, resp_record, sizeof(resp_record),
+-                        &resp_record_len)) {
++        br = verimark_bulk_in(self->transport,
++                              VERIMARK_IT_EP_BULK_IN,
++                              resp_record, sizeof(resp_record),
++                              &resp_record_len,
++                              /*timeout_ms*/ 3000);
++        if (br != VERIMARK_OK) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+-                                "delete: 0xa4 USB IN read failed/timeout "
+-                                "(sub-factor 0x%02x)", sub_factor);
++                                "delete: 0xa4 BULK IN EP81 failed/timeout "
++                                "(VerimarkResult=%d, sub-factor 0x%02x)",
++                                (int)br, sub_factor);
+             fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }

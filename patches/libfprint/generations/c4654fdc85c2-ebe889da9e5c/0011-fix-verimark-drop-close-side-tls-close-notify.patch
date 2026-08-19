@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 12:41:46 +0200
+Subject: [PATCH 11/62] fix(verimark): drop close-side TLS close_notify,
+ recover stale state at open()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Trade-off swap. The close-time close_notify added earlier (commit
+94b766b) prevents the gnutls -6 on the follow-up handshake, but in
+fprintd's context the close_notify USB write OR its drain step
+occasionally blocks past systemd TimeoutStopSec (90s), killing
+fprintd with SIGKILL. Symptom: subsequent fprintd-verify hangs with
+no LED because the next open() runs against a half-torn-down sensor
+session.
+
+Switch the recovery to open-time, mirroring python/verimark/match.py
+_try_clear_stale_tls_state: if the sensor's response to our first
+ClientHello is a TLS Alert (= it still thinks the previous session
+is alive), send a 7-byte PLAINTEXT close_notify (no session keys
+needed pre-handshake, RFC 5246 §7.2.1) to drop sensor-side state,
+drain any echo, and retry the handshake once.
+
+This way close() stays fast and stateless ; stale-state cases only
+pay the recovery cost on the next open() if they actually happen.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 43 ++++++++++++++++++++-------
+ 1 file changed, 32 insertions(+), 11 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index e6002bf..dc7c66c 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -308,6 +308,31 @@ static void verimark_open(FpDevice *device)
+ 
+     VerimarkHandshakeResult hr = verimark_handshake_perform(
+         &io, &pairing, /* repro = */ NULL, &self->session);
++
++    /* Stale TLS state recovery (Python-style, cf. match.py
++     * _try_clear_stale_tls_state). If the sensor's reply to our
++     * ClientHello is a TLS Alert instead of a ServerHello, it still
++     * thinks the previous session is alive — typically because the
++     * previous Linux process exited without sending close_notify.
++     * Send a plaintext close_notify (7 bytes, no keys needed — RFC 5246
++     * §7.2.1 allows this since we don't have keys yet) to make the
++     * sensor drop its session state, then retry the handshake once. */
++    if (hr == VERIMARK_HANDSHAKE_ERR_SERVER_ALERT) {
++        fp_warn("verimark: handshake got TLS Alert ; clearing stale state + retry");
++        static const uint8_t plain_close_notify[7] = {
++            0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00
++        };
++        io.write(io.ctx, plain_close_notify,
++                 sizeof(plain_close_notify), /*is_handshake=*/true);
++        uint8_t drain[64];
++        size_t drain_len = 0;
++        io.read(io.ctx, drain, sizeof(drain), &drain_len);
++        verimark_session_zero(&self->session);
++        hr = verimark_handshake_perform(&io, &pairing, NULL, &self->session);
++        if (hr == VERIMARK_HANDSHAKE_OK)
++            fp_warn("verimark: stale-state recovery succeeded");
++    }
++
+     /* Wipe the heap copy of pairing immediately. */
+     verimark_pairing_data_zero(&pairing);
+ 
+@@ -339,17 +364,13 @@ static void verimark_close(FpDevice *device)
+     /* Plain pointer — close_complete steals the GError reference. */
+     GError *error = NULL;
+ 
+-    /* Send the TLS close_notify Alert before tearing down — without it
+-     * the sensor holds the session state and the NEXT handshake fails
+-     * (observed runtime: gnutls returns -6 on the follow-up open()).
+-     * Best-effort : failures here just mean the next open() will trigger
+-     * the Python-style "stale TLS state recovery" path. */
+-    if (self->session_active && self->transport) {
+-        VerimarkTransportIoCtx io_ctx;
+-        VerimarkTransportIO io;
+-        verimark_io_bind(self, &io_ctx, &io);
+-        verimark_session_send_close_notify(&self->session, &io);
+-    }
++    /* No TLS close_notify here. Sending it would be more correct
++     * (RFC 5246 §7.2.1), but observed runtime on this sensor sometimes
++     * leaves the USB pipe in a state where the close_notify write OR
++     * the post-write drain blocks past systemd TimeoutStopSec, killing
++     * fprintd with SIGKILL. Stale TLS state from a missed close_notify
++     * is handled at the NEXT open() time instead, via a Python-style
++     * stale-state recovery in verimark_handshake_perform. */
+ 
+     /* Zero out the TLS session keys before releasing the handle. */
+     verimark_session_zero(&self->session);

@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 16:53:20 +0200
+Subject: [PATCH 54/62] verimark: fix double-free in delete/list vfuncs (use
+ g_steal_pointer)
+
+fpi_device_delete_complete() and fpi_device_list_complete() are
+documented as (transfer full) on their error parameter, i.e. they
+TAKE OWNERSHIP of the GError.
+
+verimark_delete() and verimark_list() declared their error variable
+with g_autoptr(GError) and then passed it raw to *_complete(). On
+the failure paths that meant :
+
+  1. *_complete() consumed and freed the error
+  2. on function return, g_autoptr cleanup freed it AGAIN
+
+The double-free corrupted the GError, so fprintd then read garbage
+through error->message inside its g_log() format call, crashing
+with SIGSEGV inside __strlen_avx2(NULL).
+
+Observed at runtime as :
+
+  Failed to delete fingerprints:
+    GDBus.Error:org.freedesktop.DBus.Error.NoReply:
+    Remote peer disconnected
+
+with a coredump frame in fprintd's delete_enrolled_fingers @ +0x1731d
+(the g_log call right after fp_device_delete_print_sync returns FALSE).
+
+Fix : every failing path now passes g_steal_pointer(&error) so the
+autoptr sees NULL on exit and the ownership transfer is honored.
+
+The success paths (passing NULL explicitly) are unaffected.
+---
+ libfprint/drivers/verimark/verimark.c | 24 ++++++++++++------------
+ 1 file changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 5546701..08ecdd1 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2894,7 +2894,7 @@ static void verimark_list(FpDevice *device)
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                             "list: TLS session not active (sub1 pairing "
+                             "file not found — see find_sub1_path)");
+-        fpi_device_list_complete(device, NULL, error);
++        fpi_device_list_complete(device, NULL, g_steal_pointer(&error));
+         return;
+     }
+ 
+@@ -2912,13 +2912,13 @@ static void verimark_list(FpDevice *device)
+                                            &list, &status)) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "list: get_object_list transport/crypto failure");
+-        fpi_device_list_complete(device, NULL, error);
++        fpi_device_list_complete(device, NULL, g_steal_pointer(&error));
+         return;
+     }
+     if (status != 0x0000) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "list: 0x9f returned status 0x%04x", status);
+-        fpi_device_list_complete(device, NULL, error);
++        fpi_device_list_complete(device, NULL, g_steal_pointer(&error));
+         return;
+     }
+ 
+@@ -2975,7 +2975,7 @@ static void verimark_delete(FpDevice *device)
+     if (!self->session_active) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
+                             "delete: TLS session not active");
+-        fpi_device_delete_complete(device, error);
++        fpi_device_delete_complete(device, g_steal_pointer(&error));
+         return;
+     }
+ 
+@@ -2984,7 +2984,7 @@ static void verimark_delete(FpDevice *device)
+     if (print == NULL) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                             "delete: no print supplied");
+-        fpi_device_delete_complete(device, error);
++        fpi_device_delete_complete(device, g_steal_pointer(&error));
+         return;
+     }
+ 
+@@ -2993,7 +2993,7 @@ static void verimark_delete(FpDevice *device)
+     if (!verimark_extract_tuid_from_print(print, &tid_var, &tuid)) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                             "delete: print has no valid 16-byte tuid in fpi-data");
+-        fpi_device_delete_complete(device, error);
++        fpi_device_delete_complete(device, g_steal_pointer(&error));
+         return;
+     }
+ 
+@@ -3037,7 +3037,7 @@ static void verimark_delete(FpDevice *device)
+                                 "delete: IT requires a specific FpFinger "
+                                 "value (got %d) to derive the ANSI-381 "
+                                 "sub-factor byte", (int)finger);
+-            fpi_device_delete_complete(device, error);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+         /* Defensive guard : the WinBio finger codes 0x01..0x0A can
+@@ -3048,7 +3048,7 @@ static void verimark_delete(FpDevice *device)
+                                 "delete: sub-factor 0x%02x is a host-side "
+                                 "special marker, refusing to send",
+                                 sub_factor);
+-            fpi_device_delete_complete(device, error);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+         VerimarkTransportIoCtx it_io_ctx = {
+@@ -3069,14 +3069,14 @@ static void verimark_delete(FpDevice *device)
+                                            &it_payload_len)) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                 "delete: 0xa4 transport/crypto failure");
+-            fpi_device_delete_complete(device, error);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+         if (it_status != 0x0000) {
+             error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                 "delete: 0xa4 status 0x%04x (sub-factor 0x%02x)",
+                                 it_status, sub_factor);
+-            fpi_device_delete_complete(device, error);
++            fpi_device_delete_complete(device, g_steal_pointer(&error));
+             return;
+         }
+         fp_dbg("delete: IT 0xa4 sub-factor 0x%02x OK (status 0x0000, %zu B payload)",
+@@ -3099,7 +3099,7 @@ static void verimark_delete(FpDevice *device)
+                                          tuid, &deleted, &status)) {
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "delete: 0xa3 transport/crypto failure");
+-        fpi_device_delete_complete(device, error);
++        fpi_device_delete_complete(device, g_steal_pointer(&error));
+         return;
+     }
+     if (status != 0x0000) {
+@@ -3107,7 +3107,7 @@ static void verimark_delete(FpDevice *device)
+          * as a non-fatal proto error so the caller can recover. */
+         error = g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "delete: 0xa3 returned status 0x%04x", status);
+-        fpi_device_delete_complete(device, error);
++        fpi_device_delete_complete(device, g_steal_pointer(&error));
+         return;
+     }
+ 

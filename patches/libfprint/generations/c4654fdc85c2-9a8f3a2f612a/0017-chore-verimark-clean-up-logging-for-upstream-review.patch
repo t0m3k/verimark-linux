@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 14:14:38 +0200
+Subject: [PATCH 17/32] chore(verimark): clean up logging for upstream review
+ (Phase 10.4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Demote routine driver progress to fp_dbg / fp_info per upstream
+convention :
+
+  fp_warn  — actual recoverable errors (TLS handshake fail, missing
+             sub1, file I/O fail)
+  fp_info  — vfunc-level milestones (verify MATCH_SUCCESS / MATCH_FAIL /
+             MATCH_ERROR, enroll progress milestones, bootstrap
+             SUCCESS, stale-state recovery success)
+  fp_dbg   — per-opcode / per-poll / per-swipe traces, "bootstrap
+             skipped" notices
+
+Remove the `g_print(">>> …<<<")` user-prompts in verify/enroll. Those
+were daemon-stdout testing artifacts from the standalone standalone test harnesses
+harnesses ; in fprintd context they pollute the journal and add no
+value over the fp_info equivalents.
+
+Rename `verimark_run_verify_pipeline` → `verimark_run_capture_match_pipeline`
+(serves both verify and identify ; original name misled).
+
+No behaviour change.
+---
+ libfprint/drivers/verimark/verimark.c | 71 +++++++++++++--------------
+ 1 file changed, 33 insertions(+), 38 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index d0d46d0..9c9919e 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -283,13 +283,13 @@ verimark_try_bootstrap(FpiDeviceVerimark *self)
+     gboolean file_ok = g_file_test("/var/lib/fprint/verimark/.allow_bootstrap",
+                                     G_FILE_TEST_EXISTS);
+     if (!env_ok && !file_ok) {
+-        fp_warn("verimark: bootstrap skipped — set "
++        fp_dbg("verimark: bootstrap skipped — set "
+                 "VERIMARK_ALLOW_BOOTSTRAP=1 or create "
+                 "/var/lib/fprint/verimark/.allow_bootstrap to opt in");
+         return NULL;
+     }
+ 
+-    fp_warn("verimark: bootstrap ENABLED — running 0x93 DoPairBasic "
++    fp_info("verimark: bootstrap ENABLED — running 0x93 DoPairBasic "
+             "(DESTRUCTIVE)");
+ 
+     uint8_t sub1[VERIMARK_BOOTSTRAP_SUB1_SIZE];
+@@ -334,7 +334,7 @@ verimark_try_bootstrap(FpiDeviceVerimark *self)
+         return NULL;
+     }
+ 
+-    fp_warn("verimark: bootstrap SUCCEEDED — sub1 written to %s "
++    fp_info("verimark: bootstrap SUCCEEDED — sub1 written to %s "
+             "(1284 B). You can now `rm "
+             "/var/lib/fprint/verimark/.allow_bootstrap` to lock pairing.",
+             final_path);
+@@ -430,7 +430,7 @@ static void verimark_open(FpDevice *device)
+         verimark_session_zero(&self->session);
+         hr = verimark_handshake_perform(&io, &pairing, NULL, &self->session);
+         if (hr == VERIMARK_HANDSHAKE_OK)
+-            fp_warn("verimark: stale-state recovery succeeded");
++            fp_info("verimark: stale-state recovery succeeded");
+     }
+ 
+     /* Wipe the heap copy of pairing immediately. */
+@@ -708,7 +708,7 @@ verimark_verify_drain_between_attempts(FpiDeviceVerimark *self,
+ 
+ 
+ static gboolean
+-verimark_run_verify_pipeline(FpiDeviceVerimark *self,
++verimark_run_capture_match_pipeline(FpiDeviceVerimark *self,
+                               gboolean *out_frame_ready,
+                               gboolean *out_match,
+                               uint8_t out_matched_tuid[VERIMARK_STORAGE_TUID_LEN],
+@@ -773,15 +773,12 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+                                        VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
+ 
+         if (attempt == 1) {
+-            fp_warn("verify: attempt %d/%d — PLACE YOUR FINGER (timeout %d s)",
++            fp_info("verify: attempt %d/%d — waiting for finger (timeout %d s)",
+                     attempt, VERIMARK_VERIFY_MAX_ATTEMPTS,
+                     VERIMARK_VERIFY_TIMEOUT_S);
+-            g_print(">>> PLACE YOUR FINGER ON THE SENSOR NOW <<< (timeout %d s)\n",
+-                    VERIMARK_VERIFY_TIMEOUT_S);
+         } else {
+-            fp_warn("verify: attempt %d/%d — RETRY (WARM mode, looser pre-filter)",
+-                    attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
+-            g_print(">>> RETRY — touch again (attempt %d/%d) <<<\n",
++            fp_info("verify: attempt %d/%d — retry in WARM mode "
++                    "(looser pre-filter)",
+                     attempt, VERIMARK_VERIFY_MAX_ATTEMPTS);
+         }
+ 
+@@ -833,10 +830,10 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+             g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+         }
+         last_poll_count = poll_count;
+-        fp_warn("verify: attempt %d poll done — frame_ready=%d polls=%d "
+-                "false_detect=%d",
+-                attempt, frame_ready_this_attempt, poll_count,
+-                saw_false_detect);
++        fp_dbg("verify: attempt %d poll done — frame_ready=%d polls=%d "
++               "false_detect=%d",
++               attempt, frame_ready_this_attempt, poll_count,
++               saw_false_detect);
+ 
+         /* Close the capture window for this attempt. */
+         verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
+@@ -850,8 +847,8 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         if (!frame_ready_this_attempt) {
+             /* Either timeout or false-detect early exit — try again. */
+             if (attempt < VERIMARK_VERIFY_MAX_ATTEMPTS) {
+-                fp_warn("verify: no frame_ready on attempt %d, retrying",
+-                        attempt);
++                fp_dbg("verify: no frame_ready on attempt %d, retrying",
++                       attempt);
+                 continue;
+             }
+             break;
+@@ -866,7 +863,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+             return FALSE;
+         }
+         if (v_st == 0x0000 && v.len >= 16) {
+-            fp_warn("verify: positive verdict on attempt %d (%zu bytes)",
++            fp_info("verify: positive verdict on attempt %d (%zu bytes)",
+                     attempt, v.len);
+             *out_match = TRUE;
+             if (out_matched_tuid)
+@@ -875,8 +872,8 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+             break;   /* MATCH — done */
+         }
+ 
+-        fp_warn("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
+-                attempt, v_st, v.len);
++        fp_dbg("verify: attempt %d no-match (status 0x%04x, %zu bytes)",
++               attempt, v_st, v.len);
+         /* WARM trigger after a no-match for the firmware's brief
+          * red-LED feedback (cf. phase9-led-red-finding.md). */
+         verimark_capture_config(&self->session, &io, VERIMARK_CFG_WARM, &st);
+@@ -929,7 +926,7 @@ static void verimark_verify(FpDevice *device)
+     gboolean frame_ready = FALSE, matched = FALSE;
+     uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
+     GError *pipeline_err = NULL;
+-    verimark_run_verify_pipeline(self, &frame_ready, &matched,
++    verimark_run_capture_match_pipeline(self, &frame_ready, &matched,
+                                   matched_tuid, &pipeline_err);
+ 
+     /* If the sensor said positive verdict, resolve the matched_tuid
+@@ -975,13 +972,13 @@ static void verimark_verify(FpDevice *device)
+     }
+ 
+     if (matched) {
+-        fp_warn("verify: reporting MATCH_SUCCESS");
++        fp_info("verify: MATCH_SUCCESS");
+         fpi_device_verify_report(device, FPI_MATCH_SUCCESS, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+     } else if (frame_ready) {
+         /* Finger was seen but no enrollment matched → libfprint
+          * "fail" verdict, not an error. */
+-        fp_warn("verify: reporting MATCH_FAIL (finger seen, no enrollment matched)");
++        fp_info("verify: MATCH_FAIL (finger seen, no enrollment matched)");
+         if (pipeline_err) g_clear_error(&pipeline_err);
+         fpi_device_verify_report(device, FPI_MATCH_FAIL, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+@@ -989,7 +986,7 @@ static void verimark_verify(FpDevice *device)
+         /* Retry-class error (timeout / no finger) goes through report,
+          * not complete — libfprint rejects retry errors at the
+          * complete entrypoint (cf. goodixmoc fp_verify_ssm_done). */
+-        fp_warn("verify: reporting MATCH_ERROR (retry: %s)",
++        fp_info("verify: MATCH_ERROR (retry: %s)",
+                 pipeline_err->message ? pipeline_err->message : "(no msg)");
+         fpi_device_verify_report(device, FPI_MATCH_ERROR, NULL,
+                                  g_steal_pointer(&pipeline_err));
+@@ -1109,10 +1106,8 @@ verimark_enroll_one_swipe(FpiDeviceVerimark *self,
+                                    VERIMARK_MASK_FRAME_READY_ARM,
+                                    VERIMARK_MASK_FRAME_READY_ARM, 0, &st);
+ 
+-    fp_info("enroll: swipe %d — PLACE FINGER ON SENSOR (timeout %d s, WARM mode)",
++    fp_info("enroll: swipe %d — waiting for finger (timeout %d s, WARM mode)",
+             swipe_idx, VERIMARK_ENROLL_SWIPE_TIMEOUT_S);
+-    g_print(">>> SWIPE %d — vary finger position slightly between swipes <<<\n",
+-            swipe_idx);
+ 
+     if (!verimark_capture_start(&self->session, &io,
+                                  VERIMARK_CAPSTART_ENROLL, &st)) {
+@@ -1310,8 +1305,8 @@ static void verimark_enroll(FpDevice *device)
+     int useful_swipes = 0;
+     int consecutive_timeouts = 0;
+     for (int attempt = 1; attempt <= VERIMARK_ENROLL_MAX_SWIPES; attempt++) {
+-        fp_info("enroll: attempt %d/%d (useful=%d/7, bitmask=0x%02x)",
+-                attempt, VERIMARK_ENROLL_MAX_SWIPES, useful_swipes, bitmask);
++        fp_dbg("enroll: attempt %d/%d (useful=%d/7, bitmask=0x%02x)",
++               attempt, VERIMARK_ENROLL_MAX_SWIPES, useful_swipes, bitmask);
+ 
+         VerimarkEnrollAddImageResult r = {0};
+         gboolean timed_out = FALSE;
+@@ -1323,8 +1318,8 @@ static void verimark_enroll(FpDevice *device)
+ 
+         if (!ok && timed_out) {
+             consecutive_timeouts++;
+-            fp_info("enroll: swipe timed out (consecutive=%d)",
+-                    consecutive_timeouts);
++            fp_dbg("enroll: swipe timed out (consecutive=%d)",
++                   consecutive_timeouts);
+             if (consecutive_timeouts >= 3) {
+                 if (swipe_err) g_clear_error(&swipe_err);
+                 /* Non-retry error class — FP_DEVICE_RETRY is reserved
+@@ -1358,7 +1353,7 @@ static void verimark_enroll(FpDevice *device)
+ 
+         gboolean accepted = (r.verdict_char == VERIMARK_ENROLL_VERDICT_ACCEPTED);
+         gboolean bitmask_advanced = (r.progress_bitmask != bitmask);
+-        fp_info("enroll: add_image bitmask=0x%02x verdict=%s swipe_idx=%u "
++        fp_dbg("enroll: add_image bitmask=0x%02x verdict=%s swipe_idx=%u "
+                 "cumulative=%u",
+                 r.progress_bitmask,
+                 accepted ? "'d' ACCEPTED" : "REJECTED",
+@@ -1378,7 +1373,7 @@ static void verimark_enroll(FpDevice *device)
+                 break;
+             }
+         } else {
+-            fp_info("enroll: swipe rejected (duplicate or low quality) — "
++            fp_dbg("enroll: swipe rejected (duplicate or low quality) — "
+                     "shift finger position slightly and retry");
+             /* Surface the rejection to fprintd's UI via a retry-class
+              * GError. fpi_device_enroll_progress consumes the error
+@@ -1402,7 +1397,7 @@ static void verimark_enroll(FpDevice *device)
+     }
+ 
+     /* === 0x96 03 commit === */
+-    fp_info("enroll: committing template");
++    fp_dbg("enroll: committing template");
+     uint16_t commit_st = 0;
+     if (!verimark_enroll_commit(&self->session, &io, new_tuid,
+                                  NULL /* SID = zeros */, &commit_st)) {
+@@ -1424,12 +1419,12 @@ static void verimark_enroll(FpDevice *device)
+     /* === 0x9e 01 DB refresh (informational ; status not enforced) === */
+     VerimarkStorageDbInfo dbi = {0};
+     verimark_storage_get_db_info(&self->session, &io, 0x01, &dbi, &st);
+-    fp_info("enroll: DB after commit — class_1=%u class_2=%u class_3=%u",
+-            dbi.count_class_1, dbi.count_class_2, dbi.count_class_3);
++    fp_dbg("enroll: DB after commit — class_1=%u class_2=%u class_3=%u",
++           dbi.count_class_1, dbi.count_class_2, dbi.count_class_3);
+ 
+     /* === 0x96 04 finish === */
+     verimark_enroll_finish(&self->session, &io, &st);
+-    fp_info("enroll: FINISH 0x96 04 status=0x%04x", st);
++    fp_dbg("enroll: FINISH 0x96 04 status=0x%04x", st);
+ 
+     /* === Resolve the actual storage_handle the sensor assigned. ===
+      * Some sensors don't honour the host-supplied tuid — they generate
+@@ -1548,7 +1543,7 @@ static void verimark_identify(FpDevice *device)
+     gboolean frame_ready = FALSE, matched = FALSE;
+     uint8_t matched_tuid[VERIMARK_STORAGE_TUID_LEN] = {0};
+     GError *pipeline_err = NULL;
+-    verimark_run_verify_pipeline(self, &frame_ready, &matched,
++    verimark_run_capture_match_pipeline(self, &frame_ready, &matched,
+                                   matched_tuid, &pipeline_err);
+ 
+     if (matched) {

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:45:31 +0200
+Subject: [PATCH 37/62] verimark: fix GTask leak when auto-routing IT calls to
+ BULK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous commit allocated a local GTask before checking the
+PID, then unref'd it without ever calling g_task_return_*() when
+forwarding to verimark_transceive_async_bulk — tripping GLib's
+"GTask … finalized without ever returning" warning at runtime.
+fprintd-enroll produced ~30 of these per session.
+
+Restructure: check PID and dispatch BEFORE allocating the local
+GTask. transceive_async_bulk creates and owns its own task.
+Argument validation moves after the dispatch (safe: BULK helper
+re-validates).
+---
+ libfprint/drivers/verimark/transport.c | 34 ++++++++++++++------------
+ 1 file changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index b9f4041..6e50406 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -480,6 +480,24 @@ verimark_transceive_async(VerimarkUsbHandle *h,
+                           GAsyncReadyCallback callback,
+                           gpointer user_data)
+ {
++    /* Auto-route to BULK on the IT (047d:8054), BEFORE creating a local
++     * GTask : transceive_async_bulk creates its own and unref'ing an
++     * unfulfilled task would trip GLib's
++     *   "GTask … finalized without ever returning"
++     * warning at runtime. All callers (verify, enroll, identify, list,
++     * ...) go through this function, so the auto-route covers them
++     * without each having to learn about is_it_variant. */
++    if (h != NULL) {
++        GUsbDevice *dev = (GUsbDevice *)h->native;
++        if (dev != NULL && g_usb_device_get_pid(dev) == VERIMARK_PID_IT) {
++            verimark_transceive_async_bulk(h, data, data_len,
++                                            resp, resp_size,
++                                            timeout_ms, cancellable,
++                                            callback, user_data);
++            return;
++        }
++    }
++
+     GTask *task = g_task_new(NULL, cancellable, callback, user_data);
+     g_task_set_source_tag(task, verimark_transceive_async);
+ 
+@@ -489,22 +507,6 @@ verimark_transceive_async(VerimarkUsbHandle *h,
+         g_object_unref(task);
+         return;
+     }
+-    /* Auto-route to BULK on the IT (047d:8054). All callers that talk
+-     * Tudor opcodes go through this function (verify, enroll, identify,
+-     * list, ...) ; routing here means they all just work without each
+-     * having to learn about is_it_variant. The IT bypasses the wValue
+-     * formula / 8-byte alignment quirks of the DT vendor control framing. */
+-    {
+-        GUsbDevice *dev = (GUsbDevice *)h->native;
+-        if (dev != NULL && g_usb_device_get_pid(dev) == VERIMARK_PID_IT) {
+-            g_object_unref(task);   /* release the local task, transceive_async_bulk creates its own */
+-            verimark_transceive_async_bulk(h, data, data_len,
+-                                            resp, resp_size,
+-                                            timeout_ms, cancellable,
+-                                            callback, user_data);
+-            return;
+-        }
+-    }
+     /* Single-chunk only — multi-chunk fragmentation is the sync path's
+      * job, and no observed Tudor opcode exceeds the chunk size. */
+     if (data_len > VERIMARK_CHUNK_SIZE) {

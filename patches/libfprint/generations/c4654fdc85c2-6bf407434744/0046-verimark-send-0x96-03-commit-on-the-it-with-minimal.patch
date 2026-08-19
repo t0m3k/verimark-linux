@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:28:13 +0200
+Subject: [PATCH 46/62] verimark: send 0x96 03 commit on the IT with minimal
+ 1-byte payload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous skip-commit hypothesis was disproved by the
+RESOLVE_TUID diag log : pre_count == post_count == 8 on the IT,
+meaning the template was never persisted. The 0x96 03 commit is
+needed to write the RAM working slot to NVRAM ; without it the
+template only lives in firmware RAM until 0x96 04 finish clears
+it.
+
+The DT 123-byte commit payload (TUID + SID + footer) was the
+trigger of the original 0x0404 BAD_STATE on the IT. The IT
+likely expects a different / shorter payload. As the smallest
+hypothesis : send just the sub-command byte 0x03 with no body
+and inspect the firmware response in enr_cb_commit.
+
+If 0x0000 → template persisted, getlist will show count+1 ; if
+0x0404 or another status, log it and grow the payload structure
+based on the firmware's response.
+---
+ libfprint/drivers/verimark/verimark.c | 29 ++++++++++++++++++---------
+ 1 file changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 9900e36..ac2e73b 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2571,16 +2571,27 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         fpi_ssm_next_state(ssm);
+         return;
+     case ENR_S_COMMIT_CALL: {
+-        /* IT firmware auto-commits when it signals enroll-complete via
+-         * 0x8006 on add_image. Sending the DT-style 0x96 03 commit on
+-         * the IT is rejected with VERIMARK_STATUS_BAD_STATE (0x0404)
+-         * because the firmware is already in idle state. Skip to
+-         * DB_REFRESH so the new TUID is still resolved via the pre/post
+-         * getlist diff (same as the DT post-commit path). */
++        /* IT : the previous "skip 0x96 03" hypothesis was wrong — the
++         * RESOLVE_TUID diag log showed pre_count == post_count after
++         * IT enroll, meaning the template was NEVER persisted to NVRAM.
++         * The 0x96 03 commit IS required to write the RAM working slot
++         * to NVRAM. The DT 123-byte commit payload is rejected on the
++         * IT with 0x0404 (BAD_STATE) ; the IT seems to expect either
++         * no payload or a different structure. Send an empty payload as
++         * the simplest hypothesis. */
+         GUsbDevice *usb = fpi_device_get_usb_device(dev);
+-        if (usb != NULL && g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
+-            fp_info("verimark: IT enroll skipping 0x96 03 (firmware auto-commits)");
+-            fpi_ssm_next_state(ssm);
++        const gboolean is_it = (usb != NULL &&
++                                g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
++        if (is_it) {
++            /* Minimal payload : just the sub-command byte 0x03 = commit.
++             * The DT's 123-byte body (TUID + SID + footer) was rejected
++             * with 0x0404 on the IT. Try the smallest valid framing
++             * first ; we can grow it incrementally if needed. */
++            static const uint8_t it_commit_payload[1] = { 0x03 };
++            fp_warn("verimark: IT enroll sending 0x96 03 with 1-byte payload");
++            verimark_session_call_opcode_async(&self->session, self->transport,
++                3000, 0x96, it_commit_payload, sizeof(it_commit_payload),
++                cancel, enr_cb_commit, ssm);
+             return;
+         }
+         uint8_t commit_payload[123];

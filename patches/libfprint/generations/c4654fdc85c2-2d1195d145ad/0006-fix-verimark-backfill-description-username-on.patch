@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 11:37:38 +0200
+Subject: [PATCH 06/33] fix(verimark): backfill description + username on
+ enroll-time FpPrint
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`delete_enrolled_fingers` in fprintd is called at the start of every
+new enroll to clean stale device-side prints. It iterates the user's
+cached FpPrints (deserialized from disk) and logs metadata via g_log
+before calling our delete() vfunc. NULL description / username from a
+previously-enrolled print crashes the logger (strlen on NULL).
+
+The fprintd CLI only sets `finger` and `username` on the template it
+hands to libfprint — never `description`. Backfill both fields (if
+absent) at enroll-complete time so the serialized print on disk
+always has them populated for future iterations.
+
+Note: existing cached prints from BEFORE this fix still have NULL
+description and will keep crashing fprintd until they are deleted
+manually (`rm /var/lib/fprintd/<user>/Kensington_VeriMark_DT/*`).
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index ac3cab2..4f28662 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -1244,6 +1244,16 @@ static void verimark_enroll(FpDevice *device)
+         fpi_print_set_type(template, FPI_PRINT_RAW);
+         fpi_print_set_device_stored(template, TRUE);
+         g_object_set(template, "fpi-data", data, NULL);
++        /* fprintd serializes the FpPrint to disk and later iterates the
++         * cached prints during enroll cleanup (`delete_enrolled_fingers`),
++         * logging metadata via g_log. A NULL description or username
++         * crashes that logger (strlen on NULL). The CLI only sets
++         * finger + username, so we backfill description here ; defensive
++         * username default if the caller didn't set one. */
++        if (fp_print_get_description(template) == NULL)
++            fp_print_set_description(template, "Kensington VeriMark DT");
++        if (fp_print_get_username(template) == NULL)
++            fp_print_set_username(template, "verimark");
+         fpi_device_enroll_complete(device, g_object_ref(template), NULL);
+     } else {
+         /* Defensive fallback : if libfprint didn't hand us a template

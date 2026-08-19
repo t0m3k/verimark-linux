@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 16:24:46 +0200
+Subject: [PATCH 24/33] =?UTF-8?q?feat(verimark):=20Phase=2010.3.f=20?=
+ =?UTF-8?q?=E2=80=94=20cancellation=20polish=20(dev=5Fclass->cancel=20hook?=
+ =?UTF-8?q?)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement `verimark_cancel(FpDevice *)` and wire it to
+`dev_class->cancel`. Conclude Phase 10.3 (sync → fpi_ssm refactor).
+
+Why this is small (~50 LOC, not the ~150 estimated) :
+Phase 10.3.d/e already wired `GCancellable` from
+`fpi_device_get_cancellable()` into every async opcode call. So when
+fprintd sends VerifyStop / EnrollStop, the GCancellable cascade
+short-circuits every pending USB transfer with `G_IO_ERROR_CANCELLED`,
+the async callback fires, the SSM mark_failed-s, and the done
+callback surfaces the cancellation to `fpi_device_*_complete`.
+
+The only gap : states blocked on `g_timeout_add` are invisible to
+the GCancellable cascade. Without this hook, a Ctrl+C delivered
+while the verify SSM is in `VFY_S_POLL_WAIT` (250 ms) or
+`VFY_S_DRAIN_SLEEP` (500 ms), or the enroll SSM is in
+`ENR_S_SWIPE_POLL_WAIT` (250 ms), would only take effect at the
+next USB opcode — bounded but visible delay.
+
+Hook logic :
+- If `pending_timer_id != 0`, drop the timer with `g_source_remove`
+  and call `fpi_ssm_mark_failed` with `G_IO_ERROR_CANCELLED`. The
+  SSM done callback then completes the libfprint action.
+- Otherwise (USB transfer in flight, no timer), do nothing — the
+  GCancellable cascade is already handling it.
+
+Double-mark_failed is avoided by construction : the two branches
+(timer pending vs USB pending) are mutually exclusive in our SSM
+design (each state is either an async USB call OR a timer, never
+both).
+
+Builds clean (zero warnings) against libfprint 1.94.10 / libgusb
+0.4.9 on NixOS. 11 standalone TDD suites stay green.
+
+Runtime validation via `fprintd-verify $(whoami)` + Ctrl+C mid-poll
+pending — should release the USB claim cleanly without unplug/replug.
+
+AI-assisted.
+---
+ libfprint/drivers/verimark/verimark.c | 68 +++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 73a8237..3bfc339 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2659,6 +2659,73 @@ static void fpi_device_verimark_init(FpiDeviceVerimark *self)
+ }
+ 
+ 
++/* ========================================================================
++ * Phase 10.3.f — cancellation
++ * ========================================================================
++ *
++ * libfprint's cancellation path :
++ *   1. fprintd (or any caller) requests VerifyStop / EnrollStop.
++ *   2. libfprint cancels the GCancellable returned by
++ *      `fpi_device_get_cancellable()` — every pending
++ *      `g_usb_device_control_transfer_async()` short-circuits with
++ *      `G_IO_ERROR_CANCELLED`, the async callback fires, the SSM
++ *      transitions to mark_failed, and the done callback surfaces the
++ *      cancellation to fpi_device_*_complete.
++ *   3. libfprint then calls `dev_class->cancel(device)` for any
++ *      driver-side cleanup the GCancellable cascade can't reach.
++ *
++ * Step 2 covers every state that is waiting on a USB transfer ; it does
++ * NOT cover states that are waiting on a `g_timeout_add` (the verify
++ * poll wait / drain sleep ; the enroll poll wait). Without this hook,
++ * a Ctrl+C delivered while we're in a timer-bound state would only take
++ * effect at the NEXT USB call — bounded but visible.
++ *
++ * This hook handles that gap : if a timer is pending, drop it and mark
++ * the SSM failed with `G_IO_ERROR_CANCELLED`. The SSM done callback
++ * then completes the libfprint action with that error.
++ *
++ * Caveat : we MUST NOT call `fpi_ssm_mark_failed` twice. If a USB
++ * transfer is in flight (no timer pending), the GCancellable cascade
++ * will fire the async callback which calls mark_failed itself — we
++ * stay out of its way.
++ */
++static void
++verimark_cancel(FpDevice *device)
++{
++    FpiDeviceVerimark *self = FPI_DEVICE_VERIMARK(device);
++    if (self->task_ssm == NULL)
++        return;
++
++    if (self->verify_ctx != NULL) {
++        VerimarkVerifyCtx *ctx = self->verify_ctx;
++        if (ctx->pending_timer_id != 0) {
++            g_source_remove(ctx->pending_timer_id);
++            ctx->pending_timer_id = 0;
++            fp_dbg("cancel: verify/identify timer dropped, marking SSM failed");
++            fpi_ssm_mark_failed(self->task_ssm,
++                g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                            "verify/identify cancelled by request"));
++        }
++        /* No timer pending → a USB transfer is in flight ; the
++         * GCancellable cascade is already handling it. */
++        return;
++    }
++
++    if (self->enroll_ctx != NULL) {
++        VerimarkEnrollCtx *ctx = self->enroll_ctx;
++        if (ctx->pending_timer_id != 0) {
++            g_source_remove(ctx->pending_timer_id);
++            ctx->pending_timer_id = 0;
++            fp_dbg("cancel: enroll timer dropped, marking SSM failed");
++            fpi_ssm_mark_failed(self->task_ssm,
++                g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                            "enroll cancelled by request"));
++        }
++        return;
++    }
++}
++
++
+ static void fpi_device_verimark_class_init(FpiDeviceVerimarkClass *klass)
+ {
+     FpDeviceClass *dev_class = FP_DEVICE_CLASS(klass);
+@@ -2686,4 +2753,5 @@ static void fpi_device_verimark_class_init(FpiDeviceVerimarkClass *klass)
+     dev_class->identify = verimark_identify;
+     dev_class->list     = verimark_list;
+     dev_class->delete   = verimark_delete;
++    dev_class->cancel   = verimark_cancel;
+ }

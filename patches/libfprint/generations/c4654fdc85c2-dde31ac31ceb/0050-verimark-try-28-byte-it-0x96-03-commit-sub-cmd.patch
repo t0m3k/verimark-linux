@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 13:49:36 +0200
+Subject: [PATCH 50/62] verimark: try 28-byte IT 0x96 03 commit (sub-cmd +
+ length + TUID)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+4-byte payload (just u32 LE sub-cmd) gave 0x0404 — firmware
+accepts the sub-cmd but needs the rest of the structure. The DLL
+RE showed total = data_length + 12, so the framing per the IT
+firmware expectation is :
+
+    [sub-cmd u32 LE = 03 00 00 00]      offset 0
+    [control 4 bytes]                    offset 4
+    [length u32 LE = 10 00 00 00 = 16]  offset 8
+    [TUID 16 bytes]                      offset 12
+
+Total = 12 + 16 = 28 bytes.
+---
+ libfprint/drivers/verimark/verimark.c | 29 ++++++++++++---------------
+ 1 file changed, 13 insertions(+), 16 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 4bb0a10..df96dcf 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2583,22 +2583,19 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         const gboolean is_it = (usb != NULL &&
+                                 g_usb_device_get_pid(usb) == VERIMARK_PID_IT);
+         if (is_it) {
+-            /* RE of synaWudfBioUsb123.dll fcn.18009a8a0
+-             * (tudorCmdMisEnrollCommit) shows the wire framing is
+-             *   [opcode 0x96][sub-cmd u32 LE = 03 00 00 00][...data]
+-             * NOT a single byte sub-cmd. Our previous attempts (1B,
+-             * 17B, 35B, 123B) all sent the sub-cmd as a single byte
+-             * so the firmware couldn't parse it correctly.
+-             *
+-             * Try the minimal form first : just the 4-byte sub-cmd
+-             * u32 LE. If 0x0000 → committed. Otherwise the DLL also
+-             * writes an encoded length and the TUID after that — but
+-             * we start small. */
+-            static const uint8_t it_commit_payload[4] = {
+-                0x03, 0x00, 0x00, 0x00,
+-            };
+-            fp_warn("verimark: IT enroll sending 0x96 03 with 4-byte payload "
+-                    "(sub-cmd as u32 LE per the documented protocol analysis)");
++            /* 4-byte sub-cmd alone gave 0x0404 (same as the DT 123B,
++             * means firmware accepted sub-cmd but state mismatch).
++             * The DLL builds total = data_length + 12, so the framing
++             * is sub-cmd(4) + control(4) + length(4) + data. Build
++             * the 28-byte form : sub-cmd u32 LE + 8 zero bytes +
++             * length u32 LE = 16 + 16-byte TUID. */
++            uint8_t it_commit_payload[28] = {0};
++            it_commit_payload[0]  = 0x03;          /* sub-cmd u32 LE */
++            it_commit_payload[8]  = 0x10;          /* length u32 LE = 16 */
++            memcpy(it_commit_payload + 12, ctx->new_tuid,
++                   VERIMARK_STORAGE_TUID_LEN);
++            fp_warn("verimark: IT enroll sending 0x96 03 with 28-byte payload "
++                    "(sub-cmd + 4B zero + length=16 + TUID)");
+             verimark_session_call_opcode_async(&self->session, self->transport,
+                 3000, 0x96, it_commit_payload, sizeof(it_commit_payload),
+                 cancel, enr_cb_commit, ssm);

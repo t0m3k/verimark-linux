@@ -1,0 +1,546 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 08:47:35 +0200
+Subject: [PATCH 30/62] =?UTF-8?q?verimark:=20bootstrap=20the=20IT=20port?=
+ =?UTF-8?q?=20(047d:8054)=20=E2=80=94=20BULK=20transport=20+=20constants?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Following the end-to-end validation of "path A" on the Python side
+(load extracted IT sub1 -> TLS handshake -> AppData round-trip), this
+commit brings the bootstrap of the libfprint port for the VeriMark IT
+to the driver source tree. The DT-side helpers (crypto, Synaptics KDF,
+session management) are reusable as-is; only the USB transport and a
+few constants differ between the DT and the IT.
+
+proto.h/c:
+- IT-specific protocol constants verbatim from the documented device trace
+  (4-opcode init dance, plaintext TLS close_notify, 44 00 00 00 prefix
+  for handshake records, firmware error sentinels 0x044f / 0x0406).
+- IT USB topology (EP01 OUT, EP81 IN, EP83 INTR, MI_00).
+- Pair frame sizes (401 B OUT, 802 B IN).
+
+transport.h/c:
+- New verimark_bulk_out / verimark_bulk_in primitives (libgusb-
+  backed), mirroring the existing ctrl_out / ctrl_in helpers.
+- Stubs for the no-libgusb standalone build.
+- verimark_bulk_in implements the Python bulk_read_all loop: keeps
+  reading chunks until a short packet (< 64 B) or a timeout, returns
+  the total bytes received.
+
+tests/test_it_proto.c — 10/10 green:
+- VID/PID/EPs (047d:8054, EP01/81/83, MI_00).
+- Pair opcode and sizes (0x93 / 401 B / 802 B).
+- Error sentinels (0x044f not_allowed, 0x0406 invalid_arg).
+- Init dance bytes verbatim (frames 4110 / 4114 / 4118 / 4122).
+- TLS close_notify plaintext and Synaptics HS prefix.
+
+All 12 tests are green (existing DT proto/crypto/tls/pairing/session/
+handshake/storage/capture/match/enroll/bootstrap, plus the new IT
+proto). No regression on the DT path.
+
+Next steps (future sessions):
+- High-level helper verimark_init_dance_it that sends the 4 opcodes
+  and handles the close_notify recovery when the firmware-side
+  session is stale.
+- IT variant of the TLS handshake (5-cipher ClientHello, otherwise
+  identical to the DT path).
+- Wiring inside open(): replace the current introspection-only stub
+  with the full IT path (init dance -> handshake -> session_active).
+---
+ libfprint/drivers/verimark/meson.build        |   8 +
+ libfprint/drivers/verimark/proto.c            |  34 +++
+ libfprint/drivers/verimark/proto.h            |  46 +++++
+ .../drivers/verimark/tests/test_it_proto.c    | 193 ++++++++++++++++++
+ libfprint/drivers/verimark/transport.c        |  87 ++++++++
+ libfprint/drivers/verimark/transport.h        |  50 +++++
+ 6 files changed, 418 insertions(+)
+ create mode 100644 libfprint/drivers/verimark/tests/test_it_proto.c
+
+diff --git a/libfprint/drivers/verimark/meson.build b/libfprint/drivers/verimark/meson.build
+index bbe7fcb..f285eff 100644
+--- a/libfprint/drivers/verimark/meson.build
++++ b/libfprint/drivers/verimark/meson.build
+@@ -83,6 +83,14 @@ test_proto_exe = executable(
+ )
+ test('proto', test_proto_exe)
+ 
++test_it_proto_exe = executable(
++  'test_it_proto',
++  files('tests/test_it_proto.c'),
++  link_with: proto_lib,
++  include_directories: include_directories('.'),
++)
++test('it_proto', test_it_proto_exe)
++
+ 
+ crypto_lib = static_library(
+   'crypto',
+diff --git a/libfprint/drivers/verimark/proto.c b/libfprint/drivers/verimark/proto.c
+index afba628..fd708ed 100644
+--- a/libfprint/drivers/verimark/proto.c
++++ b/libfprint/drivers/verimark/proto.c
+@@ -15,6 +15,40 @@
+ #define VERIMARK_MAGIC_WRITE  0x80004007u
+ 
+ 
++/* --- IT BULK transport constants -----------------------------------------
++ *
++ * Source of truth : the documented device trace (frames 4110 / 4114 /
++ * 4118 / 4122) cross-checked with tools/verimark-it/it_protocol.py
++ * (test_it_protocol 11/11). Voie A end-to-end validated runtime
++ * 2026-06-07 via handshake_attempt.py --probe-appdata.
++ */
++
++const uint8_t VERIMARK_IT_INIT_01[1]  = { 0x01 };
++const uint8_t VERIMARK_IT_INIT_19[1]  = { 0x19 };
++
++const uint8_t VERIMARK_IT_INIT_8E09[VERIMARK_IT_INIT_8E09_SIZE] = {
++    0x8e, 0x09, 0x00, 0x02,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++const uint8_t VERIMARK_IT_INIT_8E1A[VERIMARK_IT_INIT_8E1A_SIZE] = {
++    0x8e, 0x1a, 0x00, 0x02,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* TLS Alert close_notify : level=warning(1), description=close_notify(0). */
++const uint8_t VERIMARK_IT_CLOSE_NOTIFY[7] = {
++    0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00,
++};
++
++/* Synaptics handshake transport prefix (only used on HS records). */
++const uint8_t VERIMARK_IT_HS_PREFIX[VERIMARK_IT_HS_PREFIX_SIZE] = {
++    0x44, 0x00, 0x00, 0x00,
++};
++
++
+ uint16_t verimark_compute_wvalue_write(size_t original_length)
+ {
+     /* wValue = original_length & magic_write & 7 = original_length & 7
+diff --git a/libfprint/drivers/verimark/proto.h b/libfprint/drivers/verimark/proto.h
+index 31d3f74..2a1297f 100644
+--- a/libfprint/drivers/verimark/proto.h
++++ b/libfprint/drivers/verimark/proto.h
+@@ -66,6 +66,52 @@ extern "C" {
+ #define VERIMARK_STATUS_UNKNOWN_OP   0x0104  /* opcode not recognized */
+ #define VERIMARK_STATUS_BAD_STATE    0x0404  /* e.g. capture not started */
+ 
++/* ---- IT-specific BULK transport (047d:8054) -------------------------------
++ *
++ * The IT speaks the same Tudor TLS 1.2 family as the DT but over BULK
++ * endpoints (EP01 OUT / EP81 IN / EP83 INTR). Constants and init bytes
++ * here mirror tools/verimark-it/it_protocol.py — verified runtime
++ * 2026-06-07 with the AppData round-trip in handshake_attempt.py
++ * --probe-appdata. See docs/it-pairing-capture.md § "Voie A".
++ */
++
++#define VERIMARK_IT_EP_BULK_OUT     0x01
++#define VERIMARK_IT_EP_BULK_IN      0x81
++#define VERIMARK_IT_EP_INTR_IN      0x83   /* async finger events */
++
++/* IT pair opcode + framing (post-init dance ; see voie B notes for why
++ * 0x93 is refused from Linux : firmware-side NVRAM lock).  */
++#define VERIMARK_IT_PAIR_OPCODE     0x93
++#define VERIMARK_IT_PAIR_OUT_SIZE   401   /* 1 opcode + 400 B WIRE cert */
++#define VERIMARK_IT_PAIR_IN_SIZE    802   /* 2 B header + 2 × 400 B cert */
++
++/* IT firmware status sentinels — returned as the 2-byte response when the
++ * pair / cmd is refused, distinct from the standard u16 BE status codes. */
++#define VERIMARK_IT_ERR_NOT_ALLOWED   0x044F  /* pair refused (NVRAM lock) */
++#define VERIMARK_IT_ERR_INVALID_ARG   0x0406  /* bad framing / payload */
++
++/* Plaintext TLS Alert close_notify (level=warning, description=close_notify),
++ * sent on EP01 OUT to drop the firmware-side TLS session — mirrors the
++ * Synaptics DLL's ssiTlsAlertNotify path. */
++extern const uint8_t VERIMARK_IT_CLOSE_NOTIFY[7];
++
++/* IT init dance — verbatim bytes from the documented device trace
++ * (documented-device-trace frames 4110, 4114, 4118, 4122). The
++ * firmware requires this sequence twice before accepting 0x93 ; only
++ * needed for voie B (abandoned). For voie A (handshake from existing
++ * sub1), only the bio-serial response of `01` is consumed. */
++#define VERIMARK_IT_INIT_8E09_SIZE  17
++#define VERIMARK_IT_INIT_8E1A_SIZE  17
++
++extern const uint8_t VERIMARK_IT_INIT_01[1];
++extern const uint8_t VERIMARK_IT_INIT_8E09[VERIMARK_IT_INIT_8E09_SIZE];
++extern const uint8_t VERIMARK_IT_INIT_8E1A[VERIMARK_IT_INIT_8E1A_SIZE];
++extern const uint8_t VERIMARK_IT_INIT_19[1];
++
++/* Transport-prefix used on TLS handshake records (not on AppData). */
++#define VERIMARK_IT_HS_PREFIX_SIZE  4
++extern const uint8_t VERIMARK_IT_HS_PREFIX[VERIMARK_IT_HS_PREFIX_SIZE];
++
+ /* ---- Helpers ---- */
+ 
+ /**
+diff --git a/libfprint/drivers/verimark/tests/test_it_proto.c b/libfprint/drivers/verimark/tests/test_it_proto.c
+new file mode 100644
+index 0000000..2fd4e10
+--- /dev/null
++++ b/libfprint/drivers/verimark/tests/test_it_proto.c
+@@ -0,0 +1,193 @@
++/*
++ * test_it_proto.c — TDD tests for the IT-specific protocol constants
++ * declared in proto.h and defined in proto.c.
++ *
++ * These constants are the C mirror of tools/verimark-it/it_protocol.py
++ * (tested in tests/test_it_protocol.py, 11/11 green). Source of truth :
++ * the documented device trace (documented-device-trace, frames
++ * 4110 / 4114 / 4118 / 4122) cross-checked end-to-end on 2026-06-07
++ * via handshake_attempt.py --probe-appdata.
++ *
++ * Compile + run via meson :
++ *   cd driver/verimark
++ *   meson setup build && meson test -C build
++ */
++
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "proto.h"
++
++#define TEST(name) static int test_##name(void)
++
++#define ASSERT_EQ(a, b) do { \
++    if ((a) != (b)) { \
++        fprintf(stderr, "  %s:%d: ASSERT_EQ failed: %s (%ld) != %s (%ld)\n", \
++                __FILE__, __LINE__, #a, (long)(a), #b, (long)(b)); \
++        return 1; \
++    } \
++} while (0)
++
++#define ASSERT_MEM_EQ(a, b, n) do { \
++    if (memcmp((a), (b), (n)) != 0) { \
++        fprintf(stderr, "  %s:%d: ASSERT_MEM_EQ failed over %zu bytes\n", \
++                __FILE__, __LINE__, (size_t)(n)); \
++        return 1; \
++    } \
++} while (0)
++
++/* ---- USB transport identifiers ---- */
++
++TEST(it_pid_is_8054)
++{
++    ASSERT_EQ(VERIMARK_PID_IT, 0x8054);
++    ASSERT_EQ(VERIMARK_VID, 0x047d);
++    return 0;
++}
++
++TEST(it_bulk_endpoints)
++{
++    ASSERT_EQ(VERIMARK_IT_EP_BULK_OUT, 0x01);
++    ASSERT_EQ(VERIMARK_IT_EP_BULK_IN,  0x81);
++    ASSERT_EQ(VERIMARK_IT_EP_INTR_IN,  0x83);
++    /* IT has a single vendor interface MI_00, unlike the DT's MI_01. */
++    ASSERT_EQ(VERIMARK_MI_BIO_IT, 0);
++    return 0;
++}
++
++TEST(it_pair_opcode_and_sizes)
++{
++    ASSERT_EQ(VERIMARK_IT_PAIR_OPCODE, 0x93);
++    /* 1 byte opcode + 400 byte WIRE cert. */
++    ASSERT_EQ(VERIMARK_IT_PAIR_OUT_SIZE, 401);
++    /* 2 byte header + 400 byte STORAGE cert + 400 byte WIRE server cert. */
++    ASSERT_EQ(VERIMARK_IT_PAIR_IN_SIZE,  802);
++    return 0;
++}
++
++TEST(it_error_sentinels)
++{
++    /* Observed when 0x93 is refused — firmware-side NVRAM lock. */
++    ASSERT_EQ(VERIMARK_IT_ERR_NOT_ALLOWED, 0x044F);
++    /* Observed on malformed framing (e.g. 8e 93 wrapping). */
++    ASSERT_EQ(VERIMARK_IT_ERR_INVALID_ARG, 0x0406);
++    return 0;
++}
++
++/* ---- Init dance bytes — must be verbatim from pcap frames ---- */
++
++TEST(init_01_matches_frame_4110)
++{
++    const uint8_t expected[1] = { 0x01 };
++    ASSERT_EQ(sizeof(VERIMARK_IT_INIT_01), 1);
++    ASSERT_MEM_EQ(VERIMARK_IT_INIT_01, expected, 1);
++    return 0;
++}
++
++TEST(init_8e09_matches_frame_4114)
++{
++    const uint8_t expected[VERIMARK_IT_INIT_8E09_SIZE] = {
++        0x8e, 0x09, 0x00, 0x02,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00,
++    };
++    ASSERT_EQ(VERIMARK_IT_INIT_8E09_SIZE, 17);
++    ASSERT_MEM_EQ(VERIMARK_IT_INIT_8E09, expected, VERIMARK_IT_INIT_8E09_SIZE);
++    /* Body : marker `8e` + opcode `09` + length BE u16 = 2 + 2-byte payload. */
++    ASSERT_EQ(VERIMARK_IT_INIT_8E09[0], 0x8e);
++    ASSERT_EQ(VERIMARK_IT_INIT_8E09[1], 0x09);
++    ASSERT_EQ(VERIMARK_IT_INIT_8E09[2], 0x00);
++    ASSERT_EQ(VERIMARK_IT_INIT_8E09[3], 0x02);
++    /* The remaining 13 bytes are all zero (payload + padding). */
++    for (size_t i = 4; i < VERIMARK_IT_INIT_8E09_SIZE; i++) {
++        ASSERT_EQ(VERIMARK_IT_INIT_8E09[i], 0x00);
++    }
++    return 0;
++}
++
++TEST(init_8e1a_matches_frame_4118)
++{
++    const uint8_t expected[VERIMARK_IT_INIT_8E1A_SIZE] = {
++        0x8e, 0x1a, 0x00, 0x02,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00,
++    };
++    ASSERT_EQ(VERIMARK_IT_INIT_8E1A_SIZE, 17);
++    ASSERT_MEM_EQ(VERIMARK_IT_INIT_8E1A, expected, VERIMARK_IT_INIT_8E1A_SIZE);
++    return 0;
++}
++
++TEST(init_19_matches_frame_4122)
++{
++    const uint8_t expected[1] = { 0x19 };
++    ASSERT_EQ(sizeof(VERIMARK_IT_INIT_19), 1);
++    ASSERT_MEM_EQ(VERIMARK_IT_INIT_19, expected, 1);
++    return 0;
++}
++
++/* ---- TLS control records ---- */
++
++TEST(close_notify_is_plaintext_alert)
++{
++    /* RFC 5246 §7.2.1 : ContentType=Alert(0x15), version=TLS1.2(0x0303),
++     * length=2, AlertLevel=warning(1), AlertDescription=close_notify(0). */
++    const uint8_t expected[7] = {
++        0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00,
++    };
++    ASSERT_EQ(sizeof(VERIMARK_IT_CLOSE_NOTIFY), 7);
++    ASSERT_MEM_EQ(VERIMARK_IT_CLOSE_NOTIFY, expected, 7);
++    return 0;
++}
++
++TEST(hs_prefix_is_44_zeros)
++{
++    /* Synaptics transport-mode prefix on handshake records. NOT used on
++     * application data (post-CCS) records — verified runtime via
++     * handshake_attempt.py --probe-appdata. */
++    const uint8_t expected[VERIMARK_IT_HS_PREFIX_SIZE] = {
++        0x44, 0x00, 0x00, 0x00,
++    };
++    ASSERT_EQ(VERIMARK_IT_HS_PREFIX_SIZE, 4);
++    ASSERT_MEM_EQ(VERIMARK_IT_HS_PREFIX, expected, VERIMARK_IT_HS_PREFIX_SIZE);
++    return 0;
++}
++
++
++typedef int (*test_fn)(void);
++
++struct test_entry {
++    const char *name;
++    test_fn     fn;
++};
++
++#define ADD_TEST(name) { #name, test_##name }
++
++int main(void)
++{
++    struct test_entry tests[] = {
++        ADD_TEST(it_pid_is_8054),
++        ADD_TEST(it_bulk_endpoints),
++        ADD_TEST(it_pair_opcode_and_sizes),
++        ADD_TEST(it_error_sentinels),
++        ADD_TEST(init_01_matches_frame_4110),
++        ADD_TEST(init_8e09_matches_frame_4114),
++        ADD_TEST(init_8e1a_matches_frame_4118),
++        ADD_TEST(init_19_matches_frame_4122),
++        ADD_TEST(close_notify_is_plaintext_alert),
++        ADD_TEST(hs_prefix_is_44_zeros),
++    };
++    const size_t n = sizeof(tests) / sizeof(tests[0]);
++    int failed = 0;
++    for (size_t i = 0; i < n; i++) {
++        int r = tests[i].fn();
++        if (r != 0) {
++            fprintf(stderr, "FAIL %s\n", tests[i].name);
++            failed++;
++        } else {
++            fprintf(stdout, "ok   %s\n", tests[i].name);
++        }
++    }
++    fprintf(stdout, "\n%zu tests, %d failures\n", n, failed);
++    return failed == 0 ? 0 : 1;
++}
+diff --git a/libfprint/drivers/verimark/transport.c b/libfprint/drivers/verimark/transport.c
+index 06ea512..cb20369 100644
+--- a/libfprint/drivers/verimark/transport.c
++++ b/libfprint/drivers/verimark/transport.c
+@@ -113,6 +113,72 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+     return VERIMARK_OK;
+ }
+ 
++
++VerimarkResult verimark_bulk_out(VerimarkUsbHandle *h,
++                                 uint8_t ep,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms)
++{
++    if (h == NULL || (data_len > 0 && data == NULL))
++        return VERIMARK_ERR_INVALID_ARG;
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    g_autoptr(GError) error = NULL;
++    gsize actual = 0;
++    gboolean ok = g_usb_device_bulk_transfer(
++        dev, ep, (guint8 *)data, data_len, &actual,
++        timeout_ms, NULL, &error);
++    if (!ok)
++        return VERIMARK_ERR_TRANSPORT;
++    if (actual != data_len)
++        return VERIMARK_ERR_SHORT_READ;
++    return VERIMARK_OK;
++}
++
++
++VerimarkResult verimark_bulk_in(VerimarkUsbHandle *h,
++                                uint8_t ep,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms)
++{
++    if (h == NULL || data == NULL || data_size == 0)
++        return VERIMARK_ERR_INVALID_ARG;
++
++    GUsbDevice *dev = (GUsbDevice *)h->native;
++    size_t total = 0;
++    /* Mirror the Python bulk_read_all loop : keep reading chunks until a
++     * short packet (< 64 bytes, the bulk max packet size) signals end of
++     * transfer, the buffer is full, or the per-chunk timeout fires. */
++    const unsigned per_chunk_ms = (timeout_ms > 500) ? 500 : timeout_ms;
++    while (total < data_size) {
++        g_autoptr(GError) error = NULL;
++        gsize actual = 0;
++        gboolean ok = g_usb_device_bulk_transfer(
++            dev, ep,
++            data + total,
++            data_size - total,
++            &actual,
++            per_chunk_ms, NULL, &error);
++        if (!ok) {
++            /* USB timeout on a follow-up chunk is the normal end marker. */
++            if (total > 0)
++                break;
++            return VERIMARK_ERR_TIMEOUT;
++        }
++        total += (size_t)actual;
++        if (actual == 0 || actual < 64)
++            break;
++    }
++    if (total == 0)
++        return VERIMARK_ERR_TIMEOUT;
++    if (received)
++        *received = total;
++    return VERIMARK_OK;
++}
++
+ #else
+ 
+ /* Stubs when libgusb is not available — allow the high-level layer to
+@@ -146,6 +212,27 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+     return VERIMARK_ERR_TRANSPORT;
+ }
+ 
++VerimarkResult verimark_bulk_out(VerimarkUsbHandle *h,
++                                 uint8_t ep,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms)
++{
++    (void)h; (void)ep; (void)data; (void)data_len; (void)timeout_ms;
++    return VERIMARK_ERR_TRANSPORT;
++}
++
++VerimarkResult verimark_bulk_in(VerimarkUsbHandle *h,
++                                uint8_t ep,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms)
++{
++    (void)h; (void)ep; (void)data; (void)data_size; (void)received; (void)timeout_ms;
++    return VERIMARK_ERR_TRANSPORT;
++}
++
+ #endif /* VERIMARK_HAVE_LIBGUSB (closes the original sync impl / stubs split) */
+ 
+ 
+diff --git a/libfprint/drivers/verimark/transport.h b/libfprint/drivers/verimark/transport.h
+index b54f691..a56b9f0 100644
+--- a/libfprint/drivers/verimark/transport.h
++++ b/libfprint/drivers/verimark/transport.h
+@@ -83,6 +83,56 @@ VerimarkResult verimark_ctrl_in(VerimarkUsbHandle *h,
+                                 unsigned timeout_ms);
+ 
+ 
++/* --- BULK primitives (IT, 047d:8054) ------------------------------------ */
++/*
++ * The IT speaks the Tudor protocol over BULK endpoints, unlike the DT
++ * which uses vendor control transfers. These primitives mirror the
++ * pyusb-based functions used in tools/verimark-it/handshake_attempt.py,
++ * runtime-validated end-to-end on 2026-06-07 (voie A handshake + AppData
++ * round-trip). See proto.h § "IT-specific BULK transport" for the EP
++ * constants.
++ */
++
++/**
++ * Send `data` to an IT BULK OUT endpoint (typically EP01).
++ *
++ * @param ep          Endpoint number (e.g. VERIMARK_IT_EP_BULK_OUT).
++ * @param data        Buffer to send (must be non-NULL if data_len > 0).
++ * @param data_len    Number of bytes to send.
++ * @param timeout_ms  Timeout in milliseconds.
++ *
++ * @return VERIMARK_OK on full send, an error otherwise.
++ */
++VerimarkResult verimark_bulk_out(VerimarkUsbHandle *h,
++                                 uint8_t ep,
++                                 const uint8_t *data,
++                                 size_t data_len,
++                                 unsigned timeout_ms);
++
++/**
++ * Read up to `data_size` bytes from an IT BULK IN endpoint (typically EP81).
++ * Returns immediately on the first short packet (< 64 bytes) — mirrors the
++ * Python `bulk_read_all` loop. The caller passes a buffer large enough for
++ * the maximum expected response (e.g. 802 bytes for a pair response, or
++ * 4096 for an AppData record).
++ *
++ * @param ep          Endpoint number.
++ * @param data        Receive buffer (caller-allocated).
++ * @param data_size   Buffer capacity (also the per-chunk read size).
++ * @param[out] received   Total bytes actually received.
++ * @param timeout_ms  Total timeout in milliseconds.
++ *
++ * @return VERIMARK_OK if at least one chunk was read, VERIMARK_ERR_TIMEOUT
++ *         if no bytes arrived within the total timeout.
++ */
++VerimarkResult verimark_bulk_in(VerimarkUsbHandle *h,
++                                uint8_t ep,
++                                uint8_t *data,
++                                size_t data_size,
++                                size_t *received,
++                                unsigned timeout_ms);
++
++
+ /* --- High-level helpers --------------------------------------------------- */
+ 
+ /**

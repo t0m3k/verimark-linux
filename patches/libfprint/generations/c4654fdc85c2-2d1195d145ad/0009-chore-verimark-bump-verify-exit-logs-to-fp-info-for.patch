@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sat, 6 Jun 2026 12:11:54 +0200
+Subject: [PATCH 09/33] chore(verimark): bump verify exit logs to fp_info for
+ journal visibility
+
+The fp_dbg traces around the verify poll loop and final report
+(MATCH_SUCCESS / MATCH_FAIL / MATCH_ERROR retry) don't reach the
+fprintd journal unless G_MESSAGES_DEBUG=all is set, so a stuck verify
+silently leaves no trace. Bump the key exit points to fp_info so
+journalctl -u fprintd shows the path verify took.
+
+No behavior change.
+
+Drafted with AI assistance.
+---
+ libfprint/drivers/verimark/verimark.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 0c2015a..cb3a218 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -664,8 +664,8 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         }
+         g_usleep(VERIMARK_VERIFY_POLL_INTERVAL_MS * 1000);
+     }
+-    fp_dbg("verify: poll loop done — frame_ready=%d, polls=%d",
+-           *out_frame_ready, poll_count);
++    fp_info("verify: poll loop done — frame_ready=%d, polls=%d",
++            *out_frame_ready, poll_count);
+ 
+     /* Close the capture window regardless of frame_ready outcome. */
+     verimark_capture_config(&self->session, &io, VERIMARK_CFG_SPARSE, &st);
+@@ -690,6 +690,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         return FALSE;
+     }
+     if (st == 0x0000 && v.len >= 16) {
++        fp_info("verify: positive verdict (%zu bytes)", v.len);
+         fp_dbg("verify: positive verdict (%zu bytes), matched_tuid=%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                v.len,
+@@ -701,7 +702,7 @@ verimark_run_verify_pipeline(FpiDeviceVerimark *self,
+         if (out_matched_tuid)
+             memcpy(out_matched_tuid, v.bytes, VERIMARK_STORAGE_TUID_LEN);
+     } else {
+-        fp_dbg("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
++        fp_info("verify: no-match (status 0x%04x, %zu bytes)", st, v.len);
+         /* Fire 0x39 WARM to trigger the firmware's brief red-LED
+          * "no-match" feedback (cf. docs/phase9-led-red-finding.md).
+          * Even without a retry loop, this gives the user the visual
+@@ -794,11 +795,13 @@ static void verimark_verify(FpDevice *device)
+     }
+ 
+     if (matched) {
++        fp_info("verify: reporting MATCH_SUCCESS");
+         fpi_device_verify_report(device, FPI_MATCH_SUCCESS, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+     } else if (frame_ready) {
+         /* Finger was seen but no enrollment matched → libfprint
+          * "fail" verdict, not an error. */
++        fp_info("verify: reporting MATCH_FAIL (finger seen, no enrollment matched)");
+         if (pipeline_err) g_clear_error(&pipeline_err);
+         fpi_device_verify_report(device, FPI_MATCH_FAIL, NULL, NULL);
+         fpi_device_verify_complete(device, NULL);
+@@ -806,6 +809,8 @@ static void verimark_verify(FpDevice *device)
+         /* Retry-class error (timeout / no finger) goes through report,
+          * not complete — libfprint rejects retry errors at the
+          * complete entrypoint (cf. goodixmoc fp_verify_ssm_done). */
++        fp_info("verify: reporting MATCH_ERROR (retry: %s)",
++                pipeline_err->message ? pipeline_err->message : "(no msg)");
+         fpi_device_verify_report(device, FPI_MATCH_ERROR, NULL,
+                                  g_steal_pointer(&pipeline_err));
+         fpi_device_verify_complete(device, NULL);

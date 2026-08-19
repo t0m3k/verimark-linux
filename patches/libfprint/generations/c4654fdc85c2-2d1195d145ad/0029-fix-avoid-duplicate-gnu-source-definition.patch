@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomasz Tracz <t@t90.dev>
+Date: Wed, 19 Aug 2026 08:52:32 +0100
+Subject: [PATCH 29/33] fix: avoid duplicate GNU source definition
+
+---
+ libfprint/drivers/verimark/handshake.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/handshake.c b/libfprint/drivers/verimark/handshake.c
+index e99f43f..3659ca4 100644
+--- a/libfprint/drivers/verimark/handshake.c
++++ b/libfprint/drivers/verimark/handshake.c
+@@ -5,7 +5,9 @@
+  * caller-provided VerimarkTransportIO vtable.
+  */
+ 
++#ifndef _GNU_SOURCE
+ #define _GNU_SOURCE   /* for getrandom on Linux */
++#endif
+ 
+ #include "handshake.h"
+ 

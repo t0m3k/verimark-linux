@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?S=C3=A9bastien=20Celles?= <s.celles@gmail.com>
+Date: Sun, 7 Jun 2026 09:56:18 +0200
+Subject: [PATCH 39/62] verimark: skip 0x96 03 commit on the IT (firmware
+ auto-commits via 0x8006)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After the previous patch, the IT enroll proceeded through the
+'add_image returns 0x8006' interpretation and jumped to
+ENR_S_COMMIT_CALL, where 0x96 03 was rejected with status 0x0404
+(VERIMARK_STATUS_BAD_STATE). The IT firmware is already in idle
+state at that point — the 0x8006 itself was the commit.
+
+Patch ENR_S_COMMIT_CALL : when the device is the IT, log and
+fpi_ssm_next_state directly to ENR_S_DB_REFRESH without sending
+0x96 03. The downstream DB_REFRESH / FINISH / GETLIST_POST /
+RESOLVE_TUID chain still runs, so the new TUID is still found via
+the pre/post getlist diff exactly like on the DT.
+
+The DT path is unchanged when PID == 0x00F2.
+---
+ libfprint/drivers/verimark/verimark.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/libfprint/drivers/verimark/verimark.c b/libfprint/drivers/verimark/verimark.c
+index 38a7846..cbf75d7 100644
+--- a/libfprint/drivers/verimark/verimark.c
++++ b/libfprint/drivers/verimark/verimark.c
+@@ -2531,6 +2531,18 @@ enroll_sm_run_state(FpiSsm *ssm, FpDevice *dev)
+         fpi_ssm_next_state(ssm);
+         return;
+     case ENR_S_COMMIT_CALL: {
++        /* IT firmware auto-commits when it signals enroll-complete via
++         * 0x8006 on add_image. Sending the DT-style 0x96 03 commit on
++         * the IT is rejected with VERIMARK_STATUS_BAD_STATE (0x0404)
++         * because the firmware is already in idle state. Skip to
++         * DB_REFRESH so the new TUID is still resolved via the pre/post
++         * getlist diff (same as the DT post-commit path). */
++        GUsbDevice *usb = fpi_device_get_usb_device(dev);
++        if (usb != NULL && g_usb_device_get_pid(usb) == VERIMARK_PID_IT) {
++            fp_info("verimark: IT enroll skipping 0x96 03 (firmware auto-commits)");
++            fpi_ssm_next_state(ssm);
++            return;
++        }
+         uint8_t commit_payload[123];
+         enr_build_commit_payload(ctx->new_tuid, commit_payload);
+         verimark_session_call_opcode_async(&self->session, self->transport,
